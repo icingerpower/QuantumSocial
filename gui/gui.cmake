@@ -2,4 +2,15 @@ SET(GUI_FILES
     ${CMAKE_CURRENT_LIST_DIR}/MainWindow.cpp
     ${CMAKE_CURRENT_LIST_DIR}/MainWindow.h
     ${CMAKE_CURRENT_LIST_DIR}/MainWindow.ui
+    ${CMAKE_CURRENT_LIST_DIR}/ComboBoxColumnDelegate.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/ComboBoxColumnDelegate.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.ui
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.ui
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneStatistics.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneStatistics.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneStatistics.ui
 )

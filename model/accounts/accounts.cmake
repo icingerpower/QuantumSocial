@@ -1,0 +1,10 @@
+set(ACCOUNTS_FILES
+    ${CMAKE_CURRENT_LIST_DIR}/AbstractSocialAccount.h
+    ${CMAKE_CURRENT_LIST_DIR}/AbstractSocialAccount.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountTiktok.h
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountTiktok.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountPinterest.h
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountPinterest.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountYoutube.h
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountYoutube.cpp
+)
