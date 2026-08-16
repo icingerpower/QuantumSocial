@@ -10,11 +10,12 @@ namespace {
 const QString COL_SEP = QStringLiteral(",");
 }
 
-const QStringList TableAccounts::HEADER{"Type", "Url", "View", "Followers"};
+const QStringList TableAccounts::HEADER{"Type", "Url", "View", "Followers", "Likes"};
 const int TableAccounts::IND_TYPE{0};
 const int TableAccounts::IND_URL{1};
 const int TableAccounts::IND_VIEW{2};
 const int TableAccounts::IND_FOLLOWERS{3};
+const int TableAccounts::IND_LIKES{4};
 
 TableAccounts::TableAccounts(const QString &workingDirectory, QObject *parent)
     : QAbstractTableModel(parent)
@@ -79,7 +80,7 @@ void TableAccounts::addAccount()
 
     const int row = m_listOfVariantList.size();
     beginInsertRows(QModelIndex{}, row, row);
-    m_listOfVariantList << QVariantList{defaultType, QString{}, 0, 0};
+    m_listOfVariantList << QVariantList{defaultType, QString{}, 0, 0, 0};
     endInsertRows();
     _saveInFile();
 }
@@ -116,15 +117,19 @@ void TableAccounts::_loadFromFile()
             continue;
         }
         const auto &elements = lines[i].split(COL_SEP);
-        if (elements.size() < HEADER.size())
+        if (elements.size() <= IND_FOLLOWERS)
         {
             continue;
         }
+        // Files saved before the "Likes" column existed only have 4 columns;
+        // default the missing one to 0 instead of dropping the row.
+        const int likes = elements.size() > IND_LIKES ? elements[IND_LIKES].toInt() : 0;
         m_listOfVariantList << QVariantList{
             elements[IND_TYPE]
             , elements[IND_URL]
             , elements[IND_VIEW].toInt()
             , elements[IND_FOLLOWERS].toInt()
+            , likes
         };
     }
 }

@@ -3,6 +3,8 @@
 
 #include <QWidget>
 
+#include <QCoro/QCoroTask>
+
 QT_BEGIN_NAMESPACE
 namespace Ui { class PaneAccounts; }
 QT_END_NAMESPACE
@@ -20,11 +22,13 @@ public:
 private slots:
     void _addAccount();
     void _removeSelectedAccounts();
-    void _retrieveStatistics();
 
 private:
     Ui::PaneAccounts *ui;
     TableAccounts *m_model;
+    QCoro::Task<void> m_retrieveStatisticsTask;
+
+    QCoro::Task<void> _retrieveStatistics();
 };
 
 #endif // PANEACCOUNTS_H

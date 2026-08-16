@@ -1,5 +1,6 @@
 tests
 *.user
+__pycache__/
 .vscode
 *build*
 .env

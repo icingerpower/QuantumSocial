@@ -12,6 +12,7 @@ public:
     static const int IND_URL;
     static const int IND_VIEW;
     static const int IND_FOLLOWERS;
+    static const int IND_LIKES;
 
     explicit TableAccounts(const QString &workingDirectory, QObject *parent = nullptr);
 
