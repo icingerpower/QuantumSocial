@@ -1,9 +1,15 @@
 #include "PaneStatistics.h"
 #include "ui_PaneStatistics.h"
 
-PaneStatistics::PaneStatistics(QWidget *parent)
+#include "model/videos/StatisticsScheduler.h"
+#include "model/videos/TableVideos.h"
+
+PaneStatistics::PaneStatistics(TableVideos *videos, StatisticsScheduler *scheduler,
+                               QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::PaneStatistics)
+    , m_videos(videos)
+    , m_scheduler(scheduler)
 {
     ui->setupUi(this);
 }

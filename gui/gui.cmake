@@ -4,12 +4,32 @@ SET(GUI_FILES
     ${CMAKE_CURRENT_LIST_DIR}/MainWindow.ui
     ${CMAKE_CURRENT_LIST_DIR}/ComboBoxColumnDelegate.cpp
     ${CMAKE_CURRENT_LIST_DIR}/ComboBoxColumnDelegate.h
+    ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationOptions.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationOptions.h
+    ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationOptions.ui
+    ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationPlan.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationPlan.h
+    ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationPlan.ui
+    ${CMAKE_CURRENT_LIST_DIR}/DialogHooks.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DialogHooks.h
+    ${CMAKE_CURRENT_LIST_DIR}/DialogHooks.ui
+    ${CMAKE_CURRENT_LIST_DIR}/DialogNewProject.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DialogNewProject.h
+    ${CMAKE_CURRENT_LIST_DIR}/DialogNewProject.ui
+    ${CMAKE_CURRENT_LIST_DIR}/DialogReviewNewProperties.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DialogReviewNewProperties.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.ui
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.ui
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.ui
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneSettings.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneSettings.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneSettings.ui
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneStatistics.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneStatistics.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneStatistics.ui

@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>PaneSettings</class>
+ <widget class="QWidget" name="PaneSettings">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>800</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Form</string>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QLabel" name="labelClis">
+     <property name="text">
+      <string>AI CLIs found on this machine (availability is re-checked at startup):</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QTableView" name="tableViewClis"/>
+   </item>
+   <item>
+    <widget class="QLabel" name="labelInfo">
+     <property name="text">
+      <string>Video generation settings — each backend declares its own settings; values are saved in the working directory (video_generation_settings.json).</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QTableView" name="tableViewGenerationSettings"/>
+   </item>
+   <item>
+    <widget class="QLabel" name="labelHashtags">
+     <property name="text">
+      <string>Preferred hashtags — the CLI is asked to pick from this list when writing hooks/descriptions instead of inventing hashtags with no engagement data behind them (one per line, or separated by spaces/commas):</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPlainTextEdit" name="plainTextEditHashtags">
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>120</height>
+      </size>
+     </property>
+     <property name="placeholderText">
+      <string>#highheels #stiletto #ootd #fashionreel #styleinspo ...</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="labelFavoriteHooks">
+     <property name="text">
+      <string>Favorite hooks — example hooks proven to perform well, harvested from your top-ranked videos (Statistics tab) or seen elsewhere; used as style/tone inspiration when the CLI suggests new hooks, not repeated verbatim (one per line):</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPlainTextEdit" name="plainTextEditFavoriteHooks">
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>120</height>
+      </size>
+     </property>
+     <property name="placeholderText">
+      <string>Step into power.
+The heel that owns the room.</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="labelFavoriteVideoPrompts">
+     <property name="text">
+      <string>Favorite video prompts — example prompts that actually rendered like the fast, punchy, viral-style short-form videos you want (not slow/artsy cinematic filler), harvested from a past generation (Generation page → select a video → "Favorite this video prompt") or written here; used as style/pacing reference when the CLI suggests new video prompts (one per line):</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPlainTextEdit" name="plainTextEditFavoriteVideoPrompts">
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>140</height>
+      </size>
+     </property>
+     <property name="placeholderText">
+      <string>Vertical 9:16: quick jump-cut opening on the shoe close-up, snap zoom out to a full turn, freeze on a confident pose, punchy beat-synced cuts throughout, no slow motion.</string>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

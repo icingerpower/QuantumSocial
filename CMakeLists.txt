@@ -11,8 +11,8 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
 
 # Compile and install QCoro (used for the coroutine-based statistics fetch):
 #   git clone https://github.com/qcoro/qcoro.git && cd qcoro && mkdir build && cd build
@@ -23,12 +23,16 @@ set(Qt_DIR_HINT "${Qt${QT_VERSION_MAJOR}_DIR}")
 list(APPEND CMAKE_PREFIX_PATH "${Qt_DIR_HINT}/..")
 find_package(QCoro6 REQUIRED COMPONENTS Core)
 
+include(../common/aicli/aicli.cmake)
+include(../common/gui/progress/progress.cmake)
 include(../common/workingdirectory/workingdirectory.cmake)
 include(model/model.cmake)
 include(gui/gui.cmake)
 
 set(PROJECT_SOURCES
         main.cpp
+        ${AICLI_FILES}
+        ${PROGRESS_DIALOG_FILES}
         ${GUI_FILES}
         ${MODEL_FILES}
         ${WORKING_DIR_FILES}
@@ -51,12 +55,18 @@ else()
     endif()
 endif()
 
-target_link_libraries(QuantumSocial PRIVATE Qt${QT_VERSION_MAJOR}::Widgets QCoro::Core)
+target_link_libraries(QuantumSocial PRIVATE
+    Qt${QT_VERSION_MAJOR}::Widgets
+    Qt${QT_VERSION_MAJOR}::Multimedia
+    Qt${QT_VERSION_MAJOR}::MultimediaWidgets
+    QCoro::Core)
+target_include_directories(QuantumSocial PRIVATE ../common/aicli ../common/gui/progress)
 
 # Absolute path to the statistics-fetching Python worker, so the app can
 # launch it via QProcess with zero configuration in a source build.
 target_compile_definitions(QuantumSocial PRIVATE
-    SOCIAL_STATS_SCRIPT_DIR="${CMAKE_SOURCE_DIR}/model/accounts")
+    SOCIAL_STATS_SCRIPT_DIR="${CMAKE_SOURCE_DIR}/model/accounts"
+    VIDEO_GEN_SCRIPT_DIR="${CMAKE_SOURCE_DIR}/model/videogen")
 
 set_target_properties(QuantumSocial PROPERTIES
     MACOSX_BUNDLE_GUI_IDENTIFIER my.example.com

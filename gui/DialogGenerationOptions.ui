@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>DialogGenerationOptions</class>
+ <widget class="QDialog" name="DialogGenerationOptions">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>780</width>
+    <height>280</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Generation options</string>
+  </property>
+  <layout class="QHBoxLayout" name="horizontalLayoutMain">
+   <item>
+    <layout class="QVBoxLayout" name="verticalLayout">
+     <item>
+      <widget class="QGroupBox" name="groupInputImage">
+       <property name="title">
+        <string>Input image</string>
+       </property>
+       <layout class="QVBoxLayout" name="verticalLayoutImage">
+        <item>
+         <widget class="QRadioButton" name="radioKeep">
+          <property name="text">
+           <string>Keep the input image as it is</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioReusePrevious">
+          <property name="text">
+           <string>Reuse the previously regenerated image (see preview on the right)</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioRegenerate">
+          <property name="text">
+           <string>Regenerate the input (remove social icons / text, improve quality)</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="horizontalLayoutWhiteBackground">
+          <item>
+           <spacer name="horizontalSpacerWhiteBackground">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+            <property name="sizeType">
+             <enum>QSizePolicy::Policy::Fixed</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>1</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="checkBoxWhiteBackground">
+            <property name="text">
+             <string>Isolate the product only, on a plain white background (no model/human)</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioBootstrap">
+          <property name="text">
+           <string>Bootstrap a new image (close but different image will be generated)</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="horizontalLayoutCli">
+          <item>
+           <widget class="QLabel" name="labelCli">
+            <property name="text">
+             <string>Image CLI</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QComboBox" name="comboBoxCli">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item>
+      <widget class="QGroupBox" name="groupVideoFormat">
+       <property name="title">
+        <string>Video format</string>
+       </property>
+       <layout class="QHBoxLayout" name="horizontalLayoutFormat">
+        <item>
+         <widget class="QRadioButton" name="radioVertical">
+          <property name="text">
+           <string>Vertical 9:16</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioHorizontal">
+          <property name="text">
+           <string>Horizontal 16:9</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QRadioButton" name="radioSquare">
+          <property name="text">
+           <string>Square 1:1</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item>
+      <widget class="QDialogButtonBox" name="buttonBox">
+       <property name="orientation">
+        <enum>Qt::Orientation::Horizontal</enum>
+       </property>
+       <property name="standardButtons">
+        <set>QDialogButtonBox::StandardButton::Cancel|QDialogButtonBox::StandardButton::Ok</set>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="groupPreviousImagePreview">
+     <property name="title">
+      <string>Previously regenerated image</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayoutPreview">
+      <item>
+       <widget class="QLabel" name="labelPreviousImagePreview">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+          <horstretch>0</horstretch>
+          <verstretch>0</verstretch>
+         </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>220</width>
+          <height>220</height>
+         </size>
+        </property>
+        <property name="alignment">
+         <set>Qt::AlignmentFlag::AlignCenter</set>
+        </property>
+        <property name="scaledContents">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>accepted()</signal>
+   <receiver>DialogGenerationOptions</receiver>
+   <slot>accept()</slot>
+  </connection>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>rejected()</signal>
+   <receiver>DialogGenerationOptions</receiver>
+   <slot>reject()</slot>
+  </connection>
+ </connections>
+</ui>

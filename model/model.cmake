@@ -1,7 +1,27 @@
 include(${CMAKE_CURRENT_LIST_DIR}/accounts/accounts.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/imagegen/imagegen.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/properties/properties.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/videogen/videogen.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/videos/videos.cmake)
 
 SET(MODEL_FILES
     ${CMAKE_CURRENT_LIST_DIR}/TableAccounts.h
     ${CMAKE_CURRENT_LIST_DIR}/TableAccounts.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/TableProjects.h
+    ${CMAKE_CURRENT_LIST_DIR}/TableProjects.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/PreferredHashtags.h
+    ${CMAKE_CURRENT_LIST_DIR}/PreferredHashtags.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/PromptLessons.h
+    ${CMAKE_CURRENT_LIST_DIR}/PromptLessons.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/FavoriteHooks.h
+    ${CMAKE_CURRENT_LIST_DIR}/FavoriteHooks.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/FavoriteVideoPrompts.h
+    ${CMAKE_CURRENT_LIST_DIR}/FavoriteVideoPrompts.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/SavedPrompts.h
+    ${CMAKE_CURRENT_LIST_DIR}/SavedPrompts.cpp
     ${ACCOUNTS_FILES}
+    ${IMAGEGEN_FILES}
+    ${PROPERTIES_FILES}
+    ${VIDEOGEN_FILES}
+    ${VIDEOS_FILES}
 )

@@ -1,0 +1,10 @@
+set(VIDEOGEN_FILES
+    ${CMAKE_CURRENT_LIST_DIR}/AbstractVideoGenerator.h
+    ${CMAKE_CURRENT_LIST_DIR}/AbstractVideoGenerator.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/VideoGeneratorGemini.h
+    ${CMAKE_CURRENT_LIST_DIR}/VideoGeneratorGemini.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/TableGenerationSettings.h
+    ${CMAKE_CURRENT_LIST_DIR}/TableGenerationSettings.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/VideoGenerationWorkflow.h
+    ${CMAKE_CURRENT_LIST_DIR}/VideoGenerationWorkflow.cpp
+)
