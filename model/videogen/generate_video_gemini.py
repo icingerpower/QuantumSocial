@@ -513,7 +513,14 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
     while time.time() < min(deadline, attempt_deadline):
         try:
             after_text = page.locator("body").inner_text()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - see below
+            # A DEAD page must break out immediately instead of being
+            # polled for the rest of the stall timeout: swallowing this
+            # burned a full 5 minutes on a corpse after every GPU-induced
+            # browser crash, then reported a misleading "no reply before
+            # the attempt timeout".
+            if _is_target_closed_error(exc):
+                raise
             after_text = ""
         new_text = after_text.replace(before_text, "")
         marker = _rejection_in(new_text)
@@ -563,8 +570,19 @@ def _launch_context(playwright, use_system_profile):
         "accept_downloads": True,
         # Google's login rejects browsers that advertise automation.
         "ignore_default_args": ["--enable-automation"],
+        # GPU acceleration is OFF on purpose. Root-caused from dmesg: this
+        # machine's NVIDIA driver logs "NVRM: Xid 13/32/69 ... name=chrome"
+        # a few seconds before every observed browser death, i.e. Chrome's
+        # GPU process faults — most often right when Gemini renders/plays
+        # the finished video (accelerated video decode) — and takes the
+        # whole browser down with it, losing the generated clip. Automation
+        # needs no GPU rendering at all, so the entire class of crash is
+        # simply removed rather than retried around.
         "args": ["--disable-blink-features=AutomationControlled",
-                 "--no-first-run", "--no-default-browser-check"],
+                 "--no-first-run", "--no-default-browser-check",
+                 "--disable-gpu", "--disable-gpu-compositing",
+                 "--disable-accelerated-video-decode",
+                 "--disable-accelerated-2d-canvas"],
     }
     attempts = []
     if use_system_profile and os.path.isdir(SYSTEM_CHROME_PROFILE):
@@ -955,6 +973,19 @@ def _worker_main():
                     continue
                 result, page = _generate_once(context, page, prompt, images,
                                               output_dir, settings)
+                # Some failures come back as a normal result rather than an
+                # exception (a download that could not be saved because the
+                # browser died mid-way, say). The browser is just as dead —
+                # drop it here too, otherwise the NEXT request is wasted
+                # discovering the corpse itself.
+                if result.get("error") and _is_target_closed_error(result["error"]):
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                    _log("worker: browser lost (reported in a result), will relaunch")
+                    context = None
+                    page = None
                 _respond(result)
             except Exception as exc:  # noqa: BLE001 - one bad request must not
                 # kill the worker: report it and stay alive for the next one.
