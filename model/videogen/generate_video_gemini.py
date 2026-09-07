@@ -469,16 +469,23 @@ def _prompt_variant(prompt, attempt):
     return toggled + suffixes[(attempt - 2) % len(suffixes)]
 
 
-def _run_attempt(page, prompt, image_paths, deadline, attempt_deadline, stall_timeout_s):
+def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadline,
+                 stall_timeout_s):
     """One full generation attempt in the current chat. Returns
-    ("video", download) / ("rejected", marker) / ("stalled", note) /
+    ("video", saved_path) / ("rejected", marker) / ("stalled", note) /
     ("error", message). "stalled" = no reply at all before the attempt
     timeout — observed on forbidden prompts, where Gemini sometimes just
     never answers instead of refusing in text. A visible PROGRESS_MARKERS
     hit (Gemini's own "still working" indicator) resets attempt_deadline
     instead of counting toward it, since that is proof of real activity,
     not silence — only the overall `deadline` still bounds a run that keeps
-    showing progress forever."""
+    showing progress forever.
+
+    The download is saved to disk HERE, the instant the download event
+    fires and while the browser is known alive — returning a live Download
+    object to be saved by the caller lost a finished video every time the
+    browser died in between (observed live: "Gemini generated the video,
+    but the browser closed before the download could be saved")."""
     quota_message = _video_quota_message(page)
     if quota_message:
         _dump_state(page, "quota")
@@ -518,9 +525,22 @@ def _run_attempt(page, prompt, image_paths, deadline, attempt_deadline, stall_ti
                 with page.expect_download(timeout=4000) as download_info:
                     page.get_by_role("button", name=name, exact=False)\
                         .last.click(timeout=2000)
-                return ("video", download_info.value)
             except Exception:
                 continue
+            # Saved immediately, before returning anywhere: the browser can
+            # die at any moment and a Download object is worthless once it
+            # does.
+            download = download_info.value
+            target = os.path.join(
+                output_dir, download.suggested_filename or "generated_video.mp4")
+            try:
+                download.save_as(target)
+            except Exception as exc:  # noqa: BLE001 - reported, not a crash
+                _log(f"download: save_as failed: {exc}")
+                return ("error", "Gemini generated the video, but it could not "
+                                 f"be saved: {exc}")
+            _log(f"download: saved {target}")
+            return ("video", os.path.abspath(target))
 
         if any(marker in new_text for marker in PROGRESS_MARKERS):
             attempt_deadline = max(attempt_deadline, time.time() + stall_timeout_s)
@@ -775,7 +795,7 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings):
     # shared deadline covers all attempts (refusals arrive in seconds).
     deadline = time.time() + generation_timeout_s
     last_rejection = None
-    download = None
+    video_path = None
     for attempt in range(in_page_retries + 1):
         variant = _prompt_variant(prompt, attempt)
         if attempt > 0:
@@ -796,7 +816,7 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings):
                 break
         attempt_deadline = time.time() + stall_timeout_s
         try:
-            status, payload = _run_attempt(page, variant, image_paths,
+            status, payload = _run_attempt(page, variant, image_paths, output_dir,
                                            deadline, attempt_deadline,
                                            stall_timeout_s)
         except Exception as exc:  # noqa: BLE001 - recovered below
@@ -817,7 +837,7 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings):
         _log(f"attempt {attempt + 1}: {status}"
              + (f" ({payload})" if status != "video" else ""))
         if status == "video":
-            download = payload
+            video_path = payload  # already saved to disk by _run_attempt
             break
         if status == "error":
             return ({"video": None, "error": payload, "rejected": False}, page)
@@ -828,25 +848,13 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings):
         if time.time() >= deadline:
             break
 
-    if download is None:
+    if video_path is None:
         return ({"video": None,
                  "error": f"Gemini did not produce a video (last outcome: "
                           f"{last_rejection}), including the lightly edited "
                           "retry variants.",
                  "rejected": True}, page)
-
-    target = os.path.join(output_dir,
-                          download.suggested_filename or "generated_video.mp4")
-    try:
-        download.save_as(target)
-    except Exception as exc:  # noqa: BLE001 - reported, not a fatal crash
-        if not _is_target_closed_error(exc):
-            raise
-        return ({"video": None,
-                 "error": "Gemini generated the video, but the browser closed "
-                          f"before the download could be saved: {exc}",
-                 "rejected": False}, page)
-    return ({"video": os.path.abspath(target), "error": None, "rejected": False}, page)
+    return ({"video": video_path, "error": None, "rejected": False}, page)
 
 
 def _read_request(request):
@@ -896,7 +904,17 @@ def _worker_main():
     _log("worker: started, waiting for requests on stdin")
     context = None
     page = None
-    playwright = None
+    # Started ONCE for the whole worker: sync_playwright().start() a second
+    # time in the same process raises "It looks like you are using Playwright
+    # Sync API inside the asyncio loop" — which is exactly what happened when
+    # a lost browser was being relaunched mid-session. Only the BROWSER
+    # CONTEXT is ever recreated below; this driver outlives every request.
+    try:
+        playwright = sync_playwright().start()
+    except Exception as exc:  # noqa: BLE001 - nothing can run without it
+        _respond({"video": None, "rejected": False,
+                  "error": f"Could not start Playwright: {exc}"})
+        return 1
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -920,7 +938,6 @@ def _worker_main():
                 if context is None:
                     # First request pays the launch + login + Ultra cost;
                     # every later one reuses this very browser and tab.
-                    playwright = sync_playwright().start()
                     context, launch_note, launch_error = _launch_context(
                         playwright, bool(settings.get("useSystemChromeProfile", True)))
                     if context is None:
@@ -945,6 +962,14 @@ def _worker_main():
                 if _is_target_closed_error(exc):
                     # The browser itself is gone — drop it so the NEXT
                     # request relaunches cleanly instead of failing forever.
+                    # Closing it explicitly matters: a half-dead Chrome still
+                    # holding the profile's SingletonLock would make every
+                    # relaunch fail with "Opening in existing browser session".
+                    try:
+                        if context is not None:
+                            context.close()
+                    except Exception:
+                        pass
                     _log("worker: browser lost, will relaunch on the next request")
                     context = None
                     page = None
