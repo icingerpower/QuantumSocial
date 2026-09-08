@@ -55,9 +55,11 @@ Usage: generate_video_gemini.py <prompt-file> <output-dir> <settings-json> [imag
 Settings used: generationTimeoutSec (default 900),
 useSystemChromeProfile (default true), requireUltra (default true).
 """
+import glob
 import json
 import os
 import re
+import shutil
 import sys
 import time
 
@@ -137,6 +139,9 @@ VIDEO_QUOTA_MARKERS = (
 LOG_DIR = "/tmp/quantumsocial"
 LOG_PATH = os.path.join(
     LOG_DIR, time.strftime("gemini_%Y%m%d_%H%M%S.log"))
+# Chrome's own log (see the launch args): Playwright only ever reports
+# "target closed" when the browser dies, never the reason.
+CHROME_LOG_PATH = LOG_PATH[:-4] + "_chrome.log"
 
 
 def _log(message):
@@ -432,6 +437,36 @@ def _recover_page(context):
     return None
 
 
+def _download_path(download):
+    """Playwright's own path for a finished download. Still works when only
+    the PAGE died; raises once the whole browser is gone."""
+    return download.path()
+
+
+def _download_artifact_path(download):
+    """Last resort when even download.path() needs a browser that no longer
+    exists: Playwright stores downloads under its artifacts directory, so
+    look for the newest file there. Best effort — the layout is internal, so
+    a miss just means the caller reports the loss as before."""
+    roots = [os.path.join(os.environ.get("TMPDIR", "/tmp"), name)
+             for name in ("playwright-artifacts", )]
+    candidates = []
+    for root in roots:
+        candidates.extend(glob.glob(os.path.join(root, "**", "*"), recursive=True))
+    candidates.extend(glob.glob(
+        os.path.join(os.environ.get("TMPDIR", "/tmp"),
+                     "playwright-artifacts-*", "**", "*"), recursive=True))
+    files = [path for path in candidates if os.path.isfile(path)]
+    if not files:
+        return None
+    newest = max(files, key=os.path.getmtime)
+    # Only trust something written in the last couple of minutes — this
+    # directory is shared with any other Playwright run on the machine.
+    if time.time() - os.path.getmtime(newest) > 120:
+        return None
+    return newest
+
+
 def _rejection_in(text):
     for marker in REJECTION_MARKERS:
         if marker.lower() in text.lower():
@@ -542,12 +577,31 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
                 output_dir, download.suggested_filename or "generated_video.mp4")
             try:
                 download.save_as(target)
-            except Exception as exc:  # noqa: BLE001 - reported, not a crash
+                _log(f"download: saved {target}")
+                return ("video", os.path.abspath(target))
+            except Exception as exc:  # noqa: BLE001 - recovery attempt below
                 _log(f"download: save_as failed: {exc}")
-                return ("error", "Gemini generated the video, but it could not "
-                                 f"be saved: {exc}")
-            _log(f"download: saved {target}")
-            return ("video", os.path.abspath(target))
+            # save_as needs a live browser to move the file, and this browser
+            # keeps dying exactly at download time — but the bytes are often
+            # ALREADY complete in Playwright's own download directory. Copy
+            # them straight out of there rather than throwing away a video
+            # Gemini really did produce (and charged quota for).
+            for recover in (_download_path, _download_artifact_path):
+                try:
+                    source = recover(download)
+                except Exception as exc:  # noqa: BLE001 - try the next way
+                    _log(f"download: {recover.__name__} failed: {exc}")
+                    continue
+                if source and os.path.isfile(source):
+                    try:
+                        shutil.copyfile(source, target)
+                        _log(f"download: recovered from {source} -> {target}")
+                        return ("video", os.path.abspath(target))
+                    except OSError as exc:
+                        _log(f"download: copy from {source} failed: {exc}")
+            return ("error", "Gemini generated the video, but it could not be "
+                             "saved (the browser died at download time and the "
+                             "file could not be recovered from disk either).")
 
         if any(marker in new_text for marker in PROGRESS_MARKERS):
             attempt_deadline = max(attempt_deadline, time.time() + stall_timeout_s)
@@ -560,6 +614,12 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
 # ---------------------------------------------------------------------------
 # Browser launch
 # ---------------------------------------------------------------------------
+
+# Set once the default Chrome profile has proved to be held by the user's
+# own running browser: every later launch skips straight to the dedicated
+# profile instead of poking their Chrome again (see _launch_context).
+_SYSTEM_PROFILE_IN_USE = False
+
 
 def _launch_context(playwright, use_system_profile):
     """Tries system Chrome + default profile, then Chrome + dedicated
@@ -582,10 +642,16 @@ def _launch_context(playwright, use_system_profile):
                  "--no-first-run", "--no-default-browser-check",
                  "--disable-gpu", "--disable-gpu-compositing",
                  "--disable-accelerated-video-decode",
-                 "--disable-accelerated-2d-canvas"],
+                 "--disable-accelerated-2d-canvas",
+                 # Chrome's own log, next to ours: when the browser dies
+                 # mid-generation, Playwright only reports "target closed"
+                 # and never WHY — this is the file that says what Chrome
+                 # itself hit on the way down.
+                 "--enable-logging", f"--log-file={CHROME_LOG_PATH}"],
     }
     attempts = []
-    if use_system_profile and os.path.isdir(SYSTEM_CHROME_PROFILE):
+    if use_system_profile and not _SYSTEM_PROFILE_IN_USE \
+            and os.path.isdir(SYSTEM_CHROME_PROFILE):
         attempts.append((SYSTEM_CHROME_PROFILE, "chrome",
                          "system Chrome with the default profile"))
     attempts.append((PROFILE_DIR, "chrome", "system Chrome, dedicated profile"))
@@ -604,6 +670,17 @@ def _launch_context(playwright, use_system_profile):
         except Exception as exc:  # noqa: BLE001 - try the next launch flavor
             _log(f"launch failed: {note}: {exc}")
             errors.append(f"{note}: {exc}")
+            if user_dir == SYSTEM_CHROME_PROFILE \
+                    and "existing browser session" in str(exc):
+                # Your everyday Chrome owns that profile and will for as
+                # long as it runs — retrying it on every relaunch only
+                # wastes a launch AND hands a command line to your real
+                # browser each time (Chrome answers "Opening in existing
+                # browser session", which can pop a stray tab there).
+                # Remember and skip it for the rest of this worker's life.
+                globals()["_SYSTEM_PROFILE_IN_USE"] = True
+                _log("launch: the default profile is in use by your own "
+                     "Chrome — skipping it from now on")
     return None, None, " | ".join(errors)
 
 
