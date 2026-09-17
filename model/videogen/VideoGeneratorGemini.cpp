@@ -1,5 +1,8 @@
 #include "VideoGeneratorGemini.h"
 
+#include <QProcess>
+#include <QStandardPaths>
+
 QString VideoGeneratorGemini::getId() const
 {
     return QStringLiteral("gemini-browser");
@@ -45,8 +48,37 @@ QCoro::Task<AbstractVideoGenerator::Result> VideoGeneratorGemini::generate(
     const QString &prompt, const QStringList &imagePaths,
     const QString &outputDir, const QVariantMap &settings) const
 {
-    return runGeneratorScript(QStringLiteral("generate_video_gemini.py"),
-                              prompt, imagePaths, outputDir, settings);
+    // Check the local Python setup before creating the long-lived worker.
+    // A missing module makes that worker answer once and exit immediately;
+    // repeatedly recreating it cannot help and used to exercise a fragile
+    // fast-exit path in the QProcess coroutine handling.
+    const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
+    if (python.isEmpty())
+    {
+        Result result;
+        result.errorMessage = QObject::tr("python3 was not found on PATH.");
+        result.retryable = false;
+        co_return result;
+    }
+
+    QProcess dependencyCheck;
+    dependencyCheck.start(python,
+        {QStringLiteral("-c"), QStringLiteral("import playwright")});
+    if (!dependencyCheck.waitForStarted(5000)
+        || !dependencyCheck.waitForFinished(10000)
+        || dependencyCheck.exitStatus() != QProcess::NormalExit
+        || dependencyCheck.exitCode() != 0)
+    {
+        Result result;
+        result.errorMessage = QObject::tr(
+            "Python Playwright is not installed for %1. Install it with "
+            "'python3 -m pip install playwright', then retry.").arg(python);
+        result.retryable = false;
+        co_return result;
+    }
+
+    co_return co_await runGeneratorScript(QStringLiteral("generate_video_gemini.py"),
+                                           prompt, imagePaths, outputDir, settings);
 }
 
 DECLARE_VIDEO_GENERATOR(VideoGeneratorGemini)

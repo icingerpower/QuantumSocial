@@ -15,6 +15,7 @@ namespace Ui { class DialogGenerationPlan; }
 QT_END_NAMESPACE
 
 class AbstractCli;
+class GenerationPlanSection;
 class QButtonGroup;
 class QCheckBox;
 class QComboBox;
@@ -180,7 +181,7 @@ private:
     // and then copied into its final member, e.g. m_imageSection).
     struct OptionSection
     {
-        QGroupBox *group = nullptr;
+        GenerationPlanSection *group = nullptr;
         QButtonGroup *strategyButtons = nullptr;
         QStackedWidget *strategyStack = nullptr;
         QList<QSharedPointer<StrategyPage>> strategies;  // size kStrategyCount

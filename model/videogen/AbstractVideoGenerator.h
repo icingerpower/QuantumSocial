@@ -33,6 +33,10 @@ public:
         // caller can retry with a slightly modified prompt, unlike ordinary
         // failures (timeouts, crashed browser...).
         bool rejected = false;
+        // False for local setup errors (for example a missing browser
+        // dependency): changing the prompt and launching another worker can
+        // never fix those, so the workflow must stop after the first result.
+        bool retryable = true;
     };
 
     // One tunable setting of a backend. Each backend declares its own list;

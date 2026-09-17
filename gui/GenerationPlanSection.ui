@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>GenerationPlanSection</class>
+ <widget class="QGroupBox" name="GenerationPlanSection">
+  <property name="sizePolicy">
+   <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+    <horstretch>0</horstretch><verstretch>0</verstretch>
+   </sizepolicy>
+  </property>
+  <property name="minimumSize"><size><width>0</width><height>0</height></size></property>
+  <property name="checkable"><bool>true</bool></property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QWidget" name="cliRow" native="true">
+     <property name="visible"><bool>false</bool></property>
+     <layout class="QHBoxLayout" name="layoutCli">
+      <property name="leftMargin"><number>0</number></property>
+      <property name="topMargin"><number>0</number></property>
+      <property name="rightMargin"><number>0</number></property>
+      <property name="bottomMargin"><number>0</number></property>
+      <item><widget class="QLabel" name="labelCli"><property name="text"><string>CLI:</string></property></widget></item>
+      <item><widget class="QComboBox" name="comboCli"/></item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="layoutStrategies">
+     <item><widget class="QRadioButton" name="radioAnimate"><property name="toolTip"><string>Suggested use: a minimal-change take — animate/refine only, no new scene.</string></property><property name="text"><string>Animate / keep source</string></property><property name="checked"><bool>true</bool></property></widget></item>
+     <item><widget class="QRadioButton" name="radioReimagine"><property name="toolTip"><string>Suggested use: same product, a new model/background/outfit — realistic, warm, modern setting.</string></property><property name="text"><string>Reimagine (new model &amp; background)</string></property></widget></item>
+     <item><widget class="QRadioButton" name="radioCreative"><property name="toolTip"><string>Suggested use: whatever else you want to try — just an organizational label, write any prompt here.</string></property><property name="text"><string>Creative</string></property></widget></item>
+     <item><spacer name="strategySpacer"><property name="orientation"><enum>Qt::Orientation::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QStackedWidget" name="stackStrategies">
+     <property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Ignored"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property>
+     <widget class="QWidget" name="pageAnimate">
+      <layout class="QVBoxLayout" name="pageLayout0"><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+       <item><widget class="QSplitter" name="splitterPrompt0">
+        <property name="orientation"><enum>Qt::Orientation::Horizontal</enum></property>
+        <property name="childrenCollapsible"><bool>true</bool></property>
+        <widget class="QWidget" name="promptPanel0"><layout class="QVBoxLayout" name="promptLayout0">
+         <item><widget class="QLabel" name="labelPrompt0"><property name="text"><string>Prompt:</string></property></widget></item>
+         <item><layout class="QHBoxLayout" name="savedLayout0"><item><widget class="QComboBox" name="comboSaved0"><property name="sizeAdjustPolicy"><enum>QComboBox::SizeAdjustPolicy::AdjustToContents</enum></property></widget></item><item><widget class="QPushButton" name="buttonLoad0"><property name="text"><string>Load</string></property></widget></item><item><widget class="QPushButton" name="buttonSave0"><property name="text"><string>Save...</string></property></widget></item></layout></item>
+         <item><widget class="QPlainTextEdit" name="editPrompt0"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Ignored"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property><property name="placeholderText"><string>Write your prompt here (or load a saved one above).</string></property></widget></item>
+         <item><widget class="QLabel" name="labelProperties0"><property name="text"><string>A/B properties — untick to drop, or pick a different value:</string></property></widget></item>
+         <item><widget class="QScrollArea" name="scrollProperties0"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Ignored"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property><property name="frameShape"><enum>QFrame::Shape::NoFrame</enum></property><property name="widgetResizable"><bool>true</bool></property><widget class="QWidget" name="scrollContent0"><property name="geometry"><rect><x>0</x><y>0</y><width>330</width><height>130</height></rect></property><layout class="QVBoxLayout" name="layoutProperties0"/></widget></widget></item>
+        </layout></widget>
+        <widget class="QWidget" name="previewPanel0"><layout class="QVBoxLayout" name="previewLayout0">
+         <item><widget class="QLabel" name="labelFinal0"><property name="text"><string>Final prompt:</string></property></widget></item>
+         <item><widget class="QScrollArea" name="scrollPreview0"><property name="widgetResizable"><bool>true</bool></property><widget class="QLabel" name="labelPreview0"><property name="geometry"><rect><x>0</x><y>0</y><width>330</width><height>180</height></rect></property><property name="margin"><number>6</number></property><property name="text"><string/></property><property name="alignment"><set>Qt::AlignmentFlag::AlignLeading|Qt::AlignmentFlag::AlignLeft|Qt::AlignmentFlag::AlignTop</set></property><property name="wordWrap"><bool>true</bool></property><property name="textInteractionFlags"><set>Qt::TextInteractionFlag::TextSelectableByKeyboard|Qt::TextInteractionFlag::TextSelectableByMouse</set></property></widget></widget></item>
+        </layout></widget>
+       </widget></item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="pageReimagine">
+      <layout class="QVBoxLayout" name="pageLayout1"><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+       <item><widget class="QSplitter" name="splitterPrompt1">
+        <property name="orientation"><enum>Qt::Orientation::Horizontal</enum></property><property name="childrenCollapsible"><bool>true</bool></property>
+        <widget class="QWidget" name="promptPanel1"><layout class="QVBoxLayout" name="promptLayout1">
+         <item><widget class="QLabel" name="labelPrompt1"><property name="text"><string>Prompt:</string></property></widget></item>
+         <item><layout class="QHBoxLayout" name="savedLayout1"><item><widget class="QComboBox" name="comboSaved1"><property name="sizeAdjustPolicy"><enum>QComboBox::SizeAdjustPolicy::AdjustToContents</enum></property></widget></item><item><widget class="QPushButton" name="buttonLoad1"><property name="text"><string>Load</string></property></widget></item><item><widget class="QPushButton" name="buttonSave1"><property name="text"><string>Save...</string></property></widget></item></layout></item>
+         <item><widget class="QPlainTextEdit" name="editPrompt1"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Ignored"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property><property name="placeholderText"><string>Write your prompt here (or load a saved one above).</string></property></widget></item>
+         <item><widget class="QLabel" name="labelProperties1"><property name="text"><string>A/B properties — untick to drop, or pick a different value:</string></property></widget></item>
+         <item><widget class="QScrollArea" name="scrollProperties1"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Ignored"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property><property name="frameShape"><enum>QFrame::Shape::NoFrame</enum></property><property name="widgetResizable"><bool>true</bool></property><widget class="QWidget" name="scrollContent1"><property name="geometry"><rect><x>0</x><y>0</y><width>330</width><height>130</height></rect></property><layout class="QVBoxLayout" name="layoutProperties1"/></widget></widget></item>
+        </layout></widget>
+        <widget class="QWidget" name="previewPanel1"><layout class="QVBoxLayout" name="previewLayout1">
+         <item><widget class="QLabel" name="labelFinal1"><property name="text"><string>Final prompt:</string></property></widget></item>
+         <item><widget class="QScrollArea" name="scrollPreview1"><property name="widgetResizable"><bool>true</bool></property><widget class="QLabel" name="labelPreview1"><property name="geometry"><rect><x>0</x><y>0</y><width>330</width><height>180</height></rect></property><property name="margin"><number>6</number></property><property name="text"><string/></property><property name="alignment"><set>Qt::AlignmentFlag::AlignLeading|Qt::AlignmentFlag::AlignLeft|Qt::AlignmentFlag::AlignTop</set></property><property name="wordWrap"><bool>true</bool></property><property name="textInteractionFlags"><set>Qt::TextInteractionFlag::TextSelectableByKeyboard|Qt::TextInteractionFlag::TextSelectableByMouse</set></property></widget></widget></item>
+        </layout></widget>
+       </widget></item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="pageCreative">
+      <layout class="QVBoxLayout" name="pageLayout2"><property name="leftMargin"><number>0</number></property><property name="topMargin"><number>0</number></property><property name="rightMargin"><number>0</number></property><property name="bottomMargin"><number>0</number></property>
+       <item><widget class="QSplitter" name="splitterPrompt2">
+        <property name="orientation"><enum>Qt::Orientation::Horizontal</enum></property><property name="childrenCollapsible"><bool>true</bool></property>
+        <widget class="QWidget" name="promptPanel2"><layout class="QVBoxLayout" name="promptLayout2">
+         <item><widget class="QLabel" name="labelPrompt2"><property name="text"><string>Prompt:</string></property></widget></item>
+         <item><layout class="QHBoxLayout" name="savedLayout2"><item><widget class="QComboBox" name="comboSaved2"><property name="sizeAdjustPolicy"><enum>QComboBox::SizeAdjustPolicy::AdjustToContents</enum></property></widget></item><item><widget class="QPushButton" name="buttonLoad2"><property name="text"><string>Load</string></property></widget></item><item><widget class="QPushButton" name="buttonSave2"><property name="text"><string>Save...</string></property></widget></item></layout></item>
+         <item><widget class="QPlainTextEdit" name="editPrompt2"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Ignored"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property><property name="placeholderText"><string>Write your prompt here (or load a saved one above).</string></property></widget></item>
+         <item><widget class="QLabel" name="labelProperties2"><property name="text"><string>A/B properties — untick to drop, or pick a different value:</string></property></widget></item>
+         <item><widget class="QScrollArea" name="scrollProperties2"><property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Ignored"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property><property name="frameShape"><enum>QFrame::Shape::NoFrame</enum></property><property name="widgetResizable"><bool>true</bool></property><widget class="QWidget" name="scrollContent2"><property name="geometry"><rect><x>0</x><y>0</y><width>330</width><height>130</height></rect></property><layout class="QVBoxLayout" name="layoutProperties2"/></widget></widget></item>
+        </layout></widget>
+        <widget class="QWidget" name="previewPanel2"><layout class="QVBoxLayout" name="previewLayout2">
+         <item><widget class="QLabel" name="labelFinal2"><property name="text"><string>Final prompt:</string></property></widget></item>
+         <item><widget class="QScrollArea" name="scrollPreview2"><property name="widgetResizable"><bool>true</bool></property><widget class="QLabel" name="labelPreview2"><property name="geometry"><rect><x>0</x><y>0</y><width>330</width><height>180</height></rect></property><property name="margin"><number>6</number></property><property name="text"><string/></property><property name="alignment"><set>Qt::AlignmentFlag::AlignLeading|Qt::AlignmentFlag::AlignLeft|Qt::AlignmentFlag::AlignTop</set></property><property name="wordWrap"><bool>true</bool></property><property name="textInteractionFlags"><set>Qt::TextInteractionFlag::TextSelectableByKeyboard|Qt::TextInteractionFlag::TextSelectableByMouse</set></property></widget></widget></item>
+        </layout></widget>
+       </widget></item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

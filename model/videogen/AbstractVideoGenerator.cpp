@@ -4,7 +4,9 @@
 
 #include "AbstractVideoGenerator.h"
 
-#include <QCoro/QCoroProcess>
+#include <chrono>
+
+#include <QCoro/QCoroTimer>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -101,13 +103,9 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
         // stderr kept OUT of stdout: the protocol is one JSON line per
         // request on stdout, and Python warnings on stderr must not corrupt it.
         m_worker->setProcessChannelMode(QProcess::SeparateChannels);
-        // GCC 13 ICEs when the co_await expression owns temporaries — keep
-        // the argument list in a named local.
         const QStringList workerArgs{scriptPath, QStringLiteral("--worker")};
         m_worker->start(python, workerArgs);
-        bool started = false;
-        started = co_await qCoro(*m_worker).waitForStarted();
-        if (!started)
+        if (!m_worker->waitForStarted(5000))
         {
             result.errorMessage = QObject::tr("Could not start the video generator (%1).")
                 .arg(m_worker->errorString());
@@ -156,10 +154,12 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
         {
             break;
         }
-        const int slice = qBound(1, timeoutMs - static_cast<int>(timer.elapsed()), 5000);
-        bool ready = false;
-        ready = co_await qCoro(*m_worker).waitForReadyRead(slice);
-        Q_UNUSED(ready)
+        // QCoroProcess's ready-read awaiter also connects to QProcess::finished.
+        // If the worker exits while that signal is being delivered, resuming
+        // this coroutine can destroy/reset the process from inside its own
+        // finished callback. Polling with a timer avoids that reentrant
+        // lifetime hazard while keeping the UI event loop responsive.
+        co_await QCoro::sleepFor(std::chrono::milliseconds(100));
     }
 
     if (doc.isNull() || !doc.isObject())
@@ -182,6 +182,7 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
     result.videoPath = obj.value(QStringLiteral("video")).toString();
     result.errorMessage = obj.value(QStringLiteral("error")).toString();
     result.rejected = obj.value(QStringLiteral("rejected")).toBool();
+    result.retryable = obj.value(QStringLiteral("retryable")).toBool(true);
     if (!result.videoPath.isEmpty() && !QFileInfo::exists(result.videoPath))
     {
         result.errorMessage = QObject::tr("The video generator reported %1 "

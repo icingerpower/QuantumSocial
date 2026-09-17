@@ -10,6 +10,9 @@ SET(GUI_FILES
     ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationPlan.cpp
     ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationPlan.h
     ${CMAKE_CURRENT_LIST_DIR}/DialogGenerationPlan.ui
+    ${CMAKE_CURRENT_LIST_DIR}/GenerationPlanSection.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/GenerationPlanSection.h
+    ${CMAKE_CURRENT_LIST_DIR}/GenerationPlanSection.ui
     ${CMAKE_CURRENT_LIST_DIR}/DialogHooks.cpp
     ${CMAKE_CURRENT_LIST_DIR}/DialogHooks.h
     ${CMAKE_CURRENT_LIST_DIR}/DialogHooks.ui

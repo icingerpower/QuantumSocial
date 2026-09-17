@@ -327,24 +327,57 @@ def _select_video_tool(page):
     return False
 
 
-def _attach_image(page, image):
-    """Uploads one input image through the "+" menu's upload entry; the menu
-    usually closed when the video tool was selected, so reopen it if needed.
-    Best-effort: Veo also works text-only."""
+def _attachment_count(page):
+    """Count loaded image previews in the composer, excluding chat history.
+
+    A file chooser accepting a path is not proof that Gemini attached it.
+    Fail closed if a future UI no longer exposes a recognizable preview.
+    """
+    return page.locator(
+        'file-preview img, [class*="file-preview"] img, '
+        '[class*="attachment"] img, img[src^="blob:"]'
+    ).evaluate_all("""images => images.filter(img => {
+        if (img.closest('user-query, model-response, [data-message-id]'))
+            return false;
+        const box = img.getBoundingClientRect();
+        const preview = img.closest('file-preview, [class*="file-preview"], '
+                                    + '[class*="attachment"]');
+        const busy = preview && preview.querySelector(
+            '[role="progressbar"], [aria-busy="true"], mat-spinner');
+        return box.width > 0 && box.height > 0 && img.checkVisibility()
+            && img.complete && img.naturalWidth > 0 && !busy;
+    }).length""")
+
+
+def _attach_image(page, image, timeout_s=45):
+    """Choose the file once, then wait for its loaded attachment preview."""
+    if not os.path.isfile(image):
+        _log(f"attach: image file is missing: {image}")
+        return False
+    before = _attachment_count(page)
+    chosen = False
     for attempt in range(2):
         for text in UPLOAD_TEXTS:
             try:
                 with page.expect_file_chooser(timeout=1500) as chooser_info:
                     page.get_by_text(text, exact=False).first.click(timeout=800)
                 chooser_info.value.set_files(image)
-                page.wait_for_timeout(2000)
-                _log(f"attach: uploaded {image} via '{text}'")
-                return True
+                chosen = True
+                break
             except Exception:
                 continue
+        if chosen:
+            break
         if attempt == 0 and not _open_plus_menu(page):
             break
-    _log(f"attach: no upload entry found for {image} — continuing text-only")
+    if chosen:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if _attachment_count(page) > before:
+                _log(f"attach: loaded preview confirmed for {image}")
+                return True
+            page.wait_for_timeout(250)
+    _log(f"attach: could not confirm attachment for {image}; prompt will not be sent")
     return False
 
 
@@ -379,32 +412,51 @@ def _select_aspect(page, prompt):
     _log("aspect: wanted option not found")
 
 
-def _submit_prompt(page, editor, prompt):
-    """Submits via the send button (Enter alone proved unreliable in the Veo
-    editor), verifies the editor emptied, falls back to Enter."""
-    submitted_via = None
-    for name in ("Envoyer", "Send", "Submit"):
+def _submit_prompt(page, editor, prompt, timeout_s=30, retry_interval_s=5,
+                   required_attachments=0):
+    """Wait for Send to be enabled and confirm the composer actually clears.
+
+    Retry ignored clicks, with a grace period for asynchronous submission.
+    Never interpret a missing/detached editor or a click returning as success.
+    """
+    deadline = time.monotonic() + timeout_s
+    next_click = 0
+    attempts = 0
+    send_buttons = page.get_by_role(
+        "button", name=re.compile(r"Envoyer|Send|Submit", re.IGNORECASE))
+    while time.monotonic() < deadline:
         try:
-            page.get_by_role("button", name=name, exact=False).first.click(timeout=1200)
-            submitted_via = f"button '{name}'"
-            break
-        except Exception:
-            continue
-    if submitted_via is None:
-        page.keyboard.press("Enter")
-        submitted_via = "Enter"
-    page.wait_for_timeout(2000)
-    try:
-        still = editor.inner_text().strip()
-        if still and prompt[:30] in still:
-            _log(f"submit via {submitted_via}: editor still filled — pressing Enter")
-            editor.click(timeout=2000)
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(2000)
-        else:
-            _log(f"submitted via {submitted_via}")
-    except Exception:
-        _log(f"submitted via {submitted_via} (editor state unknown)")
+            if editor.is_visible():
+                value = editor.evaluate(
+                    "el => ('value' in el ? el.value : el.innerText)", timeout=500)
+                if not value.strip():
+                    _log("submit: confirmed composer cleared")
+                    return True
+                # Do not send a different draft if the user edited it.
+                if value.strip() != prompt.strip():
+                    _log("submit: draft changed; stopping automatic submission")
+                    return False
+                if time.monotonic() >= next_click and attempts < 3:
+                    if _attachment_count(page) < required_attachments:
+                        _log("submit: required image preview disappeared; stopping")
+                        return False
+                    for index in range(send_buttons.count()):
+                        button = send_buttons.nth(index)
+                        if not button.is_visible() or not button.is_enabled():
+                            continue
+                        # Set the retry delay even if Playwright times out after
+                        # dispatching the click; Gemini may still accept it.
+                        attempts += 1
+                        next_click = time.monotonic() + retry_interval_s
+                        button.click(timeout=1000)
+                        _log(f"submit: clicked Send (attempt {attempts}), awaiting confirmation")
+                        break
+        except Exception as exc:
+            if _is_target_closed_error(exc):
+                raise
+        page.wait_for_timeout(250)
+    _log("submit: no confirmed submission before timeout")
+    return False
 
 
 def _is_target_closed_error(exc):
@@ -531,18 +583,28 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
         return ("error", "Could not find Gemini's video (Veo) tool button — "
                          "the web UI may have changed; update the selectors in "
                          "generate_video_gemini.py.")
+    # Changing the video format can rebuild the composer. Do it before
+    # attaching files so a rebuilt editor cannot silently drop the image.
+    _select_aspect(page, prompt)
+    attachment_baseline = _attachment_count(page)
     for image in image_paths:
-        _attach_image(page, image)
+        if not _attach_image(page, image):
+            _dump_state(page, "attachment_failed")
+            return ("error", f"Could not confirm the image attachment: {image}. "
+                             "The prompt was not sent.")
 
     # Snapshot the page text BEFORE submitting so refusal markers are only
     # matched in what appears after our prompt.
     before_text = page.locator("body").inner_text()
 
-    _select_aspect(page, prompt)
     editor = page.get_by_role("textbox").first
     editor.click(timeout=10000)
     editor.fill(prompt)
-    _submit_prompt(page, editor, prompt)
+    if not _submit_prompt(page, editor, prompt,
+                          required_attachments=attachment_baseline + len(image_paths)):
+        _dump_state(page, "submission_failed")
+        return ("error", "Gemini submission could not be confirmed. "
+                         "Check the prompt and image attachment in the browser.")
     _log("waiting for the video or a refusal")
 
     while time.time() < min(deadline, attempt_deadline):
@@ -958,7 +1020,10 @@ def _read_request(request):
     output_dir = request.get("outputDir") or ""
     prompt_path = request.get("promptFile") or ""
     settings = request.get("settings") or {}
-    images = [p for p in (request.get("images") or []) if os.path.isfile(p)]
+    images = request.get("images") or []
+    for image in images:
+        if not os.path.isfile(image):
+            raise ValueError(f"image file is missing: {image}")
     if not output_dir:
         raise ValueError("the request has no outputDir")
     try:
@@ -992,6 +1057,7 @@ def _worker_main():
         from playwright.sync_api import sync_playwright
     except ImportError:
         _respond({"video": None, "rejected": False,
+                  "retryable": False,
                   "error": "Playwright is not installed (pip install playwright "
                            "&& playwright install chromium)"})
         return 1
@@ -1125,13 +1191,12 @@ def main():
     except json.JSONDecodeError:
         settings = {}
     try:
-        prompt, output_dir, _unused, settings = _read_request({
+        prompt, output_dir, image_paths, settings = _read_request({
             "promptFile": prompt_path, "outputDir": output_dir,
-            "settings": settings, "images": []})
+            "settings": settings, "images": sys.argv[4:]})
     except ValueError as exc:
         _emit(error=str(exc))
         return 1
-    image_paths = [p for p in sys.argv[4:] if os.path.isfile(p)]
 
     try:
         from playwright.sync_api import sync_playwright

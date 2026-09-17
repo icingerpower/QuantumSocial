@@ -1,11 +1,10 @@
 #include "DialogGenerationPlan.h"
+#include "GenerationPlanSection.h"
 #include "ui_DialogGenerationPlan.h"
 
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
-#include <QFrame>
-#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLabel>
@@ -16,7 +15,6 @@
 #include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
-#include <QSplitter>
 #include <QStackedWidget>
 #include <QVBoxLayout>
 
@@ -47,14 +45,6 @@ DialogGenerationPlan::DialogGenerationPlan(const QList<QList<PlanProperty>> &pro
     {
         setWindowTitle(tr("Generation plan — %1").arg(videoFormatLabel));
     }
-    ui->labelHint->setText(tr(
-        "Tick what to generate (several options possible). Each option offers 3 "
-        "prompt slots — Animate/keep source, Reimagine (new model & "
-        "background), Creative — pick one, WRITE ITS PROMPT yourself on the "
-        "left (load/save it from the saved-prompts row above the editor), "
-        "and adjust the A/B properties below it (untick to drop, or pick a "
-        "different value); the live Final prompt is on the right."));
-
     // Pre-seed BEFORE any section is built, keyed by (strategy index,
     // property id) — see _syncKey() — so every section's first-built page
     // for a given key already agrees on the starting checked state/pick,
@@ -313,70 +303,30 @@ DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
     const QList<QList<PlanProperty>> &propertiesPerStrategy, bool checked)
 {
     OptionSection section;
-    section.group = new QGroupBox{title, this};
-    section.group->setCheckable(true);  // unchecked = children disabled
+    section.group = new GenerationPlanSection{this};
+    section.group->setTitle(title);
     section.group->setChecked(checked);
-
-    auto *groupLayout = new QVBoxLayout{section.group};
-
-    const QStringList strategyLabels{
-        tr("Animate / keep source"), tr("Reimagine (new model & background)"), tr("Creative")};
-    const QStringList strategyTooltips{
-        tr("Suggested use: a minimal-change take — animate/refine only, no new scene."),
-        tr("Suggested use: same product, a new model/background/outfit — realistic, warm, modern setting."),
-        tr("Suggested use: whatever else you want to try — just an organizational label, write any prompt here.")};
-
-    auto *strategyRow = new QHBoxLayout{};
     section.strategyButtons = new QButtonGroup{section.group};
-    for (int i = 0; i < kStrategyCount; ++i)
+    const QList<QRadioButton *> radioButtons = section.group->strategyButtons();
+    for (int i = 0; i < radioButtons.size(); ++i)
     {
-        auto *radio = new QRadioButton{strategyLabels.value(i, tr("Option %1").arg(i + 1)),
-                                       section.group};
-        radio->setToolTip(strategyTooltips.value(i));
-        radio->setChecked(i == 0);
-        section.strategyButtons->addButton(radio, i);
-        strategyRow->addWidget(radio);
+        section.strategyButtons->addButton(radioButtons[i], i);
     }
-    strategyRow->addStretch(1);
-    groupLayout->addLayout(strategyRow);
 
-    section.strategyStack = new QStackedWidget{section.group};
+    section.strategyStack = section.group->strategyStack();
     for (int i = 0; i < kStrategyCount; ++i)
     {
         auto page = QSharedPointer<StrategyPage>::create();
-
-        auto *pageWidget = new QWidget{section.strategyStack};
-        auto *pageLayout = new QVBoxLayout{pageWidget};
-        pageLayout->setContentsMargins(0, 0, 0, 0);
-
-        auto *splitter = new QSplitter{Qt::Horizontal, pageWidget};
-        splitter->setChildrenCollapsible(false);
-
-        // LEFT: editable prompt + this strategy's property rows.
-        auto *leftWidget = new QWidget{splitter};
-        auto *leftLayout = new QVBoxLayout{leftWidget};
-        leftLayout->addWidget(new QLabel{tr("Prompt:"), leftWidget});
 
         // Saved-prompt row: one shared library (SavedPrompts) usable from
         // every strategy slot/content kind — "Load" pulls a named prompt's
         // text in, "Save..." names (or renames-over an existing name, which
         // is how a saved prompt gets edited) the current text into it.
-        auto *savedPromptRow = new QHBoxLayout{};
-        auto *savedPromptCombo = new QComboBox{leftWidget};
-        savedPromptCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        auto *savedPromptCombo = section.group->savedPromptCombo(i);
         m_savedPromptCombos << savedPromptCombo;
-        auto *buttonLoadPrompt = new QPushButton{tr("Load"), leftWidget};
-        auto *buttonSavePrompt = new QPushButton{tr("Save..."), leftWidget};
-        savedPromptRow->addWidget(savedPromptCombo, 1);
-        savedPromptRow->addWidget(buttonLoadPrompt);
-        savedPromptRow->addWidget(buttonSavePrompt);
-        leftLayout->addLayout(savedPromptRow);
-
-        page->promptEdit = new QPlainTextEdit{leftWidget};
-        page->promptEdit->setPlaceholderText(
-            tr("Write your prompt here (or load a saved one above)."));
-        page->promptEdit->setMinimumHeight(90);
-        leftLayout->addWidget(page->promptEdit);
+        auto *buttonLoadPrompt = section.group->loadPromptButton(i);
+        auto *buttonSavePrompt = section.group->savePromptButton(i);
+        page->promptEdit = section.group->promptEdit(i);
 
         connect(buttonLoadPrompt, &QPushButton::clicked, this,
                 [this, page, savedPromptCombo]() {
@@ -411,13 +361,8 @@ DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
         const QList<PlanProperty> properties = propertiesPerStrategy.value(i);
         if (!properties.isEmpty())
         {
-            leftLayout->addWidget(new QLabel{
-                tr("A/B properties — untick to drop, or pick a different value:"), leftWidget});
-            auto *scrollArea = new QScrollArea{leftWidget};
-            scrollArea->setWidgetResizable(true);
-            scrollArea->setFrameShape(QFrame::NoFrame);
-            auto *scrollContent = new QWidget{scrollArea};
-            auto *scrollLayout = new QVBoxLayout{scrollContent};
+            auto *scrollLayout = section.group->propertyLayout(i);
+            auto *scrollContent = section.group->propertyScroll(i)->widget();
             for (const PlanProperty &property : properties)
             {
                 const QString syncKey = _syncKey(i, property.propertyId);
@@ -472,36 +417,13 @@ DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
                 m_propertyRows[syncKey] << row;
             }
             scrollLayout->addStretch(1);
-            scrollArea->setWidget(scrollContent);
-            leftLayout->addWidget(scrollArea, 1);
         }
         else
         {
-            leftLayout->addStretch(1);
+            section.group->propertyLabel(i)->hide();
+            section.group->propertyScroll(i)->hide();
         }
-        splitter->addWidget(leftWidget);
-
-        // RIGHT: live "Final prompt" preview.
-        auto *rightWidget = new QWidget{splitter};
-        auto *rightLayout = new QVBoxLayout{rightWidget};
-        rightLayout->addWidget(new QLabel{tr("Final prompt:"), rightWidget});
-        page->previewLabel = new QLabel{rightWidget};
-        page->previewLabel->setWordWrap(true);
-        page->previewLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-        page->previewLabel->setTextInteractionFlags(
-            Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-        page->previewLabel->setMargin(6);
-        auto *previewScroll = new QScrollArea{rightWidget};
-        previewScroll->setWidgetResizable(true);
-        previewScroll->setFrameShape(QFrame::StyledPanel);
-        previewScroll->setWidget(page->previewLabel);
-        rightLayout->addWidget(previewScroll, 1);
-        splitter->addWidget(rightWidget);
-        splitter->setStretchFactor(0, 1);
-        splitter->setStretchFactor(1, 1);
-
-        pageLayout->addWidget(splitter);
-        section.strategyStack->addWidget(pageWidget);
+        page->previewLabel = section.group->previewLabel(i);
         section.strategies << page;
 
         connect(page->promptEdit, &QPlainTextEdit::textChanged, this, [this, page]() {
@@ -511,8 +433,6 @@ DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
 
         _recomputeFinal(*page);
     }
-    groupLayout->addWidget(section.strategyStack);
-
     auto *stack = section.strategyStack;
     connect(section.strategyButtons, &QButtonGroup::idToggled, this,
             [this, stack](int id, bool buttonChecked) {
@@ -537,12 +457,8 @@ void DialogGenerationPlan::_addCliCombo(OptionSection &section,
                                         const QList<AbstractCli *> &availableClis,
                                         const QString &settingsKey)
 {
-    auto *row = new QWidget{section.group};
-    auto *rowLayout = new QHBoxLayout{row};
-    rowLayout->setContentsMargins(0, 0, 0, 0);
-    rowLayout->addWidget(new QLabel{tr("CLI:"), row});
-
-    section.cliCombo = new QComboBox{row};
+    section.group->cliRow()->show();
+    section.cliCombo = section.group->cliCombo();
     for (AbstractCli *cli : availableClis)
     {
         if (cli->canGenImages())
@@ -568,11 +484,6 @@ void DialogGenerationPlan::_addCliCombo(OptionSection &section,
             section.cliCombo->setCurrentIndex(savedIndex);
         }
     }
-    rowLayout->addWidget(section.cliCombo, 1);
-
-    // Inserted right under the group's title, above the strategy row.
-    auto *groupLayout = qobject_cast<QVBoxLayout *>(section.group->layout());
-    groupLayout->insertWidget(0, row);
 }
 
 void DialogGenerationPlan::_updateOkButton()

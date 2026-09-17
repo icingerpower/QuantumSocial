@@ -4,8 +4,11 @@
 
 #include "VideoGenerationWorkflow.h"
 
-#include <QCoro/QCoroProcess>
+#include <chrono>
+
+#include <QCoro/QCoroTimer>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -226,6 +229,12 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                 // so it can never end up duplicated across rounds.
                 currentPrompt = perturbed;
                 break;
+            }
+            if (!result.retryable)
+            {
+                _finish({}, tr("Video generator setup error: %1")
+                    .arg(result.errorMessage));
+                co_return;
             }
             // A technical failure repeating identically is deterministic
             // (broken selector, missing dependency...) — retrying or asking
@@ -582,15 +591,25 @@ QCoro::Task<QStringList> VideoGenerationWorkflow::_extractKeyFrames(
     };
     QProcess process;
     process.start(ffmpeg, args);
-    if (!co_await qCoro(process).waitForStarted())
+    if (!process.waitForStarted(5000))
     {
         *errorMessage = tr("Could not start ffmpeg (%1).").arg(process.errorString());
         co_return QStringList{};
     }
-    if (!co_await qCoro(process).waitForFinished(120'000))
+    // A QCoroProcess finished-signal awaiter resumes inside QProcess's own
+    // signal emission. This local QProcess can then be destroyed before the
+    // callback unwinds, which crashed just after all five frames were saved.
+    QElapsedTimer timer;
+    timer.start();
+    while (process.state() != QProcess::NotRunning && timer.elapsed() < 120'000)
+    {
+        co_await QCoro::sleepFor(std::chrono::milliseconds(100));
+    }
+    if (process.state() != QProcess::NotRunning)
     {
         *errorMessage = tr("ffmpeg timed out.");
         process.kill();
+        process.waitForFinished(2000);
         co_return QStringList{};
     }
 
