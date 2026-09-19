@@ -161,6 +161,41 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
         _finish({}, tr("Unknown video backend \"%1\".").arg(request.generatorId));
         co_return;
     }
+    if (request.repeatUnchanged)
+    {
+        QStringList images = request.extraImagePaths;
+        if (!request.imagePath.isEmpty())
+        {
+            images.prepend(request.imagePath);
+        }
+        QVariantMap settings = request.settings;
+        settings.insert(QStringLiteral("preservePrompt"), true);
+        emit progress(tr("Generating another video with the saved prompt and configuration..."));
+        AbstractVideoGenerator::Result result;
+        constexpr int maxBrowserRecoveries = 2;
+        for (int recovery = 0; recovery <= maxBrowserRecoveries; ++recovery)
+        {
+            if (m_cancelled)
+            {
+                _finish({}, tr("Cancelled."));
+                co_return;
+            }
+            result = co_await generator->generate(request.prompt, images, request.outputDir, settings);
+            if (!result.videoPath.isEmpty() || !result.browserLost || !result.retryable
+                || result.rejected || recovery == maxBrowserRecoveries || m_cancelled)
+            {
+                break;
+            }
+            emit progress(tr("Browser connection lost. Relaunching and retrying the same "
+                             "prompt and images (%1/%2)...")
+                .arg(recovery + 1).arg(maxBrowserRecoveries));
+            co_await QCoro::sleepFor(std::chrono::milliseconds(500));
+        }
+        // Preserve a completed take even if Cancel was clicked while it ran;
+        // the pane stops the remaining jobs in the batch.
+        _finish(result.videoPath, result.errorMessage);
+        co_return;
+    }
     if (!request.decisionCli)
     {
         _finish({}, tr("No CLI available to drive the generation workflow."));

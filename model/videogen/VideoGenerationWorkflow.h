@@ -46,6 +46,7 @@ public:
     struct Request
     {
         QString generatorId;        // AbstractVideoGenerator id
+        bool repeatUnchanged = false; // replay one take without rewriting its inputs
         QString prompt;
         QString imagePath;          // source image; empty for text-only
         // Extra STATIC reference image(s) beyond imagePath (see

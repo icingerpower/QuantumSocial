@@ -19,9 +19,10 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Multimedia Multim
 #   cmake .. -DCMAKE_PREFIX_PATH=/home/cedric/Qt/6.8.3/gcc_64 -DUSE_QT_VERSION=6 \
 #            -DCMAKE_BUILD_TYPE=Release
 #   make && sudo make install
-set(Qt_DIR_HINT "${Qt${QT_VERSION_MAJOR}_DIR}")
-list(APPEND CMAKE_PREFIX_PATH "${Qt_DIR_HINT}/..")
-find_package(QCoro6 REQUIRED COMPONENTS Core)
+# setup_qcoro() (mirrors ../AmazonTemplate3/common.cmake) tries several install
+# layouts since the QCoro6 config file location varies by distro/build.
+include(common.cmake)
+setup_qcoro(COMPONENTS Core)
 
 include(../common/aicli/aicli.cmake)
 include(../common/gui/progress/progress.cmake)

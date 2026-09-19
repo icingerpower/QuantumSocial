@@ -30,8 +30,8 @@ public:
 
     QList<Entry> entries() const;
     // Adds a new entry, or overwrites the existing one with the same name
-    // (case-insensitive) — this is how an existing saved prompt is
-    // "edited": load it, change the text, save under the same name.
+    // (case-insensitive). The generation plan's Edit action uses this to
+    // persist changes to the selected saved prompt.
     // No-op if either name or prompt is empty (after trimming).
     void savePrompt(const QString &name, const QString &prompt);
 

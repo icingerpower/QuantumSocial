@@ -126,6 +126,7 @@ private slots:
     // video generation that actually rendered like a wanted viral-style
     // result, into the favorite-video-prompts list.
     void _favoriteCurrentVideoPrompt();
+    void _generateAgain();
 
 private:
     Ui::PaneGeneration *ui;
@@ -149,7 +150,6 @@ private:
     // generation, when it is a video with one on disk — empty otherwise, in
     // which case the "Favorite this video prompt" button stays disabled.
     QString m_currentPreviewVideoPrompt;
-    VideoGenerationWorkflow *m_videoWorkflow;
     // Content of the selected project, shown in the Generation page: the
     // project folder's files (live, so generated videos/images appear as
     // soon as they land) and the suggested hooks/descriptions.
@@ -234,9 +234,14 @@ private:
         // time; two ticked options can point at different slots, so this
         // must travel with the job, not live on a plan-wide member.
         QList<QUuid> keptValueIds;
+        bool repeatUnchanged = false;
+        QVariantMap settings;
+        QStringList sourceImageFiles; // repeat jobs: relative to their own staging directory
     };
     QHash<QString, QList<GenerationJob>> m_jobGroups;
     int m_jobCounter = 0;
+    bool m_batchCancelled = false;
+    void _queueJobs(int row, const QUuid &projectId, const QList<GenerationJob> &jobs);
     // One in-flight coroutine per group currently running an image/slideshow
     // job (kept alive by this map — a QCoro::Task must not be destroyed
     // before the coroutine it represents completes). std::unordered_map,

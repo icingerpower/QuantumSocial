@@ -47,6 +47,7 @@
 
 #include "../../../common/workingdirectory/WorkingDirectoryManager.h"
 
+#include "../DialogGenerateAgain.h"
 #include "../DialogGenerationOptions.h"
 #include "../DialogGenerationPlan.h"
 #include "../DialogHooks.h"
@@ -64,6 +65,7 @@
 #include "model/videogen/AbstractVideoGenerator.h"
 #include "model/videogen/TableGenerationSettings.h"
 #include "model/videogen/VideoGenerationWorkflow.h"
+#include "model/videogen/VideoGenerationRecipe.h"
 #include "model/videos/TableVideos.h"
 
 namespace {
@@ -273,7 +275,6 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
     , m_favoriteHooks(favoriteHooks)
     , m_favoriteVideoPrompts(favoriteVideoPrompts)
     , m_savedPrompts(savedPrompts)
-    , m_videoWorkflow(new VideoGenerationWorkflow(this))
     , m_filesModel(new QFileSystemModel(this))
     , m_hooksModel(new QStandardItemModel(this))
 {
@@ -354,44 +355,17 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
     // the standard copy context menu), and a stacked image label /
     // embedded video player for whichever content the selected generation
     // has produced.
-    auto *previewLayout = new QVBoxLayout{ui->widgetPreview};
-    auto *hookRow = new QHBoxLayout{};
-    m_labelGenerationHook = new QLabel{ui->widgetPreview};
-    QFont hookFont = m_labelGenerationHook->font();
-    hookFont.setBold(true);
-    m_labelGenerationHook->setFont(hookFont);
-    m_labelGenerationHook->setWordWrap(true);
-    m_labelGenerationHook->setTextInteractionFlags(
-        Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-    m_labelGenerationHook->setCursor(Qt::IBeamCursor);
-    hookRow->addWidget(m_labelGenerationHook, 1);
-    m_buttonFavoriteHook = new QPushButton{tr("★ Favorite this hook"), ui->widgetPreview};
-    m_buttonFavoriteHook->setToolTip(
-        tr("Save this hook as a proven-good example — used as style/tone "
-           "inspiration for future hook suggestions (Settings tab)"));
-    m_buttonFavoriteHook->setEnabled(false);
+    auto *previewLayout = ui->layoutPreview;
+    m_labelGenerationHook = ui->labelGenerationHook;
+    m_labelGenerationDescription = ui->labelGenerationDescription;
+    m_buttonFavoriteHook = ui->buttonFavoriteHook;
+    m_buttonFavoriteVideoPrompt = ui->buttonFavoriteVideoPrompt;
     connect(m_buttonFavoriteHook, &QPushButton::clicked,
             this, &PaneGeneration::_favoriteCurrentHook);
-    hookRow->addWidget(m_buttonFavoriteHook);
-    m_buttonFavoriteVideoPrompt = new QPushButton{
-        tr("★ Favorite this video prompt"), ui->widgetPreview};
-    m_buttonFavoriteVideoPrompt->setToolTip(
-        tr("Save this video's prompt as a proven-good example (only "
-           "available for video generations that still have their prompt "
-           "on disk) — used as style/pacing reference for future video "
-           "prompts (Settings tab)"));
-    m_buttonFavoriteVideoPrompt->setEnabled(false);
     connect(m_buttonFavoriteVideoPrompt, &QPushButton::clicked,
             this, &PaneGeneration::_favoriteCurrentVideoPrompt);
-    hookRow->addWidget(m_buttonFavoriteVideoPrompt);
-    previewLayout->addLayout(hookRow);
-
-    m_labelGenerationDescription = new QLabel{ui->widgetPreview};
-    m_labelGenerationDescription->setWordWrap(true);
-    m_labelGenerationDescription->setTextInteractionFlags(
-        Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-    m_labelGenerationDescription->setCursor(Qt::IBeamCursor);
-    previewLayout->addWidget(m_labelGenerationDescription);
+    connect(ui->buttonGenerateAgain, &QPushButton::clicked,
+            this, &PaneGeneration::_generateAgain);
 
     m_stackedPreview = new QStackedWidget{ui->widgetPreview};
     m_labelPreviewEmpty = new QLabel{tr("Select a generation to preview its content."),
@@ -576,6 +550,7 @@ void PaneGeneration::_currentProjectChanged(const QModelIndex &current)
         m_buttonFavoriteHook->setEnabled(false);
         m_currentPreviewVideoPrompt.clear();
         m_buttonFavoriteVideoPrompt->setEnabled(false);
+        ui->buttonGenerateAgain->setEnabled(false);
         return;
     }
     m_projectMapper->setCurrentModelIndex(current);
@@ -1426,14 +1401,20 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
         QList<GenerationJob> jobs;
         if (plan.oneImage && !plan.imagePrompt.isEmpty())
         {
-            jobs << GenerationJob{GenerationJob::Image, plan.imagePrompt, QString{},
-                                  dialog.imageCli(), plan.imagePropertyValueIds};
+            for (int take = 0; take < plan.imageCount; ++take)
+            {
+                jobs << GenerationJob{GenerationJob::Image, plan.imagePrompt, QString{},
+                                      dialog.imageCli(), plan.imagePropertyValueIds};
+            }
         }
         if (plan.slideshow && !plan.slideshowPrompt.isEmpty())
         {
-            jobs << GenerationJob{GenerationJob::Slideshow, plan.slideshowPrompt,
-                                  QString{}, dialog.slideshowCli(),
-                                  plan.slideshowPropertyValueIds};
+            for (int take = 0; take < plan.slideshowCount; ++take)
+            {
+                jobs << GenerationJob{GenerationJob::Slideshow, plan.slideshowPrompt,
+                                      QString{}, dialog.slideshowCli(),
+                                      plan.slideshowPropertyValueIds};
+            }
         }
         for (const auto &video : plan.videos)
         {
@@ -1442,42 +1423,60 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
             // per-attempt perturbation drops the prompt's last sentence, and
             // its CLI rewrites replace the prompt wholesale — both used to
             // silently lose a format line baked in this early).
-            jobs << GenerationJob{GenerationJob::Video, video.prompt,
-                                  video.generatorId, nullptr, video.propertyValueIds};
+            for (int take = 0; take < video.count; ++take)
+            {
+                jobs << GenerationJob{GenerationJob::Video, video.prompt,
+                                      video.generatorId, nullptr, video.propertyValueIds};
+            }
         }
         m_runVideoFormatLabel = videoFormatLabel;
-        if (jobs.isEmpty())
-        {
-            _finishProgress(tr("Nothing ticked to generate."));
-            return;
-        }
-
-        m_jobGroups.clear();
-        for (const GenerationJob &job : jobs)
-        {
-            m_jobGroups[_jobGroupKey(job)] << job;
-        }
-        // Snapshotted ONCE, before any job folder exists, so concurrent
-        // jobs never see each other's in-progress files (see
-        // _prepareJobStaging).
-        m_baseStagingEntries = m_projects->stagingDir(row).entryInfoList(
-            QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
-
-        _logProgress(tr("%1 job(s) in %2 group(s) queued — different groups "
-            "run in parallel.").arg(jobs.size()).arg(m_jobGroups.size()));
-        setEnabled(false);
-        // Deferred to the next event-loop turn: a job that finishes
-        // SYNCHRONOUSLY (e.g. "no CLI chosen" skip) could otherwise empty
-        // m_jobGroups and trigger the all-done wrap-up (hooks dialog)
-        // before every OTHER group even got a chance to start.
-        const auto groupKeys = m_jobGroups.keys();
-        for (const QString &groupKey : groupKeys)
-        {
-            QTimer::singleShot(0, this, [this, row, projectId, groupKey]() {
-                _runNextInGroup(row, projectId, groupKey);
-            });
-        }
+        _queueJobs(row, projectId, jobs);
     });
+}
+
+void PaneGeneration::_queueJobs(int row, const QUuid &projectId,
+                                 const QList<GenerationJob> &jobs)
+{
+    if (jobs.isEmpty())
+    {
+        _finishProgress(tr("Nothing ticked to generate."));
+        return;
+    }
+
+    m_jobGroups.clear();
+    m_jobCounter = 0;
+    for (GenerationJob job : jobs)
+    {
+        if (job.kind == GenerationJob::Video && !job.repeatUnchanged)
+        {
+            job.settings = m_generationSettings->settingsFor(job.generatorId);
+        }
+        m_jobGroups[_jobGroupKey(job)] << job;
+    }
+    // Snapshotted ONCE, before any job folder exists, so concurrent
+    // jobs never see each other's in-progress files (see
+    // _prepareJobStaging).
+    m_baseStagingEntries = m_projects->stagingDir(row).entryInfoList(
+        QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot);
+
+    _logProgress(tr("%1 job(s) in %2 group(s) queued — different groups "
+        "run in parallel.").arg(jobs.size()).arg(m_jobGroups.size()));
+    if (m_progress.cancelBtn)
+    {
+        m_progress.cancelBtn->show();
+    }
+    setEnabled(false);
+    // Deferred to the next event-loop turn: a job that finishes
+    // SYNCHRONOUSLY (e.g. "no CLI chosen" skip) could otherwise empty
+    // m_jobGroups and trigger the all-done wrap-up (hooks dialog)
+    // before every OTHER group even got a chance to start.
+    const auto groupKeys = m_jobGroups.keys();
+    for (const QString &groupKey : groupKeys)
+    {
+        QTimer::singleShot(0, this, [this, row, projectId, groupKey]() {
+            _runNextInGroup(row, projectId, groupKey);
+        });
+    }
 }
 
 QString PaneGeneration::_jobGroupKey(const GenerationJob &job)
@@ -1559,6 +1558,10 @@ QString PaneGeneration::_resolveSecondaryImage(const QDir &jobStaging) const
 void PaneGeneration::_runNextInGroup(int row, const QUuid &projectId, QString groupKey)
 {
     QList<GenerationJob> &queue = m_jobGroups[groupKey];
+    if (m_batchCancelled)
+    {
+        queue.clear();
+    }
     if (queue.isEmpty())
     {
         m_jobGroups.remove(groupKey);
@@ -1570,7 +1573,12 @@ void PaneGeneration::_runNextInGroup(int row, const QUuid &projectId, QString gr
             setEnabled(true);
             QDir{m_projects->projectDir(row).absoluteFilePath(
                 QStringLiteral("generations/_staging"))}.removeRecursively();
-            if (!m_runGenerations.isEmpty())
+            if (m_batchCancelled)
+            {
+                _finishProgress(tr("Cancelled. %1 completed generation(s) saved.")
+                    .arg(m_runGenerations.size()));
+            }
+            else if (!m_runGenerations.isEmpty())
             {
                 // The last generation to finish is already selected/previewed
                 // (see _runImageGenerationJob / _startVideoGeneration) — pick
@@ -1613,7 +1621,9 @@ QCoro::Task<void> PaneGeneration::_runImageGenerationJob(int row, QUuid projectI
     if (!generator || !job.cli)
     {
         _logProgress(tr("[%1] Skipped: no image-capable CLI was chosen.").arg(label));
-        _runNextInGroup(row, projectId, groupKey);
+        QTimer::singleShot(0, this, [this, row, projectId, groupKey]() {
+            _runNextInGroup(row, projectId, groupKey);
+        });
         co_return;
     }
 
@@ -1669,7 +1679,9 @@ QCoro::Task<void> PaneGeneration::_runImageGenerationJob(int row, QUuid projectI
         // job's group is aborted; independent groups keep going.
         _logProgress(tr("[%1] Failed: %2").arg(label, result.errorMessage));
         m_jobGroups[groupKey].clear();
-        _runNextInGroup(row, projectId, groupKey);
+        QTimer::singleShot(0, this, [this, row, projectId, groupKey]() {
+            _runNextInGroup(row, projectId, groupKey);
+        });
         co_return;
     }
 
@@ -1691,7 +1703,9 @@ QCoro::Task<void> PaneGeneration::_runImageGenerationJob(int row, QUuid projectI
             break;
         }
     }
-    _runNextInGroup(row, projectId, groupKey);
+    QTimer::singleShot(0, this, [this, row, projectId, groupKey]() {
+        _runNextInGroup(row, projectId, groupKey);
+    });
 }
 
 AbstractCli *PaneGeneration::_imageCli() const
@@ -1723,33 +1737,29 @@ void PaneGeneration::_startVideoGeneration(int row, const QUuid &projectId,
                                            const QDir &jobStaging)
 {
     const QString label = _jobLabel(job);
-    // NOTE: m_videoWorkflow is a single shared instance. Grouping by
-    // generatorId means two jobs on the SAME video backend never overlap,
-    // but if a SECOND AbstractVideoGenerator backend existed and two video
-    // jobs on DIFFERENT backends were both ticked, they'd land in different
-    // groups (safe to run concurrently by _jobGroupKey) yet still contend
-    // for this one instance. Only one video backend is registered today, so
-    // this cannot currently happen; supporting it for real would need one
-    // VideoGenerationWorkflow instance per in-flight video job.
-    if (m_videoWorkflow->isRunning())
-    {
-        _logProgress(tr("[%1] Skipped: another video generation is already "
-            "running.").arg(label));
-        _runNextInGroup(row, projectId, groupKey);
-        return;
-    }
+    // Each job owns its workflow and signal connections. Its finished handler
+    // runs queued, after the coroutine has returned, before starting the next.
+    auto *workflow = new VideoGenerationWorkflow(this);
 
     VideoGenerationWorkflow::Request request;
     request.generatorId = job.generatorId;
+    request.repeatUnchanged = job.repeatUnchanged;
     request.prompt = job.prompt;
-    request.imagePath = _resolveJobImage(jobStaging);
+    request.imagePath = job.repeatUnchanged ? QString{} : _resolveJobImage(jobStaging);
     // The project's optional second image — extra static reference material
     // (see VideoGenerationWorkflow::Request::extraImagePaths), never subject
     // to the self-correction loop that regenerates imagePath.
-    const QString secondaryImage = _resolveSecondaryImage(jobStaging);
+    const QString secondaryImage = job.repeatUnchanged ? QString{} : _resolveSecondaryImage(jobStaging);
     if (!secondaryImage.isEmpty())
     {
         request.extraImagePaths << secondaryImage;
+    }
+    if (job.repeatUnchanged)
+    {
+        for (const QString &fileName : job.sourceImageFiles)
+        {
+            request.extraImagePaths << jobStaging.absoluteFilePath(fileName);
+        }
     }
     // Everything the workflow produces (video, prompt file, rejected takes,
     // extracted frames) lands in this job's OWN isolated staging folder —
@@ -1759,7 +1769,7 @@ void PaneGeneration::_startVideoGeneration(int row, const QUuid &projectId,
         m_projects->data(m_projects->index(row, TableProjects::IND_KEYWORD)).toString(),
         m_projects->data(m_projects->index(row, TableProjects::IND_HOOK)).toString());
     request.videoFormatLabel = m_runVideoFormatLabel;
-    request.settings = m_generationSettings->settingsFor(job.generatorId);
+    request.settings = job.settings;
     request.decisionCli = _promptCli();
     request.imageCli = _imageCli();
     request.knownPitfalls = m_promptLessons->asPromptSection();
@@ -1778,15 +1788,16 @@ void PaneGeneration::_startVideoGeneration(int row, const QUuid &projectId,
     {
         m_progress.cancelBtn->show();
         connect(m_progress.cancelBtn, &QPushButton::clicked,
-                m_videoWorkflow, &VideoGenerationWorkflow::cancel);
+                workflow, &VideoGenerationWorkflow::cancel);
     }
-    connect(m_videoWorkflow, &VideoGenerationWorkflow::progress,
+    connect(workflow, &VideoGenerationWorkflow::progress,
             m_progressDlg, [this, label](const QString &message) {
         _logProgress(QStringLiteral("[%1] %2").arg(label, message));
     });
-    connect(m_videoWorkflow, &VideoGenerationWorkflow::finished, m_progressDlg,
-            [this, row, projectId, groupKey, label, job, jobStaging]
+    connect(workflow, &VideoGenerationWorkflow::finished, m_progressDlg,
+            [this, row, projectId, groupKey, label, job, jobStaging, workflow]
             (const QString &videoPath, const QString &error) {
+        workflow->deleteLater();
         if (!videoPath.isEmpty())
         {
             // Close the statistics loop: the generated video becomes a
@@ -1802,10 +1813,8 @@ void PaneGeneration::_startVideoGeneration(int row, const QUuid &projectId,
 
             const QString newVideoPath
                 = genDir.absoluteFilePath(QFileInfo{videoPath}.fileName());
-            _logProgress(tr("[%1] Video generated, checked and saved: %2")
+            _logProgress(tr("[%1] Video generated and saved: %2")
                 .arg(label, newVideoPath));
-            QMessageBox::information(this, tr("Video generated"),
-                tr("The video was generated, checked and saved:\n%1").arg(newVideoPath));
 
             _refreshGenerationsView(row);
             for (int i = 0; i < ui->treeViewGenerations->topLevelItemCount(); ++i)
@@ -1828,9 +1837,9 @@ void PaneGeneration::_startVideoGeneration(int row, const QUuid &projectId,
             m_jobGroups[groupKey].clear();
             _runNextInGroup(row, projectId, groupKey);
         }
-    });
+    }, Qt::QueuedConnection);
     _logProgress(tr("[%1] Starting...").arg(label));
-    m_videoWorkflow->start(request);
+    workflow->start(request);
 }
 
 QDir PaneGeneration::_finalizeGeneration(int row, const QUuid &projectId,
@@ -2025,6 +2034,7 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
         m_buttonFavoriteHook->setEnabled(false);
         m_currentPreviewVideoPrompt.clear();
         m_buttonFavoriteVideoPrompt->setEnabled(false);
+        ui->buttonGenerateAgain->setEnabled(false);
         m_mediaPlayer->stop();
         m_previewImageFiles.clear();
         m_buttonPrevImage->hide();
@@ -2050,6 +2060,7 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
         m_currentPreviewVideoPrompt = QString::fromUtf8(promptFile.readAll()).trimmed();
     }
     m_buttonFavoriteVideoPrompt->setEnabled(!m_currentPreviewVideoPrompt.isEmpty());
+    ui->buttonGenerateAgain->setEnabled(!m_currentPreviewVideoPrompt.isEmpty());
     m_labelGenerationHook->setText(
         hook.isEmpty() ? tr("(no hook chosen yet — use Hooks...)") : hook);
     m_labelGenerationDescription->setText(description);
@@ -2172,6 +2183,136 @@ void PaneGeneration::_favoriteCurrentVideoPrompt()
     m_favoriteVideoPrompts->addPrompt(m_currentPreviewVideoPrompt);
     _logProgress(tr("Saved as a favorite video prompt: %1")
         .arg(m_currentPreviewVideoPrompt.left(150)));
+}
+
+void PaneGeneration::_generateAgain()
+{
+    const int row = ui->tableViewProjects->currentIndex().row();
+    QTreeWidgetItem *item = ui->treeViewGenerations->currentItem();
+    if (row < 0 || !item || !m_jobGroups.isEmpty() || m_currentPreviewVideoPrompt.isEmpty())
+    {
+        return;
+    }
+    if (item->parent())
+    {
+        item = item->parent();
+    }
+    const auto *record = m_videos->recordFromId(item->data(0, Qt::UserRole).toUuid());
+    if (!record)
+    {
+        return;
+    }
+    const QUuid projectId = m_projects->projectId(row);
+    const auto propertyIds = record->propertyValueIds;
+    const QString shortCode = record->shortCode;
+    const QDir sourceDir = m_projects->generationTempDir(row, shortCode);
+    VideoGenerationRecipe recipe;
+    QString error;
+    QString note;
+    const auto &generators = AbstractVideoGenerator::ALL_VIDEO_GENERATORS();
+    if (sourceDir.exists(QStringLiteral("generation_config.json")))
+    {
+        if (!VideoGenerationRecipe::load(sourceDir, &recipe, &error))
+        {
+            QMessageBox::warning(this, tr("Cannot generate again"), error);
+            return;
+        }
+        note = tr("Saved backend settings and source images will be reused.");
+    }
+    else
+    {
+        // Legacy generations saved the prompt and source files but no backend
+        // snapshot. Be explicit about using current settings in the dialog.
+        if (generators.size() != 1)
+        {
+            QMessageBox::warning(this, tr("Cannot generate again"),
+                tr("This older video has no saved backend configuration. "
+                   "Use Generate to choose its backend and settings."));
+            return;
+        }
+        recipe.generatorId = generators.constBegin().key();
+        recipe.settings = m_generationSettings->settingsFor(recipe.generatorId);
+        recipe.prompt = m_currentPreviewVideoPrompt;
+        if (sourceDir.exists(QStringLiteral("generation_source.png")))
+        {
+            recipe.imagePaths << sourceDir.absoluteFilePath(QStringLiteral("generation_source.png"));
+        }
+        else
+        {
+            const auto images = sourceDir.entryList({QStringLiteral("source.*")}, QDir::Files);
+            if (!images.isEmpty())
+            {
+                recipe.imagePaths << sourceDir.absoluteFilePath(images.first());
+            }
+        }
+        const auto secondary = sourceDir.entryList({QStringLiteral("source2.*")}, QDir::Files);
+        if (!secondary.isEmpty())
+        {
+            recipe.imagePaths << sourceDir.absoluteFilePath(secondary.first());
+        }
+        if ((recipe.imagePaths.isEmpty() && !m_projects->absoluteImagePath(row).isEmpty())
+            || (secondary.isEmpty() && !m_projects->absoluteImagePath2(row).isEmpty()))
+        {
+            QMessageBox::warning(this, tr("Cannot generate again"),
+                tr("This older video's source images are missing. Use Generate "
+                   "to select the images again."));
+            return;
+        }
+        note = tr("Older video: the saved prompt and recovered source images will be used "
+                  "with the current backend settings. Its original settings were not saved.");
+    }
+    AbstractVideoGenerator *generator = generators.value(recipe.generatorId);
+    if (!generator)
+    {
+        QMessageBox::warning(this, tr("Cannot generate again"),
+            tr("The saved backend is not available: %1").arg(recipe.generatorId));
+        return;
+    }
+    DialogGenerateAgain dialog{tr("%1 — %2\n%3 source image(s).\n%4")
+        .arg(shortCode, generator->getName()).arg(recipe.imagePaths.size()).arg(note), this};
+    if (dialog.exec() != QDialog::Accepted)
+    {
+        return;
+    }
+
+    _openProgress();
+    m_projects->resetStagingDir(row);
+    const QDir staging = m_projects->stagingDir(row);
+    m_runGenerations.clear();
+    m_runImagePath.clear();
+    m_runImagePath2.clear();
+    m_runVideoFormatLabel.clear(); // the saved prompt already contains the format
+    GenerationJob job{GenerationJob::Video, recipe.prompt, recipe.generatorId,
+                      nullptr, propertyIds};
+    job.repeatUnchanged = true;
+    job.settings = recipe.settings;
+    for (int i = 0; i < recipe.imagePaths.size(); ++i)
+    {
+        const QString name = QStringLiteral("repeat_source_%1.%2")
+            .arg(i + 1).arg(QFileInfo(recipe.imagePaths[i]).suffix());
+        if (!QFile::copy(recipe.imagePaths[i], staging.absoluteFilePath(name)))
+        {
+            _finishProgress(tr("Could not copy a source image: %1").arg(recipe.imagePaths[i]));
+            return;
+        }
+        job.sourceImageFiles << name;
+    }
+    // Keep hook suggestions available on the new takes as well.
+    for (const QString &name : {QStringLiteral("hooks.json"), QStringLiteral("suggestions.json")})
+    {
+        if (sourceDir.exists(name))
+        {
+            QFile::copy(sourceDir.absoluteFilePath(name), staging.absoluteFilePath(name));
+        }
+    }
+    QList<GenerationJob> jobs;
+    for (int take = 0; take < dialog.generationCount(); ++take)
+    {
+        jobs << job;
+    }
+    _logProgress(tr("Generating %1 additional video(s) from %2.")
+        .arg(jobs.size()).arg(shortCode));
+    _queueJobs(row, projectId, jobs);
 }
 
 void PaneGeneration::_togglePreviewPlayback()
@@ -2339,6 +2480,7 @@ void PaneGeneration::_deleteGenerated()
     m_buttonFavoriteHook->setEnabled(false);
     m_currentPreviewVideoPrompt.clear();
     m_buttonFavoriteVideoPrompt->setEnabled(false);
+    ui->buttonGenerateAgain->setEnabled(false);
 
     _refreshGenerationsView(row);
     _logProgress(tr("Deleted generation %1.").arg(shortCode));
@@ -2718,6 +2860,7 @@ void PaneGeneration::_openHooksDialog()
 
 void PaneGeneration::_openProgress()
 {
+    m_batchCancelled = false;
     if (m_progressDlg)
     {
         m_progressDlg->close(); // previous run's dialog (WA_DeleteOnClose)
@@ -2725,6 +2868,13 @@ void PaneGeneration::_openProgress()
     // Parented to the main window, not the pane: the pane is disabled while
     // a CLI runs, which would disable a child dialog's Copy/Cancel buttons.
     m_progressDlg = makeProgressDlg(window(), tr("Generation"), &m_progress);
+    if (m_progress.cancelBtn)
+    {
+        connect(m_progress.cancelBtn, &QPushButton::clicked, m_progressDlg, [this]() {
+            m_batchCancelled = true;
+            _logProgress(tr("Cancelling remaining generations after the current steps finish..."));
+        });
+    }
     m_progressDlg->show();
 }
 

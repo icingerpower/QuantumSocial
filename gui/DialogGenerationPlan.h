@@ -22,6 +22,7 @@ class QComboBox;
 class QGroupBox;
 class QLabel;
 class QPlainTextEdit;
+class QPushButton;
 class QStackedWidget;
 class SavedPrompts;
 
@@ -50,9 +51,9 @@ class SavedPrompts;
 //
 // Saved prompts (SavedPrompts, one shared library across every strategy
 // slot/content kind — most scene descriptions work for any of them):
-// "Load" pulls a named prompt's text into the editor, "Save..." names (or
-// renames-over, to edit an existing one) the current editor text into the
-// library — available from every strategy's row.
+// "Load" pulls a named prompt's text into the editor, "Edit..." changes a
+// saved prompt directly, and "Save..." saves the current editor text under
+// a name — available from every strategy's row.
 //
 // A property is IDENTIFIED BY THE SAME id across every section at the same
 // strategy index (image/slideshow/video strategy #1 all reference the same
@@ -83,14 +84,17 @@ public:
         QString generatorId;
         QString prompt;
         QList<QUuid> propertyValueIds;
+        int count = 1;
     };
 
     struct Plan
     {
         bool oneImage = false;
+        int imageCount = 1;
         QString imagePrompt;
         QList<QUuid> imagePropertyValueIds;
         bool slideshow = false;
+        int slideshowCount = 1;
         QString slideshowPrompt;
         QList<QUuid> slideshowPropertyValueIds;
         QList<VideoPick> videos;
@@ -204,6 +208,7 @@ private:
     // shared SavedPrompts library, so a name saved from one tab is
     // immediately loadable from every other tab too.
     QList<QComboBox *> m_savedPromptCombos;
+    QList<QPushButton *> m_editSavedPromptButtons;
 
     OptionSection _makeSection(const QString &title,
                                const QList<QList<PlanProperty>> &propertiesPerStrategy,

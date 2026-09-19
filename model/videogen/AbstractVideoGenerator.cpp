@@ -3,6 +3,7 @@
 #pragma GCC optimize("O1")
 
 #include "AbstractVideoGenerator.h"
+#include "VideoGenerationRecipe.h"
 
 #include <chrono>
 
@@ -95,6 +96,13 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
     promptFile.write(prompt.toUtf8());
     promptFile.close();
 
+    const VideoGenerationRecipe recipe{getId(), prompt, imagePaths, settings};
+    if (!recipe.save(QDir(outputDir), &result.errorMessage))
+    {
+        result.retryable = false;
+        co_return result;
+    }
+
     // Start the worker on first use, or restart it if a previous one died
     // (crash, or a browser loss it could not recover from).
     if (!m_worker || m_worker->state() == QProcess::NotRunning)
@@ -165,6 +173,7 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
     if (doc.isNull() || !doc.isObject())
     {
         const QByteArray stderrOutput = m_worker->readAllStandardError().trimmed();
+        result.browserLost = m_worker->state() == QProcess::NotRunning;
         result.errorMessage = m_worker->state() == QProcess::NotRunning
             ? QObject::tr("The video generator worker stopped unexpectedly%1")
                 .arg(stderrOutput.isEmpty() ? QString{}
@@ -183,6 +192,7 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
     result.errorMessage = obj.value(QStringLiteral("error")).toString();
     result.rejected = obj.value(QStringLiteral("rejected")).toBool();
     result.retryable = obj.value(QStringLiteral("retryable")).toBool(true);
+    result.browserLost = obj.value(QStringLiteral("browserLost")).toBool();
     if (!result.videoPath.isEmpty() && !QFileInfo::exists(result.videoPath))
     {
         result.errorMessage = QObject::tr("The video generator reported %1 "

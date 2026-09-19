@@ -63,6 +63,8 @@ import shutil
 import sys
 import time
 
+from gemini_downloads import install_video_capture
+
 PROFILE_DIR = os.path.expanduser("~/.cache/quantumsocial/gemini-profile")
 SYSTEM_CHROME_PROFILE = os.path.expanduser("~/.config/google-chrome")
 ULTRA_CACHE = os.path.expanduser("~/.cache/quantumsocial/gemini_ultra_account.json")
@@ -432,8 +434,11 @@ def _submit_prompt(page, editor, prompt, timeout_s=30, retry_interval_s=5,
                 if not value.strip():
                     _log("submit: confirmed composer cleared")
                     return True
-                # Do not send a different draft if the user edited it.
-                if value.strip() != prompt.strip():
+                # Chromium inserts an extra newline into innerText for blank
+                # lines in contenteditable editors. Compare the words after
+                # normalizing whitespace so that formatting alone does not
+                # make an unchanged draft look like a user edit.
+                if re.sub(r"\s+", " ", value).strip() != re.sub(r"\s+", " ", prompt).strip():
                     _log("submit: draft changed; stopping automatic submission")
                     return False
                 if time.monotonic() >= next_click and attempts < 3:
@@ -560,7 +565,7 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
                  stall_timeout_s):
     """One full generation attempt in the current chat. Returns
     ("video", saved_path) / ("rejected", marker) / ("stalled", note) /
-    ("error", message). "stalled" = no reply at all before the attempt
+    ("error", message) / ("browser_lost", message). "stalled" = no reply at all before the attempt
     timeout — observed on forbidden prompts, where Gemini sometimes just
     never answers instead of refusing in text. A visible PROGRESS_MARKERS
     hit (Gemini's own "still working" indicator) resets attempt_deadline
@@ -578,6 +583,7 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
         _dump_state(page, "quota")
         return ("error", f"Gemini's video generation quota is exhausted for "
                          f"now: {quota_message}")
+    capture = install_video_capture(page, output_dir, _log)
     if not _select_video_tool(page):
         _dump_state(page, "no_tool")
         return ("error", "Could not find Gemini's video (Veo) tool button — "
@@ -608,12 +614,16 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
     _log("waiting for the video or a refusal")
 
     while time.time() < min(deadline, attempt_deadline):
+        if capture["video"]:
+            return ("video", capture["video"])
+        if capture["error"]:
+            return ("error", capture["error"])
         try:
             after_text = page.locator("body").inner_text()
         except Exception as exc:  # noqa: BLE001 - see below
             # A DEAD page must break out immediately instead of being
             # polled for the rest of the stall timeout: swallowing this
-            # burned a full 5 minutes on a corpse after every GPU-induced
+            # burned a full 5 minutes on a corpse after a
             # browser crash, then reported a misleading "no reply before
             # the attempt timeout".
             if _is_target_closed_error(exc):
@@ -630,6 +640,10 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
                     page.get_by_role("button", name=name, exact=False)\
                         .last.click(timeout=2000)
             except Exception:
+                if capture["video"]:
+                    return ("video", capture["video"])
+                if capture["error"]:
+                    return ("error", capture["error"])
                 continue
             # Saved immediately, before returning anywhere: the browser can
             # die at any moment and a Download object is worthless once it
@@ -643,6 +657,7 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
                 return ("video", os.path.abspath(target))
             except Exception as exc:  # noqa: BLE001 - recovery attempt below
                 _log(f"download: save_as failed: {exc}")
+                browser_lost = _is_target_closed_error(exc)
             # save_as needs a live browser to move the file, and this browser
             # keeps dying exactly at download time — but the bytes are often
             # ALREADY complete in Playwright's own download directory. Copy
@@ -653,6 +668,7 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
                     source = recover(download)
                 except Exception as exc:  # noqa: BLE001 - try the next way
                     _log(f"download: {recover.__name__} failed: {exc}")
+                    browser_lost = browser_lost or _is_target_closed_error(exc)
                     continue
                 if source and os.path.isfile(source):
                     try:
@@ -661,7 +677,8 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
                         return ("video", os.path.abspath(target))
                     except OSError as exc:
                         _log(f"download: copy from {source} failed: {exc}")
-            return ("error", "Gemini generated the video, but it could not be "
+            return ("browser_lost" if browser_lost else "error",
+                             "Gemini generated the video, but it could not be "
                              "saved (the browser died at download time and the "
                              "file could not be recovered from disk either).")
 
@@ -692,14 +709,9 @@ def _launch_context(playwright, use_system_profile):
         "accept_downloads": True,
         # Google's login rejects browsers that advertise automation.
         "ignore_default_args": ["--enable-automation"],
-        # GPU acceleration is OFF on purpose. Root-caused from dmesg: this
-        # machine's NVIDIA driver logs "NVRM: Xid 13/32/69 ... name=chrome"
-        # a few seconds before every observed browser death, i.e. Chrome's
-        # GPU process faults — most often right when Gemini renders/plays
-        # the finished video (accelerated video decode) — and takes the
-        # whole browser down with it, losing the generated clip. Automation
-        # needs no GPU rendering at all, so the entire class of crash is
-        # simply removed rather than retried around.
+        # Software rendering avoids dependence on the host's GPU drivers.
+        # This does not prevent browser-process crashes such as the Chrome
+        # download-bubble failure handled by gemini_downloads.py.
         "args": ["--disable-blink-features=AutomationControlled",
                  "--no-first-run", "--no-default-browser-check",
                  "--disable-gpu", "--disable-gpu-compositing",
@@ -944,6 +956,8 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings):
     JSON contract: {"video", "error", "rejected"}."""
     generation_timeout_s = int(settings.get("generationTimeoutSec", 900))
     in_page_retries = int(settings.get("inPageRejectionRetries", 3))
+    if settings.get("preservePrompt", False):
+        in_page_retries = 0
     stall_timeout_s = int(settings.get("attemptStallTimeoutSec", 300))
 
     # Generation attempts: a refusal is retried IN THE SAME browser with a
@@ -982,12 +996,18 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings):
             # BROWSER is far less disruptive.
             if not _is_target_closed_error(exc):
                 raise
+            if settings.get("preservePrompt", False):
+                # Recovery has its own budget in the caller. Do not consume
+                # the (disabled) prompt-variation budget or report a refusal.
+                return ({"video": None, "error": str(exc), "rejected": False,
+                         "browserLost": True}, None)
             _log(f"attempt {attempt + 1}: page/context died mid-run ({exc}) — "
                  "recovering in the same browser instead of restarting...")
             page = _recover_page(context)
             if page is None:
                 return ({"video": None,
                          "error": f"the browser tab closed unexpectedly ({exc})",
+                         "browserLost": True,
                          "rejected": False}, page)
             last_rejection = f"the browser tab closed mid-attempt ({exc}) — retried"
             continue
@@ -995,9 +1015,13 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings):
              + (f" ({payload})" if status != "video" else ""))
         if status == "video":
             video_path = payload  # already saved to disk by _run_attempt
+            with open(os.path.join(output_dir, "generation_prompt.txt"), "w",
+                      encoding="utf-8") as handle:
+                handle.write(variant)
             break
-        if status == "error":
-            return ({"video": None, "error": payload, "rejected": False}, page)
+        if status in ("error", "browser_lost"):
+            return ({"video": None, "error": payload, "rejected": False,
+                     "browserLost": status == "browser_lost"}, page)
         # "rejected" and "stalled" both retry with an edited prompt: a
         # silent stall is how Gemini sometimes handles a prompt it will
         # not fulfill.
@@ -1121,12 +1145,20 @@ def _worker_main():
                 # browser died mid-way, say). The browser is just as dead —
                 # drop it here too, otherwise the NEXT request is wasted
                 # discovering the corpse itself.
-                if result.get("error") and _is_target_closed_error(result["error"]):
+                browser_lost = (result.get("browserLost", False)
+                                or bool(result.get("error")
+                                        and _is_target_closed_error(result["error"])))
+                if browser_lost:
+                    result["browserLost"] = True
+                # A completed download may have been recovered from disk
+                # after Chrome died. Keep that success; relaunch for the next
+                # job without spending a request discovering the dead page.
+                if browser_lost or page is None or page.is_closed():
                     try:
                         context.close()
                     except Exception:
                         pass
-                    _log("worker: browser lost (reported in a result), will relaunch")
+                    _log("worker: browser closed; next request will relaunch")
                     context = None
                     page = None
                 _respond(result)
@@ -1147,7 +1179,8 @@ def _worker_main():
                     _log("worker: browser lost, will relaunch on the next request")
                     context = None
                     page = None
-                _respond({"video": None, "rejected": False, "error": str(exc)})
+                _respond({"video": None, "rejected": False, "error": str(exc),
+                          "browserLost": _is_target_closed_error(exc)})
     finally:
         _log("worker: stdin closed, shutting the browser down")
         try:

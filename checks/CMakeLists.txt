@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.16)
+project(GenerationChecks LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTOUIC ON)
+get_filename_component(REPO "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
+find_package(QCoro6 REQUIRED COMPONENTS Core)
+include("${REPO}/../common/aicli/aicli.cmake")
+include("${REPO}/../common/gui/progress/progress.cmake")
+include("${REPO}/../common/workingdirectory/workingdirectory.cmake")
+include("${REPO}/gui/gui.cmake")
+include("${REPO}/model/model.cmake")
+add_executable(generation_checks generation_checks.cpp ${GUI_FILES} ${MODEL_FILES}
+    ${AICLI_FILES} ${PROGRESS_DIALOG_FILES} ${WORKING_DIR_FILES})
+target_include_directories(generation_checks PRIVATE "${REPO}"
+    "${REPO}/../common/aicli" "${REPO}/../common/gui/progress")
+target_link_libraries(generation_checks PRIVATE Qt6::Widgets Qt6::Multimedia
+    Qt6::MultimediaWidgets QCoro::Core)
+enable_testing()
+add_test(NAME generation_checks COMMAND generation_checks)
+set_tests_properties(generation_checks PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

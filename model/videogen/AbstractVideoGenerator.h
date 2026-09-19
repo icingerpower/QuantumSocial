@@ -37,6 +37,9 @@ public:
         // dependency): changing the prompt and launching another worker can
         // never fix those, so the workflow must stop after the first result.
         bool retryable = true;
+        // The browser/worker connection was lost. A repeat can retry the
+        // same inputs after relaunch without treating this as a refusal.
+        bool browserLost = false;
     };
 
     // One tunable setting of a backend. Each backend declares its own list;

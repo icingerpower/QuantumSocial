@@ -9,6 +9,7 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRadioButton>
@@ -64,9 +65,11 @@ DialogGenerationPlan::DialogGenerationPlan(const QList<QList<PlanProperty>> &pro
     m_imageSection = _makeSection(tr("One image"), propertiesPerStrategy,
         settings.value(SETTING_ONE_IMAGE, true).toBool());
     _addCliCombo(m_imageSection, availableClis, SETTING_IMAGE_CLI);
+    m_imageSection.group->setGenerationCount(settings.value("generation/count/image", 1).toInt());
     m_slideshowSection = _makeSection(tr("Several images (slideshow)"),
         propertiesPerStrategy, settings.value(SETTING_SLIDESHOW, false).toBool());
     _addCliCombo(m_slideshowSection, availableClis, SETTING_SLIDESHOW_CLI);
+    m_slideshowSection.group->setGenerationCount(settings.value("generation/count/slideshow", 1).toInt());
 
     // One checkable group per registered video backend — a newly added
     // AbstractVideoGenerator subclass appears here on its own.
@@ -77,6 +80,8 @@ DialogGenerationPlan::DialogGenerationPlan(const QList<QList<PlanProperty>> &pro
         m_videoSections << qMakePair(it.key(),
             _makeSection(tr("Video — %1").arg(it.value()->getName()),
                          propertiesPerStrategy, savedVideos.contains(it.key())));
+        m_videoSections.last().second.group->setGenerationCount(
+            settings.value("generation/count/video/" + it.key(), 1).toInt());
     }
 
     _refreshSavedPromptCombos();
@@ -90,13 +95,15 @@ void DialogGenerationPlan::_refreshSavedPromptCombos()
     {
         names << entry.name;
     }
-    for (QComboBox *combo : m_savedPromptCombos)
+    for (int i = 0; i < m_savedPromptCombos.size(); ++i)
     {
+        QComboBox *combo = m_savedPromptCombos[i];
         const QString current = combo->currentText();
         const QSignalBlocker blocker{combo};
         combo->clear();
         combo->addItems(names);
         combo->setCurrentIndex(combo->findText(current));
+        m_editSavedPromptButtons[i]->setEnabled(combo->currentIndex() >= 0);
     }
 }
 
@@ -115,9 +122,11 @@ DialogGenerationPlan::Plan DialogGenerationPlan::plan() const
 {
     Plan plan;
     plan.oneImage = m_imageSection.group->isChecked();
+    plan.imageCount = m_imageSection.group->generationCount();
     plan.imagePrompt = _sectionPrompt(m_imageSection);
     plan.imagePropertyValueIds = _sectionCheckedPropertyValues(m_imageSection);
     plan.slideshow = m_slideshowSection.group->isChecked();
+    plan.slideshowCount = m_slideshowSection.group->generationCount();
     plan.slideshowPrompt = _sectionPrompt(m_slideshowSection);
     plan.slideshowPropertyValueIds = _sectionCheckedPropertyValues(m_slideshowSection);
     for (const auto &video : m_videoSections)
@@ -125,7 +134,8 @@ DialogGenerationPlan::Plan DialogGenerationPlan::plan() const
         if (video.second.group->isChecked())
         {
             plan.videos << VideoPick{video.first, _sectionPrompt(video.second),
-                                     _sectionCheckedPropertyValues(video.second)};
+                                     _sectionCheckedPropertyValues(video.second),
+                                     video.second.group->generationCount()};
         }
     }
     return plan;
@@ -158,6 +168,13 @@ void DialogGenerationPlan::accept()
     settings.setValue(SETTING_ONE_IMAGE, currentPlan.oneImage);
     settings.setValue(SETTING_SLIDESHOW, currentPlan.slideshow);
     settings.setValue(SETTING_VIDEOS, videoIds);
+    settings.setValue("generation/count/image", currentPlan.imageCount);
+    settings.setValue("generation/count/slideshow", currentPlan.slideshowCount);
+    for (const auto &video : m_videoSections)
+    {
+        settings.setValue("generation/count/video/" + video.first,
+                          video.second.group->generationCount());
+    }
     if (AbstractCli *cli = imageCli())
     {
         settings.setValue(SETTING_IMAGE_CLI, cli->getName());
@@ -319,14 +336,20 @@ DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
         auto page = QSharedPointer<StrategyPage>::create();
 
         // Saved-prompt row: one shared library (SavedPrompts) usable from
-        // every strategy slot/content kind — "Load" pulls a named prompt's
-        // text in, "Save..." names (or renames-over an existing name, which
-        // is how a saved prompt gets edited) the current text into it.
+        // every strategy slot/content kind. Load copies a saved prompt into
+        // the current editor; Edit changes the saved entry directly.
         auto *savedPromptCombo = section.group->savedPromptCombo(i);
         m_savedPromptCombos << savedPromptCombo;
         auto *buttonLoadPrompt = section.group->loadPromptButton(i);
+        auto *buttonEditPrompt = section.group->editPromptButton(i);
+        m_editSavedPromptButtons << buttonEditPrompt;
         auto *buttonSavePrompt = section.group->savePromptButton(i);
         page->promptEdit = section.group->promptEdit(i);
+
+        connect(savedPromptCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                buttonEditPrompt, [buttonEditPrompt](int index) {
+            buttonEditPrompt->setEnabled(index >= 0);
+        });
 
         connect(buttonLoadPrompt, &QPushButton::clicked, this,
                 [this, page, savedPromptCombo]() {
@@ -341,6 +364,39 @@ DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
                     page->promptEdit->setPlainText(entry.prompt);
                     break;
                 }
+            }
+        });
+        connect(buttonEditPrompt, &QPushButton::clicked, this,
+                [this, page, savedPromptCombo]() {
+            if (savedPromptCombo->currentIndex() < 0)
+            {
+                return;
+            }
+            for (const SavedPrompts::Entry &entry : m_savedPrompts->entries())
+            {
+                if (entry.name != savedPromptCombo->currentText())
+                {
+                    continue;
+                }
+                bool accepted = false;
+                const QString edited = QInputDialog::getMultiLineText(
+                    this, tr("Edit saved prompt — %1").arg(entry.name),
+                    tr("Prompt:"), entry.prompt, &accepted);
+                if (accepted)
+                {
+                    if (edited.trimmed().isEmpty())
+                    {
+                        QMessageBox::warning(this, tr("Edit saved prompt"),
+                                             tr("A saved prompt cannot be empty."));
+                        return;
+                    }
+                    m_savedPrompts->savePrompt(entry.name, edited);
+                    if (page->promptEdit->toPlainText() == entry.prompt)
+                    {
+                        page->promptEdit->setPlainText(edited);
+                    }
+                }
+                return;
             }
         });
         connect(buttonSavePrompt, &QPushButton::clicked, this,
@@ -493,7 +549,7 @@ void DialogGenerationPlan::_updateOkButton()
     bool anyChecked = false;
     bool allValid = true;
     const auto checkSection = [&anyChecked, &allValid](const OptionSection &section) {
-        if (!section.group->isChecked())
+        if (!section.group || !section.group->isChecked())
         {
             return;
         }

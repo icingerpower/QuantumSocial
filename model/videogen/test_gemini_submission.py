@@ -4,11 +4,12 @@ Run: python3 -m unittest discover -s model/videogen -p 'test_gemini_submission.p
 Requires Playwright and its Chromium browser.
 """
 import base64
+import io
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from playwright.sync_api import sync_playwright
 
@@ -91,6 +92,25 @@ class GeminiSubmissionTests(unittest.TestCase):
             };""")
         self.assertTrue(self.submit())
         self.assertEqual(self.page.evaluate("window.clicks"), 1)
+
+    def test_contenteditable_blank_lines_do_not_block_submission(self):
+        self.composer('<div role="textbox" contenteditable="true"></div>', """
+            send.onclick = () => {
+                window.clicks++;
+                document.querySelector('[role=textbox]').innerText = '';
+            };""")
+        prompt = "Known pitfalls:\n- Keep the shoes consistent.\n\nThe model walks."
+        self.editor.fill(prompt)
+        self.assertNotEqual(self.editor.evaluate('el => el.innerText'), prompt)
+        self.assertTrue(worker._submit_prompt(
+            self.page, self.editor, prompt, timeout_s=1.5, retry_interval_s=0.5))
+        self.assertEqual(self.page.evaluate("window.clicks"), 1)
+
+    def test_contenteditable_changed_words_still_block_submission(self):
+        self.composer('<div role="textbox" contenteditable="true"></div>')
+        self.editor.fill("A different video")
+        self.assertFalse(self.submit())
+        self.assertEqual(self.page.evaluate("window.clicks"), 0)
 
     def test_detached_editor_is_not_success(self):
         self.composer(script="send.onclick = () => document.querySelector('textarea').remove();")
@@ -181,6 +201,90 @@ class GeminiSubmissionTests(unittest.TestCase):
         self.assertIn("submission", error)
         dump.assert_called_once_with(self.page, "submission_failed")
         sleep.assert_not_called()
+
+    def test_repeat_does_not_rewrite_or_resubmit_rejected_prompt(self):
+        page = Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_run_attempt", return_value=("rejected", "refused")) as run:
+            result, _ = worker._generate_once(None, page, "Exact prompt.", [], directory,
+                                              {"preservePrompt": True})
+        self.assertTrue(result["rejected"])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[1], "Exact prompt.")
+        page.goto.assert_not_called()
+
+    def test_saves_actual_successful_prompt_for_future_repeats(self):
+        page = Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_wait_ready_or_login", return_value="ready"), \
+                patch.object(worker, "_run_attempt", side_effect=[
+                    ("rejected", "refused"), ("video", "/saved/video.mp4")]):
+            result, _ = worker._generate_once(None, page, "Initial prompt.", [], directory, {})
+            self.assertEqual(result["video"], "/saved/video.mp4")
+            self.assertEqual(Path(directory, "generation_prompt.txt").read_text(),
+                             worker._prompt_variant("Initial prompt.", 1))
+
+    def test_repeat_browser_loss_is_recoverable_not_a_refusal(self):
+        page = Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_run_attempt", side_effect=RuntimeError(
+                    "Locator.inner_text: Target page, context or browser has been closed")), \
+                patch.object(worker, "_recover_page") as recover:
+            result, next_page = worker._generate_once(
+                None, page, "Exact prompt.", [], directory, {"preservePrompt": True})
+        self.assertTrue(result["browserLost"])
+        self.assertFalse(result["rejected"])
+        self.assertIsNone(next_page)
+        recover.assert_not_called()
+
+    def worker_fixture(self, outcomes, prepare=None):
+        page = Mock()
+        page.is_closed.return_value = False
+        first_context, second_context = Mock(), Mock()
+        with patch("playwright.sync_api.sync_playwright"), \
+                patch.object(worker.sys, "stdin", io.StringIO('{}\n{}\n')), \
+                patch.object(worker, "_read_request", return_value=(
+                    "Exact prompt", "/unused", ["image.png"], {"preservePrompt": True})), \
+                patch.object(worker, "_launch_context", side_effect=[
+                    (first_context, "test", None), (second_context, "test", None)]) as launch, \
+                patch.object(worker, "_prepare_page", side_effect=prepare,
+                             return_value=(page, None)), \
+                patch.object(worker, "_generate_once", side_effect=outcomes), \
+                patch.object(worker, "_respond") as respond:
+            self.assertEqual(worker._worker_main(), 0)
+        return launch.call_count, [call.args[0] for call in respond.call_args_list]
+
+    def test_worker_relaunches_after_browser_loss_result(self):
+        page = Mock()
+        page.is_closed.return_value = False
+        count, responses = self.worker_fixture([
+            ({"video": None, "error": "closed", "browserLost": True, "rejected": False}, None),
+            ({"video": "/saved/video.mp4", "error": None, "rejected": False}, page)])
+        self.assertEqual(count, 2)
+        self.assertTrue(responses[0]["browserLost"])
+        self.assertEqual(responses[1]["video"], "/saved/video.mp4")
+
+    def test_worker_relaunches_after_prepare_exception(self):
+        page = Mock()
+        page.is_closed.return_value = False
+        count, responses = self.worker_fixture([
+            ({"video": "/saved/video.mp4", "error": None, "rejected": False}, page)], prepare=[
+            RuntimeError("Page.goto: Target page, context or browser has been closed"),
+            (page, None)])
+        self.assertEqual(count, 2)
+        self.assertTrue(responses[0]["browserLost"])
+        self.assertEqual(responses[1]["video"], "/saved/video.mp4")
+
+    def test_recovered_download_is_kept_and_next_job_gets_new_browser(self):
+        closed_page, live_page = Mock(), Mock()
+        closed_page.is_closed.return_value = True
+        live_page.is_closed.return_value = False
+        count, responses = self.worker_fixture([
+            ({"video": "/saved/first.mp4", "error": None, "rejected": False}, closed_page),
+            ({"video": "/saved/second.mp4", "error": None, "rejected": False}, live_page)])
+        self.assertEqual(count, 2)
+        self.assertEqual([result["video"] for result in responses],
+                         ["/saved/first.mp4", "/saved/second.mp4"])
 
 
 if __name__ == "__main__":

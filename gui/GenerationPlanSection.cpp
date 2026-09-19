@@ -8,6 +8,7 @@
 #include <QRadioButton>
 #include <QScrollArea>
 #include <QStackedWidget>
+#include <QSpinBox>
 #include <QVBoxLayout>
 
 GenerationPlanSection::GenerationPlanSection(QWidget *parent)
@@ -23,6 +24,8 @@ GenerationPlanSection::~GenerationPlanSection()
 }
 
 QWidget *GenerationPlanSection::cliRow() const { return ui->cliRow; }
+int GenerationPlanSection::generationCount() const { return ui->spinCount->value(); }
+void GenerationPlanSection::setGenerationCount(int count) { ui->spinCount->setValue(count); }
 QComboBox *GenerationPlanSection::cliCombo() const { return ui->comboCli; }
 QStackedWidget *GenerationPlanSection::strategyStack() const { return ui->stackStrategies; }
 
@@ -39,6 +42,11 @@ QComboBox *GenerationPlanSection::savedPromptCombo(int strategy) const
 QPushButton *GenerationPlanSection::loadPromptButton(int strategy) const
 {
     return QList<QPushButton *>{ui->buttonLoad0, ui->buttonLoad1, ui->buttonLoad2}.value(strategy);
+}
+
+QPushButton *GenerationPlanSection::editPromptButton(int strategy) const
+{
+    return QList<QPushButton *>{ui->buttonEdit0, ui->buttonEdit1, ui->buttonEdit2}.value(strategy);
 }
 
 QPushButton *GenerationPlanSection::savePromptButton(int strategy) const

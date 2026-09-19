@@ -248,7 +248,17 @@
             <enum>Qt::Orientation::Vertical</enum>
            </property>
            <widget class="QTreeView" name="treeViewFiles"/>
-           <widget class="QWidget" name="widgetPreview"/>
+           <widget class="QWidget" name="widgetPreview">
+            <layout class="QVBoxLayout" name="layoutPreview">
+             <item><layout class="QHBoxLayout" name="layoutHook">
+              <item><widget class="QLabel" name="labelGenerationHook"><property name="font"><font><bold>true</bold></font></property><property name="wordWrap"><bool>true</bool></property><property name="textInteractionFlags"><set>Qt::TextSelectableByMouse|Qt::TextSelectableByKeyboard</set></property></widget></item>
+              <item><widget class="QPushButton" name="buttonFavoriteHook"><property name="enabled"><bool>false</bool></property><property name="text"><string>★ Favorite this hook</string></property><property name="toolTip"><string>Save this hook as inspiration for future hook suggestions.</string></property></widget></item>
+              <item><widget class="QPushButton" name="buttonFavoriteVideoPrompt"><property name="enabled"><bool>false</bool></property><property name="text"><string>★ Favorite this video prompt</string></property><property name="toolTip"><string>Save the selected video's prompt as a favorite.</string></property></widget></item>
+              <item><widget class="QPushButton" name="buttonGenerateAgain"><property name="enabled"><bool>false</bool></property><property name="text"><string>Generate again</string></property><property name="toolTip"><string>Create more videos using this generation's prompt and configuration.</string></property></widget></item>
+             </layout></item>
+             <item><widget class="QLabel" name="labelGenerationDescription"><property name="wordWrap"><bool>true</bool></property><property name="textInteractionFlags"><set>Qt::TextSelectableByMouse|Qt::TextSelectableByKeyboard</set></property></widget></item>
+            </layout>
+           </widget>
           </widget>
          </widget>
         </item>

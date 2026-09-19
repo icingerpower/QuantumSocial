@@ -27,11 +27,14 @@ public:
     ~GenerationPlanSection();
 
     QWidget *cliRow() const;
+    int generationCount() const;
+    void setGenerationCount(int count);
     QComboBox *cliCombo() const;
     QList<QRadioButton *> strategyButtons() const;
     QStackedWidget *strategyStack() const;
     QComboBox *savedPromptCombo(int strategy) const;
     QPushButton *loadPromptButton(int strategy) const;
+    QPushButton *editPromptButton(int strategy) const;
     QPushButton *savePromptButton(int strategy) const;
     QPlainTextEdit *promptEdit(int strategy) const;
     QLabel *propertyLabel(int strategy) const;
