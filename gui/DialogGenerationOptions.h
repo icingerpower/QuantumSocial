@@ -48,6 +48,7 @@ public:
                                      bool hasImage,
                                      bool hasPreviousGenerated,
                                      const QString &previousGeneratedImagePath,
+                                     bool hasSecondaryImage = false,
                                      QWidget *parent = nullptr);
     ~DialogGenerationOptions();
 
@@ -64,6 +65,10 @@ public:
     // shot useful as its own asset and as an unambiguous reference for
     // later generations.
     bool whiteBackgroundProduct() const;
+    // When 2 input images are configured and imageMode() == RegenerateInput,
+    // whether to apply the regeneration step to both images instead of only
+    // the primary one.
+    bool applyToBothImages() const;
 
     void accept() override;
 
@@ -80,6 +85,7 @@ private slots:
 private:
     Ui::DialogGenerationOptions *ui;
     QPixmap m_previousImagePixmap;
+    bool m_hasSecondaryImage = false;
 
     void _rescalePreviousImagePreview();
 };

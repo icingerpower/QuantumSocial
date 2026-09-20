@@ -11,14 +11,17 @@ const QString SETTING_MODE = QStringLiteral("generation/imageMode");
 const QString SETTING_CLI = QStringLiteral("generation/imageCli");
 const QString SETTING_FORMAT = QStringLiteral("generation/videoFormat");
 const QString SETTING_WHITE_BACKGROUND = QStringLiteral("generation/whiteBackgroundProduct");
+const QString SETTING_APPLY_BOTH = QStringLiteral("generation/applyToBothImages");
 }
 
 DialogGenerationOptions::DialogGenerationOptions(
     const QList<AbstractCli *> &availableClis, bool hasImage,
     bool hasPreviousGenerated, const QString &previousGeneratedImagePath,
+    bool hasSecondaryImage,
     QWidget *parent)
     : QDialog(parent)
     , ui(new Ui::DialogGenerationOptions)
+    , m_hasSecondaryImage(hasSecondaryImage)
 {
     ui->setupUi(this);
 
@@ -75,6 +78,9 @@ DialogGenerationOptions::DialogGenerationOptions(
     }
     ui->checkBoxWhiteBackground->setChecked(
         settings.value(SETTING_WHITE_BACKGROUND, false).toBool());
+    ui->checkBoxApplyBoth->setVisible(hasSecondaryImage);
+    ui->checkBoxApplyBoth->setChecked(
+        hasSecondaryImage && settings.value(SETTING_APPLY_BOTH, false).toBool());
     const int savedCli = ui->comboBoxCli->findText(settings.value(SETTING_CLI).toString());
     if (savedCli >= 0)
     {
@@ -192,6 +198,10 @@ void DialogGenerationOptions::accept()
     {
         settings.setValue(SETTING_MODE, static_cast<int>(imageMode()));
         settings.setValue(SETTING_WHITE_BACKGROUND, ui->checkBoxWhiteBackground->isChecked());
+        if (m_hasSecondaryImage)
+        {
+            settings.setValue(SETTING_APPLY_BOTH, ui->checkBoxApplyBoth->isChecked());
+        }
         if (ui->comboBoxCli->currentIndex() >= 0)
         {
             settings.setValue(SETTING_CLI, ui->comboBoxCli->currentText());
@@ -211,9 +221,17 @@ void DialogGenerationOptions::_updateCliEnabled()
     // when not applicable) rather than hidden, so its state isn't lost by
     // toggling between radios back and forth.
     ui->checkBoxWhiteBackground->setEnabled(mode == ImageMode::RegenerateInput);
+    ui->checkBoxApplyBoth->setEnabled(m_hasSecondaryImage && mode == ImageMode::RegenerateInput);
 }
 
 bool DialogGenerationOptions::whiteBackgroundProduct() const
 {
     return ui->radioRegenerate->isChecked() && ui->checkBoxWhiteBackground->isChecked();
+}
+
+bool DialogGenerationOptions::applyToBothImages() const
+{
+    return m_hasSecondaryImage
+        && ui->radioRegenerate->isChecked()
+        && ui->checkBoxApplyBoth->isChecked();
 }

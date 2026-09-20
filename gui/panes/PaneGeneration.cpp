@@ -9,6 +9,7 @@
 #include <algorithm>
 
 #include <QAudioOutput>
+#include <QColor>
 #include <QDataWidgetMapper>
 #include <QDateTime>
 #include <QDesktopServices>
@@ -83,6 +84,7 @@ constexpr int PROMPT_VARIANT_COUNT = 3;
 // The exact file name the image-step prompts require the CLI to produce, in
 // the run's staging folder (see TableProjects::stagingDir).
 const QString GENERATED_IMAGE_NAME = QStringLiteral("generation_source.png");
+const QString GENERATED_IMAGE_NAME_2 = QStringLiteral("generation_source2.png");
 // The suggestion reply is written by the CLI to a FILE in the staging folder
 // (WebsiteEmpire2's ClaudeRunner pattern): Claude's -p stdout is known to be
 // tail-truncated on long replies, which kept corrupting the JSON. Stdout
@@ -191,7 +193,8 @@ QString friendlyCliError(const AbstractCli *cli, const CliRunResult &result)
 }
 
 QString imageStepPrompt(DialogGenerationOptions::ImageMode mode, const QString &imageRef,
-                        const QString &videoFormatLabel, bool whiteBackgroundProduct)
+                        const QString &videoFormatLabel, bool whiteBackgroundProduct,
+                        const QString &outputFileName = GENERATED_IMAGE_NAME)
 {
     // Without this exact marker, Antigravity's preparePrompt() concludes
     // "plain text only, do NOT use tools" for the call (see
@@ -224,7 +227,7 @@ QString imageStepPrompt(DialogGenerationOptions::ImageMode mode, const QString &
             "- sharp, high quality, no watermarks/text/UI overlays\n"
             "Save the result in the current working directory as exactly '%2'.\n"
             "Do not modify the original file. Reply with just the output file name.")
-            .arg(imageRef, GENERATED_IMAGE_NAME);
+            .arg(imageRef, outputFileName);
     }
     if (mode == DialogGenerationOptions::ImageMode::RegenerateInput)
     {
@@ -236,7 +239,7 @@ QString imageStepPrompt(DialogGenerationOptions::ImageMode mode, const QString &
             "- keep the subject, framing, colors and style otherwise identical\n"
             "Save the result in the current working directory as exactly '%2'.\n"
             "Do not modify the original file. Reply with just the output file name.")
-            .arg(imageRef, GENERATED_IMAGE_NAME);
+            .arg(imageRef, outputFileName);
     }
     return marker + QStringLiteral(
         "You are given the image file '%1' in the current working directory as "
@@ -247,7 +250,7 @@ QString imageStepPrompt(DialogGenerationOptions::ImageMode mode, const QString &
         "Use a %3 format suited for a social-media video.\n"
         "Save the result in the current working directory as exactly '%2'.\n"
         "Do not modify the original file. Reply with just the output file name.")
-        .arg(imageRef, GENERATED_IMAGE_NAME, videoFormatLabel);
+        .arg(imageRef, outputFileName, videoFormatLabel);
 }
 
 } // namespace
@@ -422,6 +425,8 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
             this, &PaneGeneration::_deleteGenerated);
     connect(ui->buttonHooks, &QPushButton::clicked,
             this, &PaneGeneration::_openHooksDialog);
+    connect(ui->buttonPublish, &QPushButton::clicked,
+            this, &PaneGeneration::_togglePublishSelectedVideo);
     // Quick access to the generated files (videos, images, prompts) in the
     // system file manager.
     connect(ui->buttonOpenFolder, &QPushButton::clicked, this, [this]() {
@@ -551,6 +556,9 @@ void PaneGeneration::_currentProjectChanged(const QModelIndex &current)
         m_currentPreviewVideoPrompt.clear();
         m_buttonFavoriteVideoPrompt->setEnabled(false);
         ui->buttonGenerateAgain->setEnabled(false);
+        ui->buttonPublish->setEnabled(false);
+        ui->buttonPublish->setText(tr("Mark published"));
+        ui->buttonPublish->setToolTip(tr("Mark this video as published"));
         return;
     }
     m_projectMapper->setCurrentModelIndex(current);
@@ -618,16 +626,19 @@ void PaneGeneration::_generate()
 
     const QString imagePath = m_projects->absoluteImagePath(row);
     const bool hasImage = !imagePath.isEmpty() && QFileInfo::exists(imagePath);
-    // Never regenerated/bootstrapped itself — just extra reference material
-    // that rides along unchanged into every job (see _resolveSecondaryImage).
+    // When not regenerated, rides along unchanged into every job (see
+    // _resolveSecondaryImage). When regenerated ("apply this on 2 images"),
+    // m_runImagePath2 will be updated to point at its regenerated output.
     m_runImagePath2 = m_projects->absoluteImagePath2(row);
+    const bool hasSecondaryImage = !m_runImagePath2.isEmpty() && QFileInfo::exists(m_runImagePath2);
     const QString previousGenerated = _latestGeneratedImage(row);
     const bool hasPreviousGenerated = !previousGenerated.isEmpty();
 
     // Always shown: the video format is picked here even without an input
     // image (the image choices are then hidden).
     DialogGenerationOptions dialog{m_availableClis, hasImage,
-                                   hasPreviousGenerated, previousGenerated, this};
+                                   hasPreviousGenerated, previousGenerated,
+                                   hasSecondaryImage, this};
     if (dialog.exec() != QDialog::Accepted)
     {
         return;
@@ -635,6 +646,7 @@ void PaneGeneration::_generate()
     const auto mode = dialog.imageMode();
     AbstractCli *imageCli = dialog.imageCli();
     const bool whiteBackgroundProduct = dialog.whiteBackgroundProduct();
+    const bool applyBothImages = dialog.applyToBothImages() && hasSecondaryImage;
     const QString videoFormatLabel
         = DialogGenerationOptions::formatLabel(dialog.videoFormat());
 
@@ -683,6 +695,19 @@ void PaneGeneration::_generate()
         m_runImagePath = target;
         _logProgress(tr("Reusing the previously regenerated image (%1).")
             .arg(GENERATED_IMAGE_NAME));
+
+        const QFileInfo prevInfo{previousGenerated};
+        const QString candidate2 = prevInfo.dir().absoluteFilePath(GENERATED_IMAGE_NAME_2);
+        if (QFileInfo::exists(candidate2))
+        {
+            const QString target2 = staging.absoluteFilePath(GENERATED_IMAGE_NAME_2);
+            QFile::remove(target2);
+            QFile::copy(candidate2, target2);
+            m_runImagePath2 = target2;
+            _logProgress(tr("Reusing the previously regenerated secondary image (%1).")
+                .arg(GENERATED_IMAGE_NAME_2));
+        }
+
         _suggestPlan(projectId, videoFormatLabel);
         return;
     }
@@ -702,19 +727,49 @@ void PaneGeneration::_generate()
     QFile::remove(stagedSourceImage);
     QFile::copy(imagePath, stagedSourceImage);
 
-    _logProgress(mode == DialogGenerationOptions::ImageMode::RegenerateInput
-        ? (whiteBackgroundProduct
-            ? tr("Isolating the product on white with %1...").arg(imageCli->getName())
-            : tr("Regenerating the input image with %1...").arg(imageCli->getName()))
-        : tr("Bootstrapping a new image with %1...").arg(imageCli->getName()));
-    _runImageStep(projectId, mode, imageCli, imageRef, videoFormatLabel, whiteBackgroundProduct);
+    QString imageRef2;
+    if (applyBothImages && !m_runImagePath2.isEmpty() && QFileInfo::exists(m_runImagePath2))
+    {
+        imageRef2 = QFileInfo{m_runImagePath2}.fileName();
+        if (imageRef2 == imageRef)
+        {
+            imageRef2 = QStringLiteral("input_secondary_%1").arg(imageRef2);
+        }
+        const QString stagedSourceImage2 = staging.absoluteFilePath(imageRef2);
+        QFile::remove(stagedSourceImage2);
+        QFile::copy(m_runImagePath2, stagedSourceImage2);
+    }
+
+    if (applyBothImages && !imageRef2.isEmpty())
+    {
+        _logProgress(mode == DialogGenerationOptions::ImageMode::RegenerateInput
+            ? (whiteBackgroundProduct
+                ? tr("Isolating product on white (image 1/2) with %1...").arg(imageCli->getName())
+                : tr("Regenerating input image 1/2 with %1...").arg(imageCli->getName()))
+            : tr("Bootstrapping image 1/2 with %1...").arg(imageCli->getName()));
+        _runImageStep(projectId, mode, imageCli, imageRef, videoFormatLabel,
+                      whiteBackgroundProduct, GENERATED_IMAGE_NAME, imageRef2);
+    }
+    else
+    {
+        _logProgress(mode == DialogGenerationOptions::ImageMode::RegenerateInput
+            ? (whiteBackgroundProduct
+                ? tr("Isolating the product on white with %1...").arg(imageCli->getName())
+                : tr("Regenerating the input image with %1...").arg(imageCli->getName()))
+            : tr("Bootstrapping a new image with %1...").arg(imageCli->getName()));
+        _runImageStep(projectId, mode, imageCli, imageRef, videoFormatLabel,
+                      whiteBackgroundProduct, GENERATED_IMAGE_NAME, QString{});
+    }
 }
 
 void PaneGeneration::_runImageStep(const QUuid &projectId,
                                    DialogGenerationOptions::ImageMode mode,
                                    AbstractCli *imageCli, const QString &imageRef,
                                    const QString &videoFormatLabel,
-                                   bool whiteBackgroundProduct, int attempt)
+                                   bool whiteBackgroundProduct,
+                                   const QString &outputFileName,
+                                   const QString &nextImageRef,
+                                   int attempt)
 {
     // The loop keeps going on ordinary failures (an image CLI can be
     // flaky) — it only stops for login/quota errors, which need a human to
@@ -732,11 +787,11 @@ void PaneGeneration::_runImageStep(const QUuid &projectId,
     setEnabled(false);
     const QDateTime callStart = QDateTime::currentDateTime();
     imageCli->runPromptAsync(
-        imageStepPrompt(mode, imageRef, videoFormatLabel, whiteBackgroundProduct),
+        imageStepPrompt(mode, imageRef, videoFormatLabel, whiteBackgroundProduct, outputFileName),
         staging.absolutePath(),
         this,
         [this, projectId, mode, imageCli, imageRef, videoFormatLabel,
-         whiteBackgroundProduct, attempt, callStart](CliRunResult result) {
+         whiteBackgroundProduct, outputFileName, nextImageRef, attempt, callStart](CliRunResult result) {
         setEnabled(true);
         const int row = m_projects->rowOfId(projectId);
         if (row < 0)
@@ -744,7 +799,7 @@ void PaneGeneration::_runImageStep(const QUuid &projectId,
             return;
         }
         const QDir staging = m_projects->stagingDir(row);
-        const QString targetPath = staging.absoluteFilePath(GENERATED_IMAGE_NAME);
+        const QString targetPath = staging.absoluteFilePath(outputFileName);
 
         bool producedFile = result.processStarted && result.exitCode == 0
             && QFileInfo::exists(targetPath);
@@ -763,7 +818,7 @@ void PaneGeneration::_runImageStep(const QUuid &projectId,
             for (const QString &fallbackDir : imageCli->outputFallbackDirs())
             {
                 const QString fallbackPath
-                    = QDir{fallbackDir}.absoluteFilePath(GENERATED_IMAGE_NAME);
+                    = QDir{fallbackDir}.absoluteFilePath(outputFileName);
                 const QFileInfo fallbackInfo{fallbackPath};
                 if (!fallbackInfo.exists() || fallbackInfo.lastModified() < callStart)
                 {
@@ -782,14 +837,34 @@ void PaneGeneration::_runImageStep(const QUuid &projectId,
 
         if (producedFile)
         {
-            m_runImagePath = targetPath;
+            if (outputFileName == GENERATED_IMAGE_NAME_2)
+            {
+                m_runImagePath2 = targetPath;
+            }
+            else
+            {
+                m_runImagePath = targetPath;
+            }
             if (!recoveredFrom.isEmpty())
             {
                 _logProgress(tr("Image step: the file landed in %1 instead of "
                     "the requested folder — recovered it from there.")
                     .arg(recoveredFrom));
             }
-            _logProgress(tr("Image step done (%1).").arg(GENERATED_IMAGE_NAME));
+            _logProgress(tr("Image step done (%1).").arg(outputFileName));
+
+            if (!nextImageRef.isEmpty())
+            {
+                _logProgress(mode == DialogGenerationOptions::ImageMode::RegenerateInput
+                    ? (whiteBackgroundProduct
+                        ? tr("Isolating product on white (image 2/2) with %1...").arg(imageCli->getName())
+                        : tr("Regenerating input image 2/2 with %1...").arg(imageCli->getName()))
+                    : tr("Bootstrapping image 2/2 with %1...").arg(imageCli->getName()));
+                _runImageStep(projectId, mode, imageCli, nextImageRef, videoFormatLabel,
+                              whiteBackgroundProduct, GENERATED_IMAGE_NAME_2, QString{}, 1);
+                return;
+            }
+
             _suggestPlan(projectId, videoFormatLabel);
             return;
         }
@@ -797,7 +872,7 @@ void PaneGeneration::_runImageStep(const QUuid &projectId,
         const QString reason = !result.processStarted || result.exitCode != 0
             ? friendlyCliError(imageCli, result)
             : tr("the CLI finished but did not produce %1. CLI output: %2")
-                .arg(GENERATED_IMAGE_NAME, result.output.left(500));
+                .arg(outputFileName, result.output.left(500));
 
         // Login/quota problems will not fix themselves — pause here with the
         // real reason instead of burning attempts.
@@ -816,7 +891,7 @@ void PaneGeneration::_runImageStep(const QUuid &projectId,
         _logProgress(tr("Image step failed (%1) — trying again (attempt %2)...")
             .arg(reason.left(200)).arg(attempt + 1));
         _runImageStep(projectId, mode, imageCli, imageRef, videoFormatLabel,
-                     whiteBackgroundProduct, attempt + 1);
+                     whiteBackgroundProduct, outputFileName, nextImageRef, attempt + 1);
     });
 }
 
@@ -839,6 +914,24 @@ QString PaneGeneration::_latestGeneratedImage(int row) const
     // the image sat straight in the project root.
     const QString legacy
         = m_projects->projectDir(row).absoluteFilePath(GENERATED_IMAGE_NAME);
+    return QFileInfo::exists(legacy) ? legacy : QString{};
+}
+
+QString PaneGeneration::_latestGeneratedImage2(int row) const
+{
+    const QUuid projectId = m_projects->projectId(row);
+    for (const auto *record : m_videos->recordsForProject(projectId))
+    {
+        const QString candidate = m_projects->projectDir(row).absoluteFilePath(
+            QStringLiteral("generations/%1/temp/%2")
+                .arg(record->shortCode, GENERATED_IMAGE_NAME_2));
+        if (QFileInfo::exists(candidate))
+        {
+            return candidate;
+        }
+    }
+    const QString legacy
+        = m_projects->projectDir(row).absoluteFilePath(GENERATED_IMAGE_NAME_2);
     return QFileInfo::exists(legacy) ? legacy : QString{};
 }
 
@@ -2009,6 +2102,10 @@ void PaneGeneration::_refreshGenerationsView(int row)
         topItem->setText(2, record->generatedDate.toLocalTime()
             .toString(QStringLiteral("yyyy-MM-dd hh:mm")));
         topItem->setData(0, Qt::UserRole, record->id);
+        if (m_videos->isPublished(record->id))
+        {
+            _applyGenerationPublishedStyle(topItem, true);
+        }
         for (const QUuid &valueId : record->propertyValueIds)
         {
             new QTreeWidgetItem{topItem, {resolveLabel(valueId)}};
@@ -2035,6 +2132,9 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
         m_currentPreviewVideoPrompt.clear();
         m_buttonFavoriteVideoPrompt->setEnabled(false);
         ui->buttonGenerateAgain->setEnabled(false);
+        ui->buttonPublish->setEnabled(false);
+        ui->buttonPublish->setText(tr("Mark published"));
+        ui->buttonPublish->setToolTip(tr("Mark this video as published"));
         m_mediaPlayer->stop();
         m_previewImageFiles.clear();
         m_buttonPrevImage->hide();
@@ -2061,6 +2161,12 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
     }
     m_buttonFavoriteVideoPrompt->setEnabled(!m_currentPreviewVideoPrompt.isEmpty());
     ui->buttonGenerateAgain->setEnabled(!m_currentPreviewVideoPrompt.isEmpty());
+    const bool published = m_videos->isPublished(record->id);
+    ui->buttonPublish->setEnabled(true);
+    ui->buttonPublish->setText(published ? tr("Unpublish") : tr("Mark published"));
+    ui->buttonPublish->setToolTip(published
+        ? tr("Unmark this video as published")
+        : tr("Mark this video as published"));
     m_labelGenerationHook->setText(
         hook.isEmpty() ? tr("(no hook chosen yet — use Hooks...)") : hook);
     m_labelGenerationDescription->setText(description);
@@ -2095,6 +2201,54 @@ QString PaneGeneration::_generationTypeLabel(const QDir &generationDir)
     // statistics history. Spelled out rather than a bare "—" since that
     // was easy to mistake for something not having worked.
     return tr("(files deleted)");
+}
+
+void PaneGeneration::_togglePublishSelectedVideo()
+{
+    QTreeWidgetItem *current = ui->treeViewGenerations->currentItem();
+    if (!current)
+    {
+        return;
+    }
+    QTreeWidgetItem *topItem = current->parent() ? current->parent() : current;
+    const QUuid videoId = topItem->data(0, Qt::UserRole).toUuid();
+    const auto *record = m_videos->recordFromId(videoId);
+    if (!record)
+    {
+        return;
+    }
+
+    const bool nowPublished = !m_videos->isPublished(videoId);
+    m_videos->setPublished(videoId, nowPublished);
+    _applyGenerationPublishedStyle(topItem, nowPublished);
+    ui->buttonPublish->setText(nowPublished ? tr("Unpublish") : tr("Mark published"));
+    ui->buttonPublish->setToolTip(nowPublished
+        ? tr("Unmark this video as published")
+        : tr("Mark this video as published"));
+}
+
+void PaneGeneration::_applyGenerationPublishedStyle(QTreeWidgetItem *topItem, bool published)
+{
+    if (!topItem)
+    {
+        return;
+    }
+    const QColor darkGreen(34, 100, 48);
+    const QColor darkGreenText(230, 255, 230);
+    const int cols = ui->treeViewGenerations->columnCount();
+    for (int col = 0; col < cols; ++col)
+    {
+        if (published)
+        {
+            topItem->setBackground(col, darkGreen);
+            topItem->setForeground(col, darkGreenText);
+        }
+        else
+        {
+            topItem->setBackground(col, QBrush{});
+            topItem->setForeground(col, QBrush{});
+        }
+    }
 }
 
 void PaneGeneration::_showPreview(const QDir &generationDir)
@@ -2353,9 +2507,13 @@ void PaneGeneration::_viewSourceImage()
     const QString regeneratedPath = _latestGeneratedImage(row);
     const QPixmap regeneratedPixmap{regeneratedPath};
     const bool hasRegenerated = !regeneratedPath.isEmpty() && !regeneratedPixmap.isNull();
+    const QString regeneratedPath2 = _latestGeneratedImage2(row);
+    const QPixmap regeneratedPixmap2{regeneratedPath2};
+    const bool hasRegenerated2 = !regeneratedPath2.isEmpty() && !regeneratedPixmap2.isNull();
 
-    const int columnCount = hasSecond ? (hasRegenerated ? 3 : 2) : (hasRegenerated ? 2 : 1);
-    const QSize maxEach = columnCount >= 3 ? QSize(430, 900)
+    const int columnCount = 1 + (hasRegenerated ? 1 : 0) + (hasSecond ? 1 : 0) + (hasRegenerated2 ? 1 : 0);
+    const QSize maxEach = columnCount >= 4 ? QSize(350, 900)
+        : columnCount == 3 ? QSize(430, 900)
         : columnCount == 2 ? QSize(650, 900) : QSize(900, 900);
 
     // One titled column: a caption (source file name / "Regenerated") above
@@ -2378,13 +2536,20 @@ void PaneGeneration::_viewSourceImage()
 
     auto *dialog = new QDialog{this};
     dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowTitle(hasRegenerated
+    dialog->setWindowTitle((hasRegenerated || hasRegenerated2)
         ? tr("Source vs. regenerated image — %1").arg(QFileInfo{imagePath}.fileName())
         : tr("Source image(s) — %1").arg(QFileInfo{imagePath}.fileName()));
     auto *layout = new QHBoxLayout{dialog};
 
     QSize totalSize = addColumn(layout, tr("Source — %1").arg(QFileInfo{imagePath}.fileName()),
                                 pixmap);
+    if (hasRegenerated)
+    {
+        const QSize sizeRegen = addColumn(layout,
+            hasRegenerated2 ? tr("Regenerated 1") : tr("Regenerated"), regeneratedPixmap);
+        totalSize = QSize(totalSize.width() + sizeRegen.width(),
+                          std::max(totalSize.height(), sizeRegen.height()));
+    }
     if (hasSecond)
     {
         const QSize size2 = addColumn(layout,
@@ -2392,13 +2557,13 @@ void PaneGeneration::_viewSourceImage()
         totalSize = QSize(totalSize.width() + size2.width(),
                           std::max(totalSize.height(), size2.height()));
     }
-    if (hasRegenerated)
+    if (hasRegenerated2)
     {
-        const QSize sizeRegen = addColumn(layout, tr("Regenerated"), regeneratedPixmap);
-        totalSize = QSize(totalSize.width() + sizeRegen.width(),
-                          std::max(totalSize.height(), sizeRegen.height()));
+        const QSize sizeRegen2 = addColumn(layout, tr("Regenerated 2"), regeneratedPixmap2);
+        totalSize = QSize(totalSize.width() + sizeRegen2.width(),
+                          std::max(totalSize.height(), sizeRegen2.height()));
     }
-    else
+    if (!hasRegenerated && !hasRegenerated2)
     {
         auto *notRegeneratedLabel = new QLabel{
             tr("Not regenerated yet\n(image mode: keep input as-is,\nor no "
@@ -2829,33 +2994,70 @@ void PaneGeneration::_openHooksDialog()
             shortCode = records.first()->shortCode;
         }
     }
-    if (shortCode.isEmpty())
+
+    const QDir genDir = !shortCode.isEmpty()
+        ? m_projects->generationDir(row, shortCode)
+        : m_projects->projectDir(row);
+    const QDir tempDir = !shortCode.isEmpty()
+        ? m_projects->generationTempDir(row, shortCode)
+        : m_projects->stagingDir(row);
+    auto hooks = loadHooksFile(tempDir, nullptr);
+    if (hooks.isEmpty() && !shortCode.isEmpty())
     {
-        QMessageBox::information(this, tr("No hooks yet"),
-            tr("No suggested hooks were saved for this project — run "
-               "Generate first."));
-        return;
+        hooks = loadHooksFile(m_projects->stagingDir(row), nullptr);
     }
 
-    const QDir genDir = m_projects->generationDir(row, shortCode);
-    const auto hooks = loadHooksFile(m_projects->generationTempDir(row, shortCode), nullptr);
-    if (hooks.isEmpty())
-    {
-        QMessageBox::information(this, tr("No hooks yet"),
-            tr("No suggested hooks were saved for this generation."));
-        return;
-    }
     QString existingHook, existingDescription;
     readHookDescriptionFile(genDir, &existingHook, &existingDescription);
 
-    DialogHooks dialog{hooks, codeTagFromShortCode(shortCode), this};
+    DialogHooks::Context context;
+    context.keyword = m_projects->data(
+        m_projects->index(row, TableProjects::IND_KEYWORD)).toString().trimmed();
+    context.hookIdea = m_projects->data(
+        m_projects->index(row, TableProjects::IND_HOOK)).toString().trimmed();
+    context.videoFormatLabel = m_runVideoFormatLabel.isEmpty()
+        ? QStringLiteral("9:16 vertical") : m_runVideoFormatLabel;
+    context.preferredHashtags = m_hashtags ? m_hashtags->hashtags() : QStringList{};
+    context.favoriteHooksPrompt = m_favoriteHooks ? m_favoriteHooks->asPromptSection() : QString{};
+    context.codeTag = codeTagFromShortCode(shortCode);
+    context.workingDir = tempDir.absolutePath();
+    context.availableClis = m_availableClis;
+    context.selectedCli = _promptCli();
+
+    if (!shortCode.isEmpty())
+    {
+        QFile promptFile{tempDir.filePath(QStringLiteral("generation_prompt.txt"))};
+        if (!promptFile.exists())
+        {
+            promptFile.setFileName(genDir.filePath(QStringLiteral("generation_prompt.txt")));
+        }
+        if (promptFile.open(QFile::ReadOnly))
+        {
+            context.videoPrompt = QString::fromUtf8(promptFile.readAll()).trimmed();
+        }
+    }
+
+    DialogHooks dialog{hooks, context, this};
     dialog.preselect(existingHook, existingDescription);
     if (dialog.exec() != QDialog::Accepted)
     {
         return;
     }
-    _saveChosenHookDescription(row, {qMakePair(genDir, shortCode)}, dialog.selectedHook(),
-                               dialog.selectedDescription());
+    if (!dialog.selectedHook().isEmpty() || !dialog.selectedDescription().isEmpty())
+    {
+        _saveChosenHookDescription(row, {qMakePair(genDir, shortCode)}, dialog.selectedHook(),
+                                   dialog.selectedDescription());
+    }
+    if (!shortCode.isEmpty())
+    {
+        saveHooksFile(tempDir, dialog.allHooks(), shortCode);
+        _refreshHooksView(tempDir);
+    }
+    else
+    {
+        saveHooksFile(m_projects->stagingDir(row), dialog.allHooks(), QString{});
+        _refreshHooksView(m_projects->stagingDir(row));
+    }
 }
 
 void PaneGeneration::_openProgress()

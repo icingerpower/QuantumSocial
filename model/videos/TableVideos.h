@@ -65,6 +65,7 @@ public:
         QSet<QUuid> generatedValueIds;  // per-value "generated" checkbox state
         QSet<QUuid> statsValueIds;      // per-value "stats fetched" checkbox state
         QList<Publication> publications;
+        bool published = false;
     };
 
     // Which per-value checkbox of the plan view is being read/written.
@@ -133,6 +134,9 @@ public:
     // Every record generated from the given project, most recent first —
     // drives the per-project "Generations" view.
     QList<const VideoRecord *> recordsForProject(const QUuid &projectId) const;
+
+    bool isPublished(const QUuid &videoId) const;
+    void setPublished(const QUuid &videoId, bool published);
 
     // Publications can be attached at any moment, months after generation
     // (e.g. a best video republished elsewhere): the snapshot scheduler

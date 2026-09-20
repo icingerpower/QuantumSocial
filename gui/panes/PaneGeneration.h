@@ -127,8 +127,10 @@ private slots:
     // result, into the favorite-video-prompts list.
     void _favoriteCurrentVideoPrompt();
     void _generateAgain();
+    void _togglePublishSelectedVideo();
 
 private:
+    void _applyGenerationPublishedStyle(class QTreeWidgetItem *topItem, bool published);
     Ui::PaneGeneration *ui;
     TreeProperties *m_properties;
     TreeProperties *m_archive;
@@ -272,6 +274,8 @@ private:
     void _runImageStep(const QUuid &projectId, DialogGenerationOptions::ImageMode mode,
                        AbstractCli *imageCli, const QString &imageRef,
                        const QString &videoFormatLabel, bool whiteBackgroundProduct,
+                       const QString &outputFileName = QStringLiteral("generation_source.png"),
+                       const QString &nextImageRef = QString{},
                        int attempt = 1);
     void _openProgress();
     void _logProgress(const QString &message);
@@ -312,6 +316,7 @@ private:
     // ended up (new per-generation temp folder, or the legacy project-root
     // location from before this layout existed) — used by "reuse previous".
     QString _latestGeneratedImage(int row) const;
+    QString _latestGeneratedImage2(int row) const;
     // On a successful generation: creates the VideoRecord, moves this job's
     // isolated staging folder into its final generations/<shortCode>/ home
     // (every path in outputPaths to the top level, everything else to

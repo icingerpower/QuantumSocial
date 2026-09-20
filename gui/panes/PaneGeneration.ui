@@ -216,6 +216,19 @@
            </widget>
           </item>
           <item>
+           <widget class="QPushButton" name="buttonPublish">
+            <property name="enabled">
+             <bool>false</bool>
+            </property>
+            <property name="text">
+             <string>Mark published</string>
+            </property>
+            <property name="toolTip">
+             <string>Mark this video as published or unpublish if clicked by accident</string>
+            </property>
+           </widget>
+          </item>
+          <item>
            <spacer name="horizontalSpacer_2">
             <property name="orientation">
              <enum>Qt::Orientation::Horizontal</enum>

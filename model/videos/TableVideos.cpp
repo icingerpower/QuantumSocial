@@ -459,6 +459,28 @@ int TableVideos::rowOfId(const QUuid &videoId) const
     return -1;
 }
 
+bool TableVideos::isPublished(const QUuid &videoId) const
+{
+    const VideoRecord *record = recordFromId(videoId);
+    return record && (record->published || !record->publications.isEmpty());
+}
+
+void TableVideos::setPublished(const QUuid &videoId, bool published)
+{
+    VideoRecord *record = _recordFromId(videoId);
+    if (!record)
+    {
+        return;
+    }
+    record->published = published;
+    if (!published)
+    {
+        record->publications.clear();
+    }
+    _saveInFile();
+    _emitRowChanged(rowOfId(videoId));
+}
+
 void TableVideos::addPublication(const QUuid &videoId, const QString &platformId,
                                  const QString &postUrl, const QDateTime &publishDate,
                                  qint64 followersAtPublish)
@@ -468,6 +490,7 @@ void TableVideos::addPublication(const QUuid &videoId, const QString &platformId
     {
         return;
     }
+    record->published = true;
     Publication publication;
     publication.platformId = platformId;
     publication.postUrl = postUrl;
@@ -725,6 +748,7 @@ void TableVideos::_loadFromFile()
         const auto fetched
             = uuidsFromJson(videoObj.value(QStringLiteral("statsValueIds")).toArray());
         record.statsValueIds = QSet<QUuid>{fetched.begin(), fetched.end()};
+        record.published = videoObj.value(QStringLiteral("published")).toBool(false);
 
         for (const QJsonValue &pubValue : videoObj.value(QStringLiteral("publications")).toArray())
         {
@@ -749,6 +773,10 @@ void TableVideos::_loadFromFile()
                 publication.snapshots << snapshot;
             }
             record.publications << publication;
+        }
+        if (!record.publications.isEmpty())
+        {
+            record.published = true;
         }
         m_videos << record;
     }
@@ -791,6 +819,7 @@ void TableVideos::_saveInFile()
             {QStringLiteral("generatedValueIds"), uuidsToJson(record.generatedValueIds)},
             {QStringLiteral("statsValueIds"), uuidsToJson(record.statsValueIds)},
             {QStringLiteral("publications"), publications},
+            {QStringLiteral("published"), record.published || !record.publications.isEmpty()},
         };
     }
 
