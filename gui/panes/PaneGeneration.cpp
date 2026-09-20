@@ -151,8 +151,9 @@ QList<QPair<QString, QString>> loadHooksFile(const QDir &dir, QString *shortCode
     return hooks;
 }
 
-// hook-description.txt is "hook\n\ndescription\n" — the only format written,
-// so splitting on the first blank line is enough.
+// hook-description.txt is "hook\ndescription\n" (previously "hook\n\ndescription\n").
+// Splitting on the first double newline (if present) or first single newline separates
+// the title from the description.
 void readHookDescriptionFile(const QDir &dir, QString *hook, QString *description)
 {
     QFile file{dir.absoluteFilePath(HOOK_DESCRIPTION_FILE_NAME)};
@@ -161,14 +162,26 @@ void readHookDescriptionFile(const QDir &dir, QString *hook, QString *descriptio
         return;
     }
     const QString content = QString::fromUtf8(file.readAll());
-    const int splitAt = content.indexOf(QStringLiteral("\n\n"));
-    if (splitAt < 0)
+    const int splitAtDouble = content.indexOf(QStringLiteral("\n\n"));
+    if (splitAtDouble >= 0)
     {
-        *hook = content.trimmed();
-        return;
+        *hook = content.left(splitAtDouble).trimmed();
+        *description = content.mid(splitAtDouble + 2).trimmed();
     }
-    *hook = content.left(splitAt).trimmed();
-    *description = content.mid(splitAt + 2).trimmed();
+    else
+    {
+        const int splitAtSingle = content.indexOf(QLatin1Char('\n'));
+        if (splitAtSingle >= 0)
+        {
+            *hook = content.left(splitAtSingle).trimmed();
+            *description = content.mid(splitAtSingle + 1).trimmed();
+        }
+        else
+        {
+            *hook = content.trimmed();
+            *description = QString{};
+        }
+    }
 }
 
 // Turns a failed CLI run into something actionable: expired logins and hit
@@ -2069,7 +2082,18 @@ void PaneGeneration::_saveChosenHookDescription(
         if (file.open(QFile::WriteOnly))
         {
             QTextStream stream{&file};
-            stream << hook << "\n\n" << taggedDescription << "\n";
+            if (!hook.isEmpty() && !taggedDescription.isEmpty())
+            {
+                stream << hook << "\n" << taggedDescription << "\n";
+            }
+            else if (!hook.isEmpty())
+            {
+                stream << hook << "\n";
+            }
+            else
+            {
+                stream << taggedDescription << "\n";
+            }
         }
     }
 
