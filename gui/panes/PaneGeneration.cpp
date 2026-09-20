@@ -438,7 +438,7 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
             return;
         }
         QDesktopServices::openUrl(QUrl::fromLocalFile(
-            m_projects->projectDir(row).absolutePath()));
+            m_projects->projectGenerationsDir(row).absolutePath()));
     });
     connect(ui->comboBoxCli, &QComboBox::currentIndexChanged, this, [this]() {
         if (AbstractCli *cli = _promptCli())
@@ -566,7 +566,7 @@ void PaneGeneration::_currentProjectChanged(const QModelIndex &current)
 
     // The Generation page follows the selection: project folder, past
     // generations and the suggestions of the latest one.
-    const QString projectPath = m_projects->projectDir(row).absolutePath();
+    const QString projectPath = m_projects->projectGenerationsDir(row).absolutePath();
     m_filesModel->setRootPath(projectPath);
     ui->treeViewFiles->setRootIndex(m_filesModel->index(projectPath));
     _refreshGenerationsView(row);
@@ -898,16 +898,30 @@ void PaneGeneration::_runImageStep(const QUuid &projectId,
 QString PaneGeneration::_latestGeneratedImage(int row) const
 {
     const QUuid projectId = m_projects->projectId(row);
+    const QString idString = projectId.toString(QUuid::WithoutBraces);
+    const QDir genBaseDir = m_projects->projectGenerationsDir(row);
     for (const auto *record : m_videos->recordsForProject(projectId))
     {
         // Constructed directly (not via generationTempDir()) so probing
         // never creates folders for old/deleted generations as a side effect.
-        const QString candidate = m_projects->projectDir(row).absoluteFilePath(
+        const QString candidateNew = genBaseDir.absoluteFilePath(
+            QStringLiteral("%1/%2/%3").arg(record->shortCode, idString, GENERATED_IMAGE_NAME));
+        if (QFileInfo::exists(candidateNew))
+        {
+            return candidateNew;
+        }
+        const QString candidateNewTemp = genBaseDir.absoluteFilePath(
+            QStringLiteral("%1/temp/%2").arg(record->shortCode, GENERATED_IMAGE_NAME));
+        if (QFileInfo::exists(candidateNewTemp))
+        {
+            return candidateNewTemp;
+        }
+        const QString candidateLegacy = m_projects->projectDir(row).absoluteFilePath(
             QStringLiteral("generations/%1/temp/%2")
                 .arg(record->shortCode, GENERATED_IMAGE_NAME));
-        if (QFileInfo::exists(candidate))
+        if (QFileInfo::exists(candidateLegacy))
         {
-            return candidate;
+            return candidateLegacy;
         }
     }
     // Legacy layout (generations existed before per-generation folders did):
@@ -920,14 +934,28 @@ QString PaneGeneration::_latestGeneratedImage(int row) const
 QString PaneGeneration::_latestGeneratedImage2(int row) const
 {
     const QUuid projectId = m_projects->projectId(row);
+    const QString idString = projectId.toString(QUuid::WithoutBraces);
+    const QDir genBaseDir = m_projects->projectGenerationsDir(row);
     for (const auto *record : m_videos->recordsForProject(projectId))
     {
-        const QString candidate = m_projects->projectDir(row).absoluteFilePath(
+        const QString candidateNew = genBaseDir.absoluteFilePath(
+            QStringLiteral("%1/%2/%3").arg(record->shortCode, idString, GENERATED_IMAGE_NAME_2));
+        if (QFileInfo::exists(candidateNew))
+        {
+            return candidateNew;
+        }
+        const QString candidateNewTemp = genBaseDir.absoluteFilePath(
+            QStringLiteral("%1/temp/%2").arg(record->shortCode, GENERATED_IMAGE_NAME_2));
+        if (QFileInfo::exists(candidateNewTemp))
+        {
+            return candidateNewTemp;
+        }
+        const QString candidateLegacy = m_projects->projectDir(row).absoluteFilePath(
             QStringLiteral("generations/%1/temp/%2")
                 .arg(record->shortCode, GENERATED_IMAGE_NAME_2));
-        if (QFileInfo::exists(candidate))
+        if (QFileInfo::exists(candidateLegacy))
         {
-            return candidate;
+            return candidateLegacy;
         }
     }
     const QString legacy
@@ -1664,8 +1692,7 @@ void PaneGeneration::_runNextInGroup(int row, const QUuid &projectId, QString gr
             // failure) — the shared staging scratch, and every per-job
             // subfolder under it, is no longer needed by anything.
             setEnabled(true);
-            QDir{m_projects->projectDir(row).absoluteFilePath(
-                QStringLiteral("generations/_staging"))}.removeRecursively();
+            m_projects->stagingDir(row).removeRecursively();
             if (m_batchCancelled)
             {
                 _finishProgress(tr("Cancelled. %1 completed generation(s) saved.")
@@ -2997,7 +3024,7 @@ void PaneGeneration::_openHooksDialog()
 
     const QDir genDir = !shortCode.isEmpty()
         ? m_projects->generationDir(row, shortCode)
-        : m_projects->projectDir(row);
+        : m_projects->projectGenerationsDir(row);
     const QDir tempDir = !shortCode.isEmpty()
         ? m_projects->generationTempDir(row, shortCode)
         : m_projects->stagingDir(row);

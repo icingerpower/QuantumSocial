@@ -69,19 +69,23 @@ public:
     int rowOfId(const QUuid &projectId) const;
     // The project's own folder (<workingDir>/projects/<id>).
     QDir projectDir(int row) const;
+    // The project's generations folder (<workingDir>/projects/generations/<003-slug>/).
+    QDir projectGenerationsDir(int row) const;
+    // Name of the project's folder under projects/generations/ (e.g. "003-high-heels").
+    QString projectGenerationFolderName(int row) const;
     // Absolute path of the source image ("" when the row has none).
     QString absoluteImagePath(int row) const;
     // Absolute path of the optional second source image ("" when none).
     QString absoluteImagePath2(int row) const;
 
-    // One folder per generation (<workingDir>/projects/<id>/generations/
+    // One folder per generation (<workingDir>/projects/generations/<003-slug>/
     // <shortCode>/, created on first access): its top level holds only what
-    // matters for publishing (the video/images, hook-description.txt); a
-    // "temp" subfolder (see generationTempDir) holds everything else, so
-    // browsing this folder alone is enough to review and publish.
+    // matters for publishing (the video/images, hook-description.txt); an
+    // inner subfolder named with the project ID (<workingDir>/projects/generations/
+    // <003-slug>/<shortCode>/<id>/) holds internal working material.
     QDir generationDir(int row, const QString &shortCode) const;
-    // The "temp" subfolder of one generation: source-image variant, prompt
-    // files, suggestions/hooks JSON, rejected takes, extracted frames.
+    // The working subfolder of one generation (<generationDir>/<id>/):
+    // source-image variant, prompt files, suggestions/hooks JSON, rejected takes, extracted frames.
     QDir generationTempDir(int row, const QString &shortCode) const;
     // Scratch folder for the image + suggestion steps, which run BEFORE the
     // generation's short code is known. Callers should clear it (see

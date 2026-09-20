@@ -62,9 +62,9 @@ class VideoPlanProxy;
 // setVideo().
 //
 // On disk, each generation gets its own folder
-// (projects/<id>/generations/<shortCode>/): its top level holds only the
-// video/images and hook-description.txt (what matters to publish); a
-// "temp" subfolder holds the rest (source-image variant, prompts,
+// (projects/generations/<003-slug>/<shortCode>/): its top level holds only the
+// video/images and hook-description.txt (what matters to publish); an
+// inner subfolder named with the project ID holds the rest (source-image variant, prompts,
 // suggestions/hooks JSON, rejected takes, extracted frames).
 class PaneGeneration : public QWidget
 {
@@ -319,8 +319,8 @@ private:
     QString _latestGeneratedImage2(int row) const;
     // On a successful generation: creates the VideoRecord, moves this job's
     // isolated staging folder into its final generations/<shortCode>/ home
-    // (every path in outputPaths to the top level, everything else to
-    // temp/). Returns the new generation folder; *outShortCode (if given)
+    // (every path in outputPaths to the top level, everything else to its
+    // project ID subfolder). Returns the new generation folder; *outShortCode (if given)
     // receives its short code — read that, not m_runShortCode, when several
     // jobs may be finishing around the same time.
     QDir _finalizeGeneration(int row, const QUuid &projectId,

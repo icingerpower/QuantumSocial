@@ -28,6 +28,35 @@ QString escapeCsvField(const QString &field)
     return escaped;
 }
 
+QString slugify(const QString &text)
+{
+    const QString trimmed = text.trimmed().toLower();
+    QString result;
+    result.reserve(trimmed.size());
+    bool lastWasHyphen = false;
+    for (const QChar &ch : trimmed)
+    {
+        if (ch.isLetterOrNumber())
+        {
+            result += ch;
+            lastWasHyphen = false;
+        }
+        else if (ch == QLatin1Char('-') || ch == QLatin1Char('_') || ch.isSpace())
+        {
+            if (!lastWasHyphen && !result.isEmpty())
+            {
+                result += QLatin1Char('-');
+                lastWasHyphen = true;
+            }
+        }
+    }
+    while (result.endsWith(QLatin1Char('-')))
+    {
+        result.chop(1);
+    }
+    return result;
+}
+
 QStringList splitCsvLine(const QString &line)
 {
     QStringList fields;
@@ -143,8 +172,27 @@ bool TableProjects::setData(const QModelIndex &index, const QVariant &value, int
 {
     if (role == Qt::EditRole)
     {
+        const int row = index.row();
+        const QString oldFolderName = (index.column() == IND_NAME && row >= 0 && row < m_listOfVariantList.size())
+            ? projectGenerationFolderName(row) : QString{};
+
         m_listOfVariantList[index.row()][index.column()] = value;
         _saveInFile();
+
+        if (!oldFolderName.isEmpty())
+        {
+            const QString newFolderName = projectGenerationFolderName(row);
+            if (!newFolderName.isEmpty() && oldFolderName != newFolderName)
+            {
+                QDir baseGenerationsDir{m_workingDir.absoluteFilePath(
+                    PROJECTS_SUBDIR + QStringLiteral("/generations"))};
+                if (baseGenerationsDir.exists(oldFolderName) && !baseGenerationsDir.exists(newFolderName))
+                {
+                    baseGenerationsDir.rename(oldFolderName, newFolderName);
+                }
+            }
+        }
+
         emit dataChanged(index, index, {role, Qt::DisplayRole});
         return true;
     }
@@ -234,6 +282,11 @@ void TableProjects::removeProject(int row)
     {
         dir.removeRecursively();
     }
+    QDir genDir = projectGenerationsDir(row);
+    if (genDir != m_workingDir && genDir.exists())
+    {
+        genDir.removeRecursively();
+    }
     beginRemoveRows(QModelIndex{}, row, row);
     m_listOfVariantList.removeAt(row);
     endRemoveRows();
@@ -272,6 +325,35 @@ QDir TableProjects::projectDir(int row) const
         + m_listOfVariantList[row][IND_ID].toString())};
 }
 
+QString TableProjects::projectGenerationFolderName(int row) const
+{
+    if (row < 0 || row >= m_listOfVariantList.size())
+    {
+        return QString{};
+    }
+    const QString name = m_listOfVariantList[row][IND_NAME].toString();
+    const QString slug = slugify(name);
+    const QString prefix = QStringLiteral("%1").arg(row + 1, 3, 10, QLatin1Char('0'));
+    return slug.isEmpty() ? prefix : QStringLiteral("%1-%2").arg(prefix, slug);
+}
+
+QDir TableProjects::projectGenerationsDir(int row) const
+{
+    if (row < 0 || row >= m_listOfVariantList.size())
+    {
+        return m_workingDir;
+    }
+    const QString folderName = projectGenerationFolderName(row);
+    if (folderName.isEmpty())
+    {
+        return m_workingDir;
+    }
+    QDir dir{m_workingDir.absoluteFilePath(
+        PROJECTS_SUBDIR + QStringLiteral("/generations/") + folderName)};
+    dir.mkpath(QStringLiteral("."));
+    return dir;
+}
+
 QString TableProjects::absoluteImagePath(int row) const
 {
     if (row < 0 || row >= m_listOfVariantList.size())
@@ -306,17 +388,40 @@ QDir TableProjects::generationDir(int row, const QString &shortCode) const
     {
         return m_workingDir;
     }
-    QDir dir{projectDir(row).absoluteFilePath(
+    const QDir newDir{projectGenerationsDir(row).absoluteFilePath(shortCode)};
+    const QDir legacyDir{projectDir(row).absoluteFilePath(
         QStringLiteral("generations/") + shortCode)};
-    dir.mkpath(QStringLiteral("."));
-    return dir;
+
+    if (legacyDir.exists() && !newDir.exists())
+    {
+        return legacyDir;
+    }
+    newDir.mkpath(QStringLiteral("."));
+    return newDir;
 }
 
 QDir TableProjects::generationTempDir(int row, const QString &shortCode) const
 {
-    QDir dir{generationDir(row, shortCode).absoluteFilePath(QStringLiteral("temp"))};
-    dir.mkpath(QStringLiteral("."));
-    return dir;
+    if (row < 0 || row >= m_listOfVariantList.size() || shortCode.isEmpty())
+    {
+        return m_workingDir;
+    }
+    const QDir baseGenDir = generationDir(row, shortCode);
+    const QString idString = m_listOfVariantList[row][IND_ID].toString();
+    const QString subfolderName = idString.isEmpty() ? QStringLiteral("temp") : idString;
+    const QDir idDir{baseGenDir.absoluteFilePath(subfolderName)};
+
+    if (idDir.exists())
+    {
+        return idDir;
+    }
+    const QDir legacyTempDir{baseGenDir.absoluteFilePath(QStringLiteral("temp"))};
+    if (legacyTempDir.exists())
+    {
+        return legacyTempDir;
+    }
+    idDir.mkpath(QStringLiteral("."));
+    return idDir;
 }
 
 QDir TableProjects::stagingDir(int row) const
@@ -325,8 +430,7 @@ QDir TableProjects::stagingDir(int row) const
     {
         return m_workingDir;
     }
-    QDir dir{projectDir(row).absoluteFilePath(
-        QStringLiteral("generations/_staging"))};
+    QDir dir{projectDir(row).absoluteFilePath(QStringLiteral("staging"))};
     dir.mkpath(QStringLiteral("."));
     return dir;
 }
