@@ -31,6 +31,16 @@
           </widget>
          </item>
          <item>
+          <widget class="QPushButton" name="buttonProjectAddMultiVideo">
+           <property name="text">
+            <string>Add multi video</string>
+           </property>
+           <property name="toolTip">
+            <string>Create a multi-video project with steps and multiple product takes</string>
+           </property>
+          </widget>
+         </item>
+         <item>
           <widget class="QPushButton" name="buttonProjectRemove">
            <property name="text">
             <string>Remove</string>
@@ -172,6 +182,32 @@
            <widget class="QPushButton" name="buttonGenerate">
             <property name="text">
              <string>Generate</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="buttonResumeGeneration">
+            <property name="enabled">
+             <bool>false</bool>
+            </property>
+            <property name="text">
+             <string>Resume generation</string>
+            </property>
+            <property name="toolTip">
+             <string>Resume generation of remaining videos once limits are lifted</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="buttonResetStep">
+            <property name="enabled">
+             <bool>false</bool>
+            </property>
+            <property name="text">
+             <string>Reset step...</string>
+            </property>
+            <property name="toolTip">
+             <string>Reset or regenerate specific steps of the multi-video showcase</string>
             </property>
            </widget>
           </item>

@@ -218,6 +218,25 @@ void DialogHooks::_initUi(const QList<QPair<QString, QString>> &hooks)
     connect(ui->buttonEdit, &QPushButton::clicked, this, &DialogHooks::_editHook);
     connect(ui->buttonDelete, &QPushButton::clicked, this, &DialogHooks::_deleteHook);
     connect(ui->buttonRegenerate, &QPushButton::clicked, this, &DialogHooks::_regenerateHooks);
+
+    if (!m_context.videoIdea.trimmed().isEmpty())
+    {
+        ui->editVideoIdea->setText(m_context.videoIdea.trimmed());
+    }
+
+    const bool hasPrompt = !m_context.videoPrompt.trimmed().isEmpty();
+    ui->buttonUsePrompt->setVisible(hasPrompt);
+    if (hasPrompt)
+    {
+        connect(ui->buttonUsePrompt, &QPushButton::clicked, this, [this]() {
+            ui->editVideoIdea->setText(m_context.videoPrompt.trimmed());
+            ui->editVideoIdea->setFocus();
+            ui->editVideoIdea->selectAll();
+        });
+    }
+
+    connect(ui->editVideoIdea, &QLineEdit::returnPressed,
+            this, &DialogHooks::_regenerateHooks);
 }
 
 void DialogHooks::preselect(const QString &hook, const QString &description)
@@ -247,6 +266,19 @@ QString DialogHooks::selectedDescription() const
 {
     return (m_descriptionRow >= 0 && m_descriptionRow < ui->tableHooks->rowCount())
         ? _cellText(m_descriptionRow, 1) : QString{};
+}
+
+QString DialogHooks::videoIdea() const
+{
+    return ui->editVideoIdea ? ui->editVideoIdea->text().trimmed() : QString{};
+}
+
+void DialogHooks::setVideoIdea(const QString &idea)
+{
+    if (ui->editVideoIdea)
+    {
+        ui->editVideoIdea->setText(idea);
+    }
 }
 
 QList<QPair<QString, QString>> DialogHooks::allHooks() const
@@ -417,6 +449,8 @@ void DialogHooks::_regenerateHooks()
 
     ui->buttonRegenerate->setEnabled(false);
     ui->comboCli->setEnabled(false);
+    ui->editVideoIdea->setEnabled(false);
+    ui->buttonUsePrompt->setEnabled(false);
     ui->buttonBox->setEnabled(false);
     ui->progressBar->setRange(0, 0);
     ui->progressBar->setVisible(true);
@@ -427,6 +461,8 @@ void DialogHooks::_regenerateHooks()
     cli->runPromptAsync(prompt, workingDir, this, [this, cli, workingDir, replyFilePath](CliRunResult result) {
         ui->buttonRegenerate->setEnabled(true);
         ui->comboCli->setEnabled(true);
+        ui->editVideoIdea->setEnabled(true);
+        ui->buttonUsePrompt->setEnabled(!m_context.videoPrompt.trimmed().isEmpty());
         ui->buttonBox->setEnabled(true);
         ui->progressBar->setVisible(false);
 
@@ -632,13 +668,27 @@ QString DialogHooks::_buildRegenerationPrompt() const
     {
         prompt += QStringLiteral("- Keyword / Product: %1\n").arg(m_context.keyword);
     }
-    if (!m_context.hookIdea.isEmpty())
+    const QString currentIdea = videoIdea();
+    if (!currentIdea.isEmpty())
     {
-        prompt += QStringLiteral("- Hook idea: %1\n").arg(m_context.hookIdea);
+        prompt += QStringLiteral("- Current video idea / description: %1\n").arg(currentIdea);
+        prompt += QStringLiteral(
+            "Orientation requirement: Ensure the suggested hooks and post descriptions specifically reflect, match, and highlight this video's visual action, details, and concept.\n");
+        if (!m_context.hookIdea.isEmpty() && m_context.hookIdea.compare(currentIdea, Qt::CaseInsensitive) != 0)
+        {
+            prompt += QStringLiteral("- Overall project hook idea: %1\n").arg(m_context.hookIdea);
+        }
     }
-    if (!m_context.videoPrompt.isEmpty())
+    else
     {
-        prompt += QStringLiteral("- Video content / concept: %1\n").arg(m_context.videoPrompt);
+        if (!m_context.hookIdea.isEmpty())
+        {
+            prompt += QStringLiteral("- Hook idea: %1\n").arg(m_context.hookIdea);
+        }
+        if (!m_context.videoPrompt.isEmpty())
+        {
+            prompt += QStringLiteral("- Video content / concept: %1\n").arg(m_context.videoPrompt);
+        }
     }
     prompt += QStringLiteral(
         "Style guidance: keep everything tasteful, brand-safe fashion-editorial — "

@@ -11,6 +11,7 @@ public:
     QString getId() const override;
     QString getName() const override;
     QList<SettingSpec> availableSettings() const override;
+    double continuationDurationSeconds(const QVariantMap &settings) const override;
     QCoro::Task<Result> generate(const QString &prompt,
                                  const QStringList &imagePaths,
                                  const QString &outputDir,

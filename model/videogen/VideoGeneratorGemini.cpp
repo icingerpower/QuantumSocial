@@ -16,6 +16,12 @@ QString VideoGeneratorGemini::getName() const
 QList<AbstractVideoGenerator::SettingSpec> VideoGeneratorGemini::availableSettings() const
 {
     return {
+        {QStringLiteral("continuationDurationSec"),
+         QObject::tr("New segment duration in multi-video continuations (seconds; 0 disables trimming)"),
+         10.0},
+        {QStringLiteral("validationFramesCount"),
+         QObject::tr("Number of key frames to extract for CLI content validation (5 to 10)"),
+         5},
         {QStringLiteral("maxTriesPerPrompt"),
          QObject::tr("Tries with small prompt variations before the CLI rewrites "
                      "the prompt or changes the source image"),
@@ -42,6 +48,11 @@ QList<AbstractVideoGenerator::SettingSpec> VideoGeneratorGemini::availableSettin
                      "the right one)"),
          true},
     };
+}
+
+double VideoGeneratorGemini::continuationDurationSeconds(const QVariantMap &settings) const
+{
+    return qMax(0.0, settings.value(QStringLiteral("continuationDurationSec"), 10.0).toDouble());
 }
 
 QCoro::Task<AbstractVideoGenerator::Result> VideoGeneratorGemini::generate(

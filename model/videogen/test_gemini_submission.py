@@ -286,6 +286,461 @@ class GeminiSubmissionTests(unittest.TestCase):
         self.assertEqual([result["video"] for result in responses],
                          ["/saved/first.mp4", "/saved/second.mp4"])
 
+    def test_edit_last_message_success(self):
+        self.page.set_content("""
+            <user-query>
+                <div id="content">Original prompt</div>
+                <button id="edit" aria-label="Modifier">Modifier</button>
+                <textarea id="box" hidden></textarea>
+                <button id="update" aria-label="Mettre à jour" hidden disabled>Mettre à jour</button>
+            </user-query>
+            <script>
+                edit.onclick = () => {
+                    box.hidden = false;
+                    box.value = 'Original prompt';
+                    update.hidden = false;
+                };
+                box.oninput = () => {
+                    update.disabled = false;
+                };
+                update.onclick = () => {
+                    window.updated = box.value;
+                };
+            </script>
+        """)
+        self.assertTrue(worker._edit_last_message(self.page, "New prompt for take 2", timeout_s=1.0))
+        self.assertEqual(self.page.evaluate("window.updated"), "New prompt for take 2")
+
+    def test_edit_last_message_returns_false_when_no_queries(self):
+        self.page.set_content("<div>No queries here</div>")
+        self.assertFalse(worker._edit_last_message(self.page, "Prompt", timeout_s=0.5))
+
+    def test_edit_last_message_returns_false_when_edit_button_missing(self):
+        self.page.set_content("<user-query><div>Text only</div></user-query>")
+        self.assertFalse(worker._edit_last_message(self.page, "Prompt", timeout_s=0.5))
+
+    def test_run_attempt_uses_edit_last_when_requested(self):
+        self.page.set_content("<user-query><button aria-label='Modifier'></button></user-query>")
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_edit_last_message", return_value=True) as edit_mock, \
+                patch.object(worker, "_select_video_tool") as select_tool, \
+                patch.object(worker, "install_video_capture", return_value={"video": "/saved/take2.mp4", "error": None}):
+            status, payload = worker._run_attempt(
+                self.page, "Take 2 prompt", [], "/tmp", time.time() + 10, time.time() + 10,
+                5, message_action="edit_last")
+            self.assertEqual(status, "video")
+            self.assertEqual(payload, "/saved/take2.mp4")
+            edit_mock.assert_called_once_with(self.page, "Take 2 prompt")
+            select_tool.assert_not_called()
+
+    def test_prepare_page_reuses_existing_conversation(self):
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://gemini.google.com/app/12345678"
+        with patch.object(worker, "_wait_ready_or_login", return_value="ready"), \
+                patch.object(worker, "_ensure_ultra", return_value=None):
+            result_page, error = worker._prepare_page(
+                None, require_ultra=True, existing_page=page, chat_mode="conversation")
+            self.assertIsNone(error)
+            self.assertEqual(result_page, page)
+            page.goto.assert_not_called()
+
+    def test_handle_tool_switch_dialog_clicks_dialog_button_not_sidebar(self):
+        self.page.set_content("""
+            <div id="sidebar">
+                <button id="sidebar_btn">Nouvelle discussion</button>
+            </div>
+            <div role="dialog" id="modal">
+                <h2>Commencer une nouvelle discussion ?</h2>
+                <p>Sélectionner cet outil lancera une nouvelle discussion.</p>
+                <button role="switch" id="dont_ask">Ne plus me demander</button>
+                <button id="modal_btn">Nouvelle discussion</button>
+            </div>
+            <script>
+                window.sidebarClicked = false;
+                window.modalClicked = false;
+                window.dontAskClicked = false;
+                sidebar_btn.onclick = () => { window.sidebarClicked = true; };
+                modal_btn.onclick = () => { window.modalClicked = true; };
+                dont_ask.onclick = () => { window.dontAskClicked = true; };
+            </script>
+        """)
+        handled = worker._handle_tool_switch_dialog(self.page)
+        self.assertTrue(handled)
+        self.assertFalse(self.page.evaluate("window.sidebarClicked"))
+        self.assertTrue(self.page.evaluate("window.modalClicked"))
+        self.assertTrue(self.page.evaluate("window.dontAskClicked"))
+
+    def test_handle_tool_switch_dialog_dismiss_does_not_click_new_chat(self):
+        self.page.set_content("""
+            <div role="dialog" id="modal">
+                <h2>Commencer une nouvelle discussion ?</h2>
+                <button aria-label="Fermer" id="close_btn">X</button>
+                <button id="modal_btn">Nouvelle discussion</button>
+            </div>
+            <script>
+                window.closeClicked = false;
+                window.modalClicked = false;
+                close_btn.onclick = () => { window.closeClicked = true; };
+                modal_btn.onclick = () => { window.modalClicked = true; };
+            </script>
+        """)
+        handled = worker._handle_tool_switch_dialog(self.page, action="dismiss")
+        self.assertTrue(handled)
+        self.assertTrue(self.page.evaluate("window.closeClicked"))
+        self.assertFalse(self.page.evaluate("window.modalClicked"))
+
+    def test_run_attempt_calls_select_tool_in_fresh_chat(self):
+        self.page.set_content("<textarea aria-label='Prompt'></textarea><button aria-label='Envoyer'></button>")
+        self.page.goto = Mock()
+        type(self.page).url = "https://gemini.google.com/app"
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_select_video_tool", return_value=True) as select_tool, \
+                patch.object(worker, "_handle_tool_switch_dialog") as switch_dialog, \
+                patch.object(worker, "_attach_image", return_value=True), \
+                patch.object(worker, "_submit_prompt", return_value=True), \
+                patch.object(worker, "install_video_capture", return_value={"video": "/saved/step1.mp4", "error": None}):
+            status, payload = worker._run_attempt(
+                self.page, "Next video prompt", ["/tmp/test.png"], "/tmp",
+                time.time() + 10, time.time() + 10, 5, message_action="new",
+                chat_mode="fresh")
+            self.assertEqual(status, "video")
+            self.assertEqual(payload, "/saved/step1.mp4")
+            select_tool.assert_called_once_with(self.page)
+            switch_dialog.assert_called_once_with(self.page, action="confirm")
+
+    def test_run_attempt_video_tool_disabled_treated_as_quota(self):
+        self.page.set_content("<textarea aria-label='Prompt'></textarea><button aria-label='Envoyer'></button>")
+        self.page.goto = Mock()
+        type(self.page).url = "https://gemini.google.com/app"
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_select_video_tool", return_value="disabled") as select_tool:
+            status, payload = worker._run_attempt(
+                self.page, "Prompt", [], "/tmp", time.time() + 10, time.time() + 10, 5)
+            self.assertEqual(status, "quota")
+            self.assertIn("disabled by Google", payload)
+            select_tool.assert_called_once_with(self.page)
+
+    def test_run_attempt_in_existing_conversation_stays_in_chat(self):
+        self.page.set_content("<textarea aria-label='Prompt'></textarea><button aria-label='Envoyer'></button>")
+        self.page.goto = Mock()
+        type(self.page).url = "https://gemini.google.com/app/77e31cb1ab773abd"
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_select_video_tool") as select_tool, \
+                patch.object(worker, "_handle_tool_switch_dialog") as switch_dialog, \
+                patch.object(worker, "_attach_image", return_value=True), \
+                patch.object(worker, "_submit_prompt", return_value=True), \
+                patch.object(worker, "install_video_capture", return_value={"video": "/saved/step2.mp4", "error": None}):
+            status, payload = worker._run_attempt(
+                self.page, "Next video prompt", ["/tmp/test.png"], "/tmp",
+                time.time() + 10, time.time() + 10, 5, message_action="new",
+                chat_mode="conversation")
+            self.assertEqual(status, "video")
+            self.assertEqual(payload, "/saved/step2.mp4")
+            select_tool.assert_not_called()
+            switch_dialog.assert_not_called()
+
+    def test_run_attempt_does_not_click_previous_turn_download_button(self):
+        # Page already has an old turn with a video and download button
+        self.page.set_content("""
+            <model-response>
+                <video src="old.mp4"></video>
+                <button aria-label="Télécharger" id="old_dl">Télécharger</button>
+            </model-response>
+            <textarea aria-label='Prompt'></textarea>
+            <button aria-label='Envoyer'></button>
+        """)
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_select_video_tool", return_value=True), \
+                patch.object(worker, "_handle_tool_switch_dialog"), \
+                patch.object(worker, "_submit_prompt", return_value=True), \
+                patch.object(worker, "install_video_capture", return_value={"video": None, "error": None}), \
+                patch.object(worker.time, "time", side_effect=[100, 100, 100, 100, 100, 120]):
+            # The attempt should stall and timeout without clicking the old download button
+            status, payload = worker._run_attempt(
+                self.page, "New video prompt", [], "/tmp",
+                105, 105, 5, message_action="new")
+            self.assertEqual(status, "stalled")
+
+    def test_run_attempt_edit_last_does_not_click_previous_turn_download_button(self):
+        # Page has Turn 1 (with video) and Turn 2 (with refusal), and user edits Turn 2
+        self.page.set_content("""
+            <user-query id="q1"><div id="c1">Turn 1</div></user-query>
+            <model-response id="r1">
+                <video src="turn1.mp4"></video>
+                <button aria-label="Télécharger" id="old_dl">Télécharger</button>
+            </model-response>
+            <user-query id="q2">
+                <div id="c2">Turn 2</div>
+                <button aria-label="Modifier">Modifier</button>
+            </user-query>
+            <model-response id="r2">
+                <p>I can't make videos of real people in situations like that.</p>
+            </model-response>
+        """)
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_edit_last_message", return_value=True), \
+                patch.object(worker, "install_video_capture", return_value={"video": None, "error": None}), \
+                patch.object(worker.time, "time", side_effect=[100, 100, 100, 100, 100, 120]):
+            status, payload = worker._run_attempt(
+                self.page, "Take 2 prompt variant", [], "/tmp",
+                105, 105, 5, message_action="edit_last", chat_mode="conversation")
+            # Must NOT click Turn 1's download button or report video!
+            self.assertEqual(status, "stalled")
+
+    def test_run_attempt_detects_text_only_response_as_rejection(self):
+        self.page.set_content("""
+            <textarea aria-label='Prompt'></textarea>
+            <button aria-label='Envoyer'></button>
+        """)
+        # After submit, a new model-response appears with text "Your video is ready!" but NO video
+        def fake_submit(page, editor, prompt, **kwargs):
+            page.set_content("""
+                <model-response>
+                    <p>Your video is ready!</p>
+                    <button aria-label="Bonne réponse">Like</button>
+                </model-response>
+            """)
+            return True
+
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_select_video_tool", return_value=True), \
+                patch.object(worker, "_handle_tool_switch_dialog"), \
+                patch.object(worker, "_submit_prompt", side_effect=fake_submit), \
+                patch.object(worker, "install_video_capture", return_value={"video": None, "error": None}):
+            status, marker = worker._run_attempt(
+                self.page, "Prompt", [], "/tmp",
+                time.time() + 10, time.time() + 10, 5, message_action="new")
+            self.assertEqual(status, "rejected")
+            self.assertIn("text without a video", marker)
+
+    def test_run_attempt_detects_refusal_real_people_situations(self):
+        self.page.set_content("""
+            <textarea aria-label='Prompt'></textarea>
+            <button aria-label='Envoyer'></button>
+        """)
+        def fake_submit(page, editor, prompt, **kwargs):
+            page.set_content("""
+                <model-response>
+                    <p>I can't make videos of real people in situations like that. Can I help you with something else?</p>
+                </model-response>
+            """)
+            return True
+
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_select_video_tool", return_value=True), \
+                patch.object(worker, "_handle_tool_switch_dialog"), \
+                patch.object(worker, "_submit_prompt", side_effect=fake_submit), \
+                patch.object(worker, "install_video_capture", return_value={"video": None, "error": None}):
+            status, marker = worker._run_attempt(
+                self.page, "Prompt", [], "/tmp",
+                time.time() + 10, time.time() + 10, 5, message_action="new")
+            self.assertEqual(status, "rejected")
+            self.assertTrue(any(p in marker for p in ("I can't make", "videos of real people", "situations like that")))
+
+    def test_handle_tool_switch_dialog_noop_when_no_dialog(self):
+        self.page.set_content("""
+            <div id="sidebar">
+                <button id="sidebar_btn">Nouvelle discussion</button>
+            </div>
+        """)
+        handled = worker._handle_tool_switch_dialog(self.page)
+        self.assertFalse(handled)
+
+    def test_video_quota_in_detects_daily_limit_phrases(self):
+        phrases = [
+            "Sorry I can't generate more video for you today",
+            "Sorry, I cannot generate more videos for you today. Try again tomorrow.",
+            "You have reached your daily limit for video creation.",
+            "Vous n'avez plus de vidéos pour le moment.",
+            "Je ne peux plus générer de vidéo pour aujourd'hui.",
+            "You have no more videos for now.",
+        ]
+        for phrase in phrases:
+            hit = worker._video_quota_in(phrase)
+            self.assertIsNotNone(hit, f"Expected quota match for: {phrase}")
+
+    def test_run_attempt_detects_quota_exhaustion_in_response(self):
+        self.page.set_content("""
+            <textarea aria-label='Prompt'></textarea>
+            <button aria-label='Envoyer'></button>
+        """)
+        def fake_submit(page, editor, prompt, **kwargs):
+            page.set_content("""
+                <model-response>
+                    <p>Sorry I can't generate more video for you today.</p>
+                </model-response>
+            """)
+            return True
+
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_select_video_tool", return_value=True), \
+                patch.object(worker, "_handle_tool_switch_dialog"), \
+                patch.object(worker, "_submit_prompt", side_effect=fake_submit), \
+                patch.object(worker, "install_video_capture", return_value={"video": None, "error": None}):
+            status, payload = worker._run_attempt(
+                self.page, "Prompt", [], "/tmp",
+                time.time() + 10, time.time() + 10, 5, message_action="new")
+            self.assertEqual(status, "quota")
+            self.assertIn("can't generate more video", payload)
+
+    def test_generate_once_returns_quota_exceeded_dict(self):
+        with patch.object(worker, "_run_attempt", return_value=("quota", "Sorry I can't generate more video for you today")):
+            result, _ = worker._generate_once(
+                None, self.page, "Prompt", [], "/tmp", {})
+            self.assertTrue(result["quotaExceeded"])
+            self.assertFalse(result["retryable"])
+            self.assertFalse(result["rejected"])
+            self.assertIsNone(result["video"])
+            self.assertIn("Gemini daily video quota reached", result["error"])
+
+    def test_video_quota_message_ignores_old_model_responses(self):
+        self.page.set_content("""
+            <model-response>
+                <p>Sorry, I can't generate more videos for you today, but come back tomorrow and we can make more.</p>
+            </model-response>
+            <div id="composer">
+                <textarea aria-label="Prompt"></textarea>
+            </div>
+        """)
+        hit = worker._video_quota_message(self.page)
+        self.assertIsNone(hit, "Old quota response in model-response must not be treated as a live quota wall")
+
+    def test_video_quota_message_detects_banner_outside_model_responses(self):
+        self.page.set_content("""
+            <div class="quota-banner">
+                <p>Vous n'avez plus de vidéos pour le moment. Les vidéos seront de nouveau disponibles demain.</p>
+            </div>
+            <div id="composer">
+                <textarea aria-label="Prompt"></textarea>
+            </div>
+        """)
+        hit = worker._video_quota_message(self.page)
+        self.assertIsNotNone(hit)
+        self.assertIn("n'avez plus de vidéos", hit)
+
+    def test_run_attempt_switches_model_away_from_flash_lite(self):
+        self.page.set_content("""
+            <button aria-label="Flash-Lite">Flash-Lite</button>
+            <textarea aria-label='Prompt'></textarea>
+            <button aria-label='Envoyer'></button>
+        """)
+        with patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_switch_to_video_capable_model") as switch_model, \
+                patch.object(worker, "_select_video_tool", return_value=True), \
+                patch.object(worker, "_handle_tool_switch_dialog"), \
+                patch.object(worker, "_submit_prompt", return_value=True), \
+                patch.object(worker, "install_video_capture", return_value={"video": "/path/video.mp4", "error": None}):
+            status, _ = worker._run_attempt(
+                self.page, "Prompt", [], "/tmp",
+                time.time() + 10, time.time() + 10, 5, message_action="new",
+                chat_mode="conversation")
+    def test_run_attempt_with_old_quota_turn_detects_new_rejection_not_quota(self):
+        self.page.set_content("""
+            <model-response>
+                <p>Sorry, I can't generate more videos for you today, but come back tomorrow and we can make more.</p>
+            </model-response>
+            <textarea aria-label='Prompt'></textarea>
+            <button aria-label='Envoyer'></button>
+        """)
+        def fake_submit(page, editor, prompt, **kwargs):
+            page.set_content("""
+                <model-response>
+                    <p>Sorry, I can't generate more videos for you today, but come back tomorrow and we can make more.</p>
+                </model-response>
+                <model-response>
+                    <p>Can't generate your video. Try another prompt.</p>
+                    <button aria-label="Bonne réponse">Like</button>
+                </model-response>
+                <textarea aria-label='Prompt'></textarea>
+                <button aria-label='Envoyer'></button>
+            """)
+            return True
+
+        with patch.object(worker, "_switch_to_video_capable_model"), \
+                patch.object(worker, "_select_video_tool", return_value=True), \
+                patch.object(worker, "_handle_tool_switch_dialog"), \
+                patch.object(worker, "_submit_prompt", side_effect=fake_submit), \
+                patch.object(worker, "install_video_capture", return_value={"video": None, "error": None}):
+            status, payload = worker._run_attempt(
+                self.page, "Prompt", [], "/tmp",
+                time.time() + 10, time.time() + 10, 5, message_action="new",
+                chat_mode="conversation")
+            self.assertEqual(status, "rejected")
+            self.assertIn("can't generate your video", payload)
+
+    def test_continuation_retries_edit_even_when_first_action_was_new(self):
+        with tempfile.TemporaryDirectory() as output, \
+                patch.object(worker, "_run_attempt", side_effect=[("rejected", "refused"), ("video", "/clip.mp4")]) as attempt:
+            result, _ = worker._generate_once(None, self.page, "Prompt", [], output,
+                {}, chat_mode="conversation", message_action="new")
+            self.assertEqual([call.kwargs["message_action"] for call in attempt.call_args_list], ["new", "edit_last"])
+            self.assertEqual(result["video"], "/clip.mp4")
+
+    def test_saved_submission_retries_edit_after_restart(self):
+        with tempfile.TemporaryDirectory() as output:
+            Path(output, "gemini_submission.json").write_text(worker.json.dumps({
+                "promptSubmitted": True, "conversationUrl": self.page.url}))
+            with patch.object(worker, "_run_attempt", return_value=("error", "download failed")) as attempt:
+                result, _ = worker._generate_once(None, self.page, "Prompt", [], output,
+                    {}, chat_mode="conversation", message_action="new")
+            self.assertEqual(attempt.call_args.kwargs["message_action"], "edit_last")
+            self.assertTrue(result["promptSubmitted"])
+
+    def test_pre_submission_failure_does_not_edit_previous_step(self):
+        with tempfile.TemporaryDirectory() as output, \
+                patch.object(worker, "_run_attempt", return_value=("error", "attachment failed")) as attempt:
+            result, _ = worker._generate_once(None, self.page, "Prompt", [], output,
+                {}, chat_mode="conversation", message_action="new")
+            self.assertEqual(attempt.call_args.kwargs["message_action"], "new")
+            self.assertFalse(result["promptSubmitted"])
+
+    def test_edit_unavailable_falls_back_to_new_submission(self):
+        self.composer()
+        with tempfile.TemporaryDirectory() as output, \
+                patch.object(worker, "_edit_last_message", return_value=False), \
+                patch.object(worker, "_video_quota_message", return_value=None), \
+                patch.object(worker, "_switch_to_video_capable_model"), \
+                patch.object(worker, "_select_video_tool", return_value=True), \
+                patch.object(worker, "_handle_tool_switch_dialog"), \
+                patch.object(worker, "_select_aspect"), \
+                patch.object(worker, "_submit_prompt", return_value=True) as submit, \
+                patch.object(worker, "install_video_capture", return_value={"video": "/clip.mp4", "error": None}):
+            state = {}
+            status, _ = worker._run_attempt(self.page, "Prompt", [], output,
+                time.time() + 10, time.time() + 10, 5, message_action="edit_last", submission_state=state)
+            self.assertEqual(status, "video")
+            submit.assert_called_once()
+            self.assertTrue(worker._saved_submission(output)["promptSubmitted"])
+
+    def test_browser_recovery_edits_only_after_a_confirmed_submission(self):
+        for submitted in (False, True):
+            with self.subTest(submitted=submitted), tempfile.TemporaryDirectory() as output:
+                page = Mock()
+                page.url = "https://gemini.google.com/app/conversation123"
+                page.is_closed.return_value = False
+                recovered = Mock()
+                recovered.url = page.url
+                recovered.is_closed.return_value = False
+                actions = []
+
+                def attempt(*args, **kwargs):
+                    actions.append(kwargs["message_action"])
+                    if len(actions) == 1:
+                        if submitted:
+                            kwargs["submission_state"].update(promptSubmitted=True, conversationUrl=page.url)
+                        raise RuntimeError("Target page has been closed")
+                    return "video", "/clip.mp4"
+
+                with patch.object(worker, "_run_attempt", side_effect=attempt), \
+                        patch.object(worker, "_recover_page", return_value=recovered), \
+                        patch.object(worker, "_wait_ready_or_login", return_value="ready"):
+                    result, _ = worker._generate_once(None, page, "Prompt", [], output,
+                        {}, chat_mode="conversation", message_action="new")
+                self.assertEqual(actions, ["new", "edit_last" if submitted else "new"])
+                self.assertEqual(result["video"], "/clip.mp4")
+                recovered.goto.assert_called_once_with(page.url, wait_until="domcontentloaded", timeout=60000)
+
 
 if __name__ == "__main__":
     unittest.main()

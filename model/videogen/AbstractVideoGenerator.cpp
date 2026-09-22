@@ -61,6 +61,11 @@ QList<AbstractVideoGenerator::SettingSpec> AbstractVideoGenerator::availableSett
     return {};
 }
 
+double AbstractVideoGenerator::continuationDurationSeconds(const QVariantMap &) const
+{
+    return 0.0;
+}
+
 QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGeneratorScript(
     const QString &scriptFileName, const QString &prompt,
     const QStringList &imagePaths, const QString &outputDir,
@@ -127,6 +132,18 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
     request.insert(QStringLiteral("outputDir"), outputDir);
     request.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(settings));
     request.insert(QStringLiteral("images"), QJsonArray::fromStringList(imagePaths));
+    if (settings.contains(QStringLiteral("chatMode")))
+    {
+        request.insert(QStringLiteral("chatMode"), settings.value(QStringLiteral("chatMode")).toString());
+    }
+    if (settings.contains(QStringLiteral("messageAction")))
+    {
+        request.insert(QStringLiteral("messageAction"), settings.value(QStringLiteral("messageAction")).toString());
+    }
+    if (settings.contains(QStringLiteral("conversationUrl")))
+    {
+        request.insert(QStringLiteral("conversationUrl"), settings.value(QStringLiteral("conversationUrl")).toString());
+    }
     m_worker->write(QJsonDocument{request}.toJson(QJsonDocument::Compact) + "\n");
 
     // Video generation is slow, and browser-driven backends may additionally
@@ -193,6 +210,9 @@ QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGenerator
     result.rejected = obj.value(QStringLiteral("rejected")).toBool();
     result.retryable = obj.value(QStringLiteral("retryable")).toBool(true);
     result.browserLost = obj.value(QStringLiteral("browserLost")).toBool();
+    result.conversationUrl = obj.value(QStringLiteral("conversationUrl")).toString();
+    result.promptSubmitted = obj.value(QStringLiteral("promptSubmitted")).toBool();
+    result.quotaExceeded = obj.value(QStringLiteral("quotaExceeded")).toBool();
     if (!result.videoPath.isEmpty() && !QFileInfo::exists(result.videoPath))
     {
         result.errorMessage = QObject::tr("The video generator reported %1 "

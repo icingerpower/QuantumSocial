@@ -22,6 +22,12 @@ SET(GUI_FILES
     ${CMAKE_CURRENT_LIST_DIR}/DialogNewProject.cpp
     ${CMAKE_CURRENT_LIST_DIR}/DialogNewProject.h
     ${CMAKE_CURRENT_LIST_DIR}/DialogNewProject.ui
+    ${CMAKE_CURRENT_LIST_DIR}/MultiVideoStepWidget.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/MultiVideoStepWidget.h
+    ${CMAKE_CURRENT_LIST_DIR}/DialogMultiVideoGeneration.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DialogMultiVideoGeneration.h
+    ${CMAKE_CURRENT_LIST_DIR}/DialogPickIntroVideo.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/DialogPickIntroVideo.h
     ${CMAKE_CURRENT_LIST_DIR}/DialogReviewNewProperties.cpp
     ${CMAKE_CURRENT_LIST_DIR}/DialogReviewNewProperties.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.cpp

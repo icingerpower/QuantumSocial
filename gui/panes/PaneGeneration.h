@@ -19,6 +19,7 @@
 #include "model/properties/PropertySampler.h"
 
 #include "../DialogGenerationOptions.h"
+#include "model/videogen/AbstractMultiVideoWorkflow.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class PaneGeneration; }
@@ -128,9 +129,31 @@ private slots:
     void _favoriteCurrentVideoPrompt();
     void _generateAgain();
     void _togglePublishSelectedVideo();
+    void _addMultiVideoProject();
+    void _resumeMultiVideoGeneration();
+    void _connectMultiVideoMerge(class ProductShowcaseMultiVideoWorkflow *workflow, int row);
+    void _resetStepClicked();
 
 private:
     void _applyGenerationPublishedStyle(class QTreeWidgetItem *topItem, bool published);
+    void _updateResumeButtonState(int row);
+    bool _prepareMultiVideoGeneration(int row, class ProductShowcaseMultiVideoWorkflow *workflow);
+    void _startMultiVideoGeneration(int row, const QUuid &projectId,
+                                    class ProductShowcaseMultiVideoWorkflow *workflow);
+    void _resetMultiVideoStep(int row, const QUuid &projectId,
+                              class ProductShowcaseMultiVideoWorkflow *workflow,
+                              int stepIndex, bool resetSubsequentSteps = false);
+    void _regenerateMultiVideoStep(int row, const QUuid &projectId,
+                                   class ProductShowcaseMultiVideoWorkflow *workflow,
+                                   int stepIndex, int count, bool replaceExisting = false);
+    bool _promptIntroSelection(class ProductShowcaseMultiVideoWorkflow *workflow,
+                               const QList<AbstractMultiVideoWorkflow::TakeInfo> &introTakes,
+                               int row);
+    bool _promptTakeSelection(class ProductShowcaseMultiVideoWorkflow *workflow,
+                              int stepIndex,
+                              const QList<AbstractMultiVideoWorkflow::TakeInfo> &takes,
+                              int row);
+    QPointer<class ProductShowcaseMultiVideoWorkflow> m_activeMultiVideoWorkflow;
     Ui::PaneGeneration *ui;
     TreeProperties *m_properties;
     TreeProperties *m_archive;

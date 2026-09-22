@@ -40,6 +40,11 @@ public:
         // The browser/worker connection was lost. A repeat can retry the
         // same inputs after relaunch without treating this as a refusal.
         bool browserLost = false;
+        // The active conversation URL (for multi-turn / multi-video workflows)
+        QString conversationUrl;
+        bool promptSubmitted = false;
+        // True when generation was blocked because of an account quota or rate limit.
+        bool quotaExceeded = false;
     };
 
     // One tunable setting of a backend. Each backend declares its own list;
@@ -68,6 +73,10 @@ public:
     // The settings this backend understands; they differ per backend, so the
     // settings pane builds itself from this. Default: none.
     virtual QList<SettingSpec> availableSettings() const;
+
+    // Maximum new segment to retain in a multi-video continuation. Zero
+    // leaves the provider's download intact.
+    virtual double continuationDurationSeconds(const QVariantMap &settings) const;
 
     // Generates one video from the prompt — optionally starting from input
     // image(s) — into outputDir. `settings` holds the current values for

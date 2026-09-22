@@ -38,6 +38,7 @@ public:
     // itself regenerated/bootstrapped by the image step; it rides along
     // unchanged as extra reference material.
     static const int IND_IMAGE2;
+    static const int IND_TYPE;
     static const int IND_ID;
 
     explicit TableProjects(const QString &workingDirectory, QObject *parent = nullptr);
@@ -61,6 +62,11 @@ public:
     int addProject(const QString &imagePath, const QString &imagePath2,
                    const QString &keyword, const QString &hookIdea);
 
+    // Creates a multi-video project row and folder
+    int addMultiVideoProject(const QString &keyword, const QString &firstImagePath = QString{});
+    bool isMultiVideoProject(int row) const;
+    QString projectType(int row) const;
+
     // Removes the row AND deletes the project's folder on disk — callers
     // must confirm with the user first.
     void removeProject(int row);
@@ -83,7 +89,7 @@ public:
     // matters for publishing (the video/images, hook-description.txt); an
     // inner subfolder named with the project ID (<workingDir>/projects/generations/
     // <003-slug>/<shortCode>/<id>/) holds internal working material.
-    QDir generationDir(int row, const QString &shortCode) const;
+    QDir generationDir(int row, const QString &shortCode, bool create = true) const;
     // The working subfolder of one generation (<generationDir>/<id>/):
     // source-image variant, prompt files, suggestions/hooks JSON, rejected takes, extracted frames.
     QDir generationTempDir(int row, const QString &shortCode) const;

@@ -25,6 +25,40 @@
     </widget>
    </item>
    <item>
+    <layout class="QHBoxLayout" name="layoutVideoIdea">
+     <item>
+      <widget class="QLabel" name="labelVideoIdea">
+       <property name="text">
+        <string>Video idea / description:</string>
+       </property>
+       <property name="toolTip">
+        <string>Optional idea, visual actions, or description of the current video to orientate AI hook and description suggestions.</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLineEdit" name="editVideoIdea">
+       <property name="placeholderText">
+        <string>e.g. Model walking in red stilettos, close-up feet poses... (optional, orientates suggestions)</string>
+       </property>
+       <property name="clearButtonEnabled">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="buttonUsePrompt">
+       <property name="text">
+        <string>From prompt</string>
+       </property>
+       <property name="toolTip">
+        <string>Fill with the video prompt used during generation.</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
     <layout class="QHBoxLayout" name="layoutRegenerate">
      <item>
       <widget class="QLabel" name="labelCli">

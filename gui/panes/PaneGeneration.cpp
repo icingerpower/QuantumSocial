@@ -52,12 +52,15 @@
 #include "../DialogGenerationOptions.h"
 #include "../DialogGenerationPlan.h"
 #include "../DialogHooks.h"
+#include "../DialogMultiVideoGeneration.h"
 #include "../DialogNewProject.h"
+#include "../DialogPickIntroVideo.h"
 #include "../DialogReviewNewProperties.h"
 #include "model/FavoriteHooks.h"
 #include "model/FavoriteVideoPrompts.h"
 #include "model/PreferredHashtags.h"
 #include "model/PromptLessons.h"
+#include "model/videogen/ProductShowcaseMultiVideoWorkflow.h"
 #include "model/SavedPrompts.h"
 #include "model/TableProjects.h"
 #include "model/imagegen/AbstractImageGenerator.h"
@@ -110,7 +113,7 @@ QString codeTagFromShortCode(const QString &shortCode)
 }
 
 void saveHooksFile(const QDir &dir, const QList<QPair<QString, QString>> &hooks,
-                   const QString &shortCode)
+                   const QString &shortCode, const QString &videoIdea = QString{})
 {
     QJsonArray array;
     for (const auto &hook : hooks)
@@ -118,18 +121,24 @@ void saveHooksFile(const QDir &dir, const QList<QPair<QString, QString>> &hooks,
         array << QJsonObject{{QStringLiteral("hook"), hook.first},
                              {QStringLiteral("description"), hook.second}};
     }
+    QJsonObject root{
+        {QStringLiteral("code"), shortCode},
+        {QStringLiteral("hooks"), array},
+    };
+    if (!videoIdea.isEmpty())
+    {
+        root[QStringLiteral("videoIdea")] = videoIdea;
+    }
     QFile file{dir.absoluteFilePath(HOOKS_FILE_NAME)};
     if (!file.open(QFile::WriteOnly))
     {
         return;
     }
-    file.write(QJsonDocument{QJsonObject{
-        {QStringLiteral("code"), shortCode},
-        {QStringLiteral("hooks"), array},
-    }}.toJson(QJsonDocument::Indented));
+    file.write(QJsonDocument{root}.toJson(QJsonDocument::Indented));
 }
 
-QList<QPair<QString, QString>> loadHooksFile(const QDir &dir, QString *shortCode)
+QList<QPair<QString, QString>> loadHooksFile(const QDir &dir, QString *shortCode = nullptr,
+                                             QString *videoIdea = nullptr)
 {
     QList<QPair<QString, QString>> hooks;
     QFile file{dir.absoluteFilePath(HOOKS_FILE_NAME)};
@@ -141,6 +150,10 @@ QList<QPair<QString, QString>> loadHooksFile(const QDir &dir, QString *shortCode
     if (shortCode)
     {
         *shortCode = root.value(QStringLiteral("code")).toString();
+    }
+    if (videoIdea)
+    {
+        *videoIdea = root.value(QStringLiteral("videoIdea")).toString();
     }
     for (const QJsonValue &value : root.value(QStringLiteral("hooks")).toArray())
     {
@@ -312,7 +325,7 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
     for (int column : {TableProjects::IND_KEYWORD, TableProjects::IND_HOOK,
                        TableProjects::IND_IMAGE, TableProjects::IND_GEN_PROMPT,
                        TableProjects::IND_GEN_HOOK, TableProjects::IND_GEN_DESC,
-                       TableProjects::IND_IMAGE2, TableProjects::IND_ID})
+                       TableProjects::IND_IMAGE2, TableProjects::IND_TYPE, TableProjects::IND_ID})
     {
         ui->tableViewProjects->setColumnHidden(column, true);
     }
@@ -426,12 +439,18 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
 
     connect(ui->buttonProjectAdd, &QPushButton::clicked,
             this, &PaneGeneration::_addProject);
+    connect(ui->buttonProjectAddMultiVideo, &QPushButton::clicked,
+            this, &PaneGeneration::_addMultiVideoProject);
     connect(ui->buttonProjectRemove, &QPushButton::clicked,
             this, &PaneGeneration::_removeProject);
     connect(ui->tableViewProjects->selectionModel(), &QItemSelectionModel::currentRowChanged,
             this, &PaneGeneration::_currentProjectChanged);
     connect(ui->buttonGenerate, &QPushButton::clicked,
             this, &PaneGeneration::_generate);
+    connect(ui->buttonResumeGeneration, &QPushButton::clicked,
+            this, &PaneGeneration::_resumeMultiVideoGeneration);
+    connect(ui->buttonResetStep, &QPushButton::clicked,
+            this, &PaneGeneration::_resetStepClicked);
     connect(ui->buttonViewSource, &QPushButton::clicked,
             this, &PaneGeneration::_viewSourceImage);
     connect(ui->buttonDeleteGenerated, &QPushButton::clicked,
@@ -451,7 +470,7 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
             return;
         }
         QDesktopServices::openUrl(QUrl::fromLocalFile(
-            m_projects->projectGenerationsDir(row).absolutePath()));
+            m_filesModel->rootPath()));
     });
     connect(ui->comboBoxCli, &QComboBox::currentIndexChanged, this, [this]() {
         if (AbstractCli *cli = _promptCli())
@@ -513,6 +532,650 @@ void PaneGeneration::_addProject()
     ui->tableViewProjects->setCurrentIndex(m_projects->index(row, TableProjects::IND_NAME));
 }
 
+void PaneGeneration::_addMultiVideoProject()
+{
+    DialogMultiVideoGeneration dialog{m_availableClis, this};
+    if (dialog.exec() != QDialog::Accepted)
+    {
+        return;
+    }
+
+    const auto stepImages = dialog.stepImages();
+    QString firstImagePath;
+    for (const auto &stepImgs : stepImages)
+    {
+        if (!stepImgs.isEmpty() && !stepImgs.first().originalPath.isEmpty())
+        {
+            firstImagePath = stepImgs.first().originalPath;
+            break;
+        }
+    }
+
+    const int row = m_projects->addMultiVideoProject(dialog.keyword(), firstImagePath);
+    ui->tableViewProjects->setCurrentIndex(m_projects->index(row, TableProjects::IND_NAME));
+
+    const QUuid projectId = m_projects->projectId(row);
+    const QString projPath = m_projects->projectDir(row).absolutePath();
+    const QString genPath = m_projects->projectGenerationsDir(row).absolutePath();
+
+    auto *workflow = new ProductShowcaseMultiVideoWorkflow(this);
+    workflow->configure(dialog.totalSteps(),
+                        dialog.introPrompt(), dialog.introTakes(),
+                        dialog.afterIntroPrompt(), dialog.afterIntroTakes(),
+                        stepImages);
+
+    // Persist configuration to the project directory
+    const QString manifestPath = QDir{projPath}.absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    workflow->saveToFile(manifestPath);
+
+    const QVariantMap settings = m_generationSettings->settingsFor(dialog.generatorId());
+    workflow->start(projPath, genPath, dialog.generatorId(), settings,
+                    dialog.decisionCli(), dialog.imageCli(), dialog.videoFormatLabel());
+
+    _startMultiVideoGeneration(row, projectId, workflow);
+}
+
+void PaneGeneration::_resumeMultiVideoGeneration()
+{
+    const QModelIndex current = ui->tableViewProjects->currentIndex();
+    if (!current.isValid())
+    {
+        return;
+    }
+    const int row = current.row();
+    const QUuid projectId = m_projects->projectId(row);
+    const QDir projDir = m_projects->projectDir(row);
+    QString manifestPath = m_projects->projectGenerationsDir(row).absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    if (!QFile::exists(manifestPath))
+    {
+        manifestPath = projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    }
+
+    ProductShowcaseMultiVideoWorkflow *workflow = nullptr;
+    // Reuse an in-flight merge when the user reopens selection. Separate
+    // workflow instances could otherwise publish older selections last.
+    for (auto *candidate : findChildren<ProductShowcaseMultiVideoWorkflow *>())
+    {
+        if (candidate->isMerging()
+            && candidate->toJson().value(QStringLiteral("projectDir")).toString() == projDir.absolutePath())
+        {
+            workflow = candidate;
+            break;
+        }
+    }
+    if (!workflow)
+    {
+        workflow = new ProductShowcaseMultiVideoWorkflow(this);
+        if (!workflow->loadFromFile(manifestPath))
+        {
+            QMessageBox::warning(this, tr("Cannot resume"),
+                                 tr("Could not load multi-video state from %1").arg(manifestPath));
+            delete workflow;
+            return;
+        }
+    }
+
+    // If all videos are generated, allow reviewing / changing take selections
+    if (workflow->completedVideoCount() == workflow->totalVideoCount())
+    {
+        _connectMultiVideoMerge(workflow, row);
+        if (!_prepareMultiVideoGeneration(row, workflow))
+        {
+            workflow->deleteLater();
+            return;
+        }
+        for (int sIdx = 0; sIdx < workflow->steps().size(); ++sIdx)
+        {
+            const auto &st = workflow->steps().at(sIdx);
+            if (st.videoCount > 1)
+            {
+                QList<AbstractMultiVideoWorkflow::TakeInfo> stepTakes;
+                for (const auto &t : workflow->takes())
+                {
+                    if (t.stepIndex == sIdx && t.completed)
+                    {
+                        stepTakes << t;
+                    }
+                }
+                if (!stepTakes.isEmpty())
+                {
+                    if (!_promptTakeSelection(workflow, sIdx, stepTakes, row))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        workflow->updateMergedVideo();
+        if (workflow->state() != AbstractMultiVideoWorkflow::State::Running && !workflow->isMerging())
+        {
+            workflow->deleteLater();
+        }
+        // In-flight workflows remain owned by the pane and can be reused
+        // if selection is reopened before encoding finishes.
+        return;
+    }
+
+    const QString genPath = m_projects->projectGenerationsDir(row).absolutePath();
+    const QString genId = !workflow->toJson().value(QStringLiteral("generatorId")).toString().isEmpty()
+        ? workflow->toJson().value(QStringLiteral("generatorId")).toString()
+        : QStringLiteral("gemini-browser");
+    const QVariantMap settings = m_generationSettings->settingsFor(genId);
+
+    workflow->start(projDir.absolutePath(), genPath, genId, settings,
+                    _promptCli(), _imageCli(), QStringLiteral("vertical (9:16)"));
+
+    _startMultiVideoGeneration(row, projectId, workflow);
+}
+
+void PaneGeneration::_resetStepClicked()
+{
+    const QModelIndex current = ui->tableViewProjects->currentIndex();
+    if (!current.isValid())
+    {
+        return;
+    }
+    const int row = current.row();
+    if (!m_projects->isMultiVideoProject(row))
+    {
+        return;
+    }
+
+    const QUuid projectId = m_projects->projectId(row);
+    const QDir projDir = m_projects->projectDir(row);
+    QString manifestPath = m_projects->projectGenerationsDir(row).absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    if (!QFile::exists(manifestPath))
+    {
+        manifestPath = projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    }
+    if (!QFile::exists(manifestPath))
+    {
+        QMessageBox::information(this, tr("No workflow"), tr("No multi-video workflow manifest was found for this project."));
+        return;
+    }
+
+    ProductShowcaseMultiVideoWorkflow workflow;
+    if (!workflow.loadFromFile(manifestPath))
+    {
+        QMessageBox::warning(this, tr("Cannot read workflow"), tr("Could not read workflow from %1").arg(manifestPath));
+        return;
+    }
+
+    QMenu menu(this);
+    menu.setTitle(tr("Reset / Regenerate Multi-Video Steps"));
+
+    const auto &steps = workflow.steps();
+    for (int sIdx = 0; sIdx < steps.size(); ++sIdx)
+    {
+        const auto &step = steps.at(sIdx);
+        int completedTakes = 0;
+        for (const auto &t : workflow.takes())
+        {
+            if (t.stepIndex == sIdx && t.completed)
+            {
+                completedTakes++;
+            }
+        }
+        const QString stepLabel = step.title.isEmpty() ? tr("Step %1").arg(sIdx + 1) : step.title;
+        auto *actReset = menu.addAction(tr("Reset %1 (%2/%3 takes done)...")
+            .arg(stepLabel).arg(completedTakes).arg(step.videoCount));
+        connect(actReset, &QAction::triggered, this, [this, row, projectId, sIdx, stepLabel]() {
+            const auto reply = QMessageBox::question(
+                this,
+                tr("Reset Step"),
+                tr("Are you sure you want to reset %1?\nGenerated video files for this step will be deleted so you can regenerate them.").arg(stepLabel),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No);
+            if (reply == QMessageBox::Yes)
+            {
+                _resetMultiVideoStep(row, projectId, nullptr, sIdx, false);
+            }
+        });
+    }
+
+    if (steps.size() > 1)
+    {
+        menu.addSeparator();
+        auto *actResetAfterIntro = menu.addAction(tr("Reset from Step 2 onwards (keep Step 1 Intro)..."));
+        connect(actResetAfterIntro, &QAction::triggered, this, [this, row, projectId]() {
+            const auto reply = QMessageBox::question(
+                this,
+                tr("Reset Steps from Step 2"),
+                tr("Are you sure you want to reset all steps after Step 1?\nGenerated video files for Step 2 and subsequent steps will be deleted while keeping your chosen Intro video."),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No);
+            if (reply == QMessageBox::Yes)
+            {
+                _resetMultiVideoStep(row, projectId, nullptr, 1, true);
+            }
+        });
+
+        auto *actResetAll = menu.addAction(tr("Reset all steps (including Intro)..."));
+        connect(actResetAll, &QAction::triggered, this, [this, row, projectId]() {
+            const auto reply = QMessageBox::question(
+                this,
+                tr("Reset All Steps"),
+                tr("Are you sure you want to reset ALL steps?\nAll generated video files for this showcase will be deleted so you can restart cleanly."),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No);
+            if (reply == QMessageBox::Yes)
+            {
+                _resetMultiVideoStep(row, projectId, nullptr, 0, true);
+            }
+        });
+    }
+
+    menu.addSeparator();
+    auto *subMenuAddTakes = menu.addMenu(tr("Generate again (add more takes)..."));
+    for (int sIdx = 0; sIdx < steps.size(); ++sIdx)
+    {
+        const auto &step = steps.at(sIdx);
+        const QString stepLabel = step.title.isEmpty() ? tr("Step %1").arg(sIdx + 1) : step.title;
+        auto *actAdd = subMenuAddTakes->addAction(tr("Add takes to %1...").arg(stepLabel));
+        connect(actAdd, &QAction::triggered, this, [this, row, projectId, sIdx, stepLabel]() {
+            bool ok = false;
+            const int count = QInputDialog::getInt(
+                this,
+                tr("Add Takes"),
+                tr("How many new takes to generate for %1?").arg(stepLabel),
+                1, 1, 10, 1, &ok);
+            if (ok && count > 0)
+            {
+                _regenerateMultiVideoStep(row, projectId, nullptr, sIdx, count, false);
+            }
+        });
+    }
+
+    menu.exec(ui->buttonResetStep->mapToGlobal(QPoint(0, ui->buttonResetStep->height())));
+}
+
+void PaneGeneration::_resetMultiVideoStep(int row, const QUuid &projectId,
+                                          ProductShowcaseMultiVideoWorkflow *workflow,
+                                          int stepIndex, bool resetSubsequentSteps)
+{
+    Q_UNUSED(projectId);
+    const QDir projDir = m_projects->projectDir(row);
+    QString manifestPath = m_projects->projectGenerationsDir(row).absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    if (!QFile::exists(manifestPath))
+    {
+        manifestPath = projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    }
+
+    bool ownWorkflow = false;
+    if (!workflow)
+    {
+        workflow = new ProductShowcaseMultiVideoWorkflow(this);
+        if (!workflow->loadFromFile(manifestPath))
+        {
+            delete workflow;
+            return;
+        }
+        ownWorkflow = true;
+    }
+
+    workflow->resetStep(stepIndex, resetSubsequentSteps);
+    workflow->saveToFile(manifestPath);
+    if (projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json")) != manifestPath)
+    {
+        workflow->saveToFile(projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json")));
+    }
+
+    _refreshGenerationsView(row);
+    _updateResumeButtonState(row);
+    _finishProgress(tr("Reset completed (%1/%2 videos ready). Click 'Resume generation' to generate remaining videos.")
+        .arg(workflow->completedVideoCount()).arg(workflow->totalVideoCount()));
+
+    if (ownWorkflow)
+    {
+        delete workflow;
+    }
+}
+
+void PaneGeneration::_regenerateMultiVideoStep(int row, const QUuid &projectId,
+                                               ProductShowcaseMultiVideoWorkflow *workflow,
+                                               int stepIndex, int count, bool replaceExisting)
+{
+    const QDir projDir = m_projects->projectDir(row);
+    const QString genPath = m_projects->projectGenerationsDir(row).absolutePath();
+    QString manifestPath = m_projects->projectGenerationsDir(row).absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    if (!QFile::exists(manifestPath))
+    {
+        manifestPath = projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    }
+
+    if (!workflow)
+    {
+        workflow = new ProductShowcaseMultiVideoWorkflow(this);
+        if (!workflow->loadFromFile(manifestPath))
+        {
+            delete workflow;
+            return;
+        }
+    }
+
+    workflow->regenerateStep(stepIndex, count, replaceExisting);
+    workflow->saveToFile(manifestPath);
+    if (projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json")) != manifestPath)
+    {
+        workflow->saveToFile(projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json")));
+    }
+
+    _refreshGenerationsView(row);
+    _updateResumeButtonState(row);
+
+    const QString genId = !workflow->toJson().value(QStringLiteral("generatorId")).toString().isEmpty()
+        ? workflow->toJson().value(QStringLiteral("generatorId")).toString()
+        : QStringLiteral("gemini-browser");
+    const QVariantMap settings = m_generationSettings->settingsFor(genId);
+
+    workflow->start(projDir.absolutePath(), genPath, genId, settings,
+                    _promptCli(), _imageCli(), QStringLiteral("vertical (9:16)"));
+
+    _startMultiVideoGeneration(row, projectId, workflow);
+}
+
+void PaneGeneration::_updateResumeButtonState(int row)
+{
+    if (row < 0 || !m_projects->isMultiVideoProject(row))
+    {
+        ui->buttonResumeGeneration->setEnabled(false);
+        ui->buttonResumeGeneration->setText(tr("Resume generation"));
+        ui->buttonResumeGeneration->setToolTip(tr("Resume generation of remaining videos once limits are lifted"));
+        ui->buttonResetStep->setEnabled(false);
+        return;
+    }
+
+    const QDir projDir = m_projects->projectDir(row);
+    QString manifestPath = m_projects->projectGenerationsDir(row).absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    if (!QFile::exists(manifestPath))
+    {
+        manifestPath = projDir.absoluteFilePath(QStringLiteral("multi_video_workflow.json"));
+    }
+    if (!QFile::exists(manifestPath))
+    {
+        ui->buttonResumeGeneration->setEnabled(false);
+        ui->buttonResumeGeneration->setText(tr("Resume generation"));
+        ui->buttonResetStep->setEnabled(false);
+        return;
+    }
+
+    ProductShowcaseMultiVideoWorkflow workflow;
+    if (!workflow.loadFromFile(manifestPath))
+    {
+        ui->buttonResumeGeneration->setEnabled(false);
+        ui->buttonResetStep->setEnabled(false);
+        return;
+    }
+
+    ui->buttonResetStep->setEnabled(true);
+
+    const int total = workflow.totalVideoCount();
+    const int completed = workflow.completedVideoCount();
+    if (completed < total)
+    {
+        ui->buttonResumeGeneration->setEnabled(true);
+        ui->buttonResumeGeneration->setText(tr("Resume generation (%1/%2 done)").arg(completed).arg(total));
+        ui->buttonResumeGeneration->setToolTip(
+            tr("Resume generation (%1 of %2 videos done).\n%3")
+                .arg(completed).arg(total)
+                .arg(workflow.pauseReason().isEmpty()
+                     ? tr("Click to generate remaining videos.")
+                     : tr("Paused: %1").arg(workflow.pauseReason())));
+    }
+    else
+    {
+        bool hasMultiTakes = false;
+        for (const auto &step : workflow.steps())
+        {
+            if (step.videoCount > 1)
+            {
+                hasMultiTakes = true;
+                break;
+            }
+        }
+        if (hasMultiTakes)
+        {
+            ui->buttonResumeGeneration->setEnabled(true);
+            ui->buttonResumeGeneration->setText(tr("Review / select takes (%1/%2)").arg(completed).arg(total));
+            ui->buttonResumeGeneration->setToolTip(tr("All %1 videos have been generated. Click to review or change preferred takes for each step.").arg(total));
+        }
+        else
+        {
+            ui->buttonResumeGeneration->setEnabled(false);
+            ui->buttonResumeGeneration->setText(tr("Generation complete (%1/%2)").arg(completed).arg(total));
+            ui->buttonResumeGeneration->setToolTip(tr("All %1 videos have been generated.").arg(total));
+        }
+    }
+}
+
+void PaneGeneration::_connectMultiVideoMerge(ProductShowcaseMultiVideoWorkflow *workflow, int row)
+{
+    if (workflow->property("mergeUiConnected").toBool()) return;
+    workflow->setProperty("mergeUiConnected", true);
+    connect(workflow, &ProductShowcaseMultiVideoWorkflow::mergedVideoUpdated,
+            this, [this, row](const QString &path, const QString &error) {
+        if (!error.isEmpty())
+        {
+            QMessageBox::warning(this, tr("Could not merge videos"), error);
+            return;
+        }
+        _refreshGenerationsView(row);
+        if (!path.isEmpty()) _logProgress(tr("Final video ready: %1").arg(path));
+    });
+}
+
+bool PaneGeneration::_prepareMultiVideoGeneration(int row, ProductShowcaseMultiVideoWorkflow *workflow)
+{
+    const QUuid projectId = m_projects->projectId(row);
+    QString code = workflow->generationShortCode();
+    const auto *record = m_videos->recordFromShortCode(code);
+    if (!record || record->projectId != projectId)
+    {
+        const QUuid id = m_videos->addVideo({}, {}, QStringLiteral("compilation"), projectId);
+        code = m_videos->recordFromId(id)->shortCode;
+    }
+    QString error;
+    if (!workflow->prepareGeneration(code, &error))
+    {
+        QMessageBox::warning(this, tr("Could not save multi-video generation"), error);
+        return false;
+    }
+    const auto generation = qMakePair(m_projects->generationDir(row, code), code);
+    if (!m_runGenerations.contains(generation)) m_runGenerations << generation;
+    _refreshGenerationsView(row);
+    return true;
+}
+
+void PaneGeneration::_startMultiVideoGeneration(
+    int row, const QUuid &projectId, ProductShowcaseMultiVideoWorkflow *workflow)
+{
+    const bool isNewInstance = (m_activeMultiVideoWorkflow != workflow);
+    m_activeMultiVideoWorkflow = workflow;
+    _connectMultiVideoMerge(workflow, row);
+    _openProgress();
+    _logProgress(tr("Multi-video generation started (%1/%2 completed)...")
+        .arg(workflow->completedVideoCount()).arg(workflow->totalVideoCount()));
+
+    if (isNewInstance)
+    {
+        connect(workflow, &ProductShowcaseMultiVideoWorkflow::progress, this, [this](const QString &msg) {
+            _logProgress(msg);
+        });
+
+        connect(workflow, &ProductShowcaseMultiVideoWorkflow::takeCompleted,
+                this, [this, row](int stepIdx, int takeIdx, const QString &videoPath) {
+            Q_UNUSED(stepIdx);
+            Q_UNUSED(takeIdx);
+            Q_UNUSED(videoPath);
+            _refreshGenerationsView(row);
+            _updateResumeButtonState(row);
+        });
+
+        connect(workflow, &ProductShowcaseMultiVideoWorkflow::paused,
+                this, [this, row](const QString &reason, int completed, int total) {
+            const QString advice = (reason.contains(QStringLiteral("quota"), Qt::CaseInsensitive) ||
+                                    reason.contains(QStringLiteral("limit"), Qt::CaseInsensitive))
+                ? tr("Click 'Resume generation' once limits are lifted.")
+                : tr("Click 'Resume generation' to continue.");
+            _finishProgress(tr("Generation paused (%1/%2 videos generated): %3\n%4")
+                .arg(completed).arg(total).arg(reason, advice));
+            _updateResumeButtonState(row);
+        });
+
+        connect(workflow, &ProductShowcaseMultiVideoWorkflow::allCompleted,
+                this, [this, row, projectId, workflow](const QStringList &videoPaths) {
+            if (!videoPaths.isEmpty())
+            {
+                if (!_prepareMultiVideoGeneration(row, workflow)) return;
+                workflow->updateMergedVideo();
+            }
+            _finishProgress(tr("All %1 takes are ready. The selected clips will be merged into one final video.")
+                .arg(videoPaths.size()));
+            _updateResumeButtonState(row);
+
+            // At completion, prompt take selection for any multi-take steps that haven't been picked yet (e.g. Step 2, Step 3)
+            for (int sIdx = 1; sIdx < workflow->steps().size(); ++sIdx)
+            {
+                const auto &st = workflow->steps().at(sIdx);
+                if (st.videoCount > 1 && workflow->selectedTakeIndex(sIdx) < 0)
+                {
+                    QList<AbstractMultiVideoWorkflow::TakeInfo> stepTakes;
+                    for (const auto &t : workflow->takes())
+                    {
+                        if (t.stepIndex == sIdx && t.completed)
+                        {
+                            stepTakes << t;
+                        }
+                    }
+                    if (!stepTakes.isEmpty())
+                    {
+                        if (!_promptTakeSelection(workflow, sIdx, stepTakes, row))
+                        {
+                            break; // User cancelled / decided later
+                        }
+                    }
+                }
+            }
+        });
+
+        connect(workflow, &ProductShowcaseMultiVideoWorkflow::introSelectionRequested,
+                this, [this, workflow, row](const QList<AbstractMultiVideoWorkflow::TakeInfo> &introTakes) {
+            _promptIntroSelection(workflow, introTakes, row);
+        });
+
+        connect(workflow, &ProductShowcaseMultiVideoWorkflow::takeSelectionRequested,
+                this, [this, workflow, row](int stepIndex, const QList<AbstractMultiVideoWorkflow::TakeInfo> &takes) {
+            if (stepIndex == 0)
+            {
+                return; // Step 0 is the intro, handled exclusively by introSelectionRequested
+            }
+            _promptTakeSelection(workflow, stepIndex, takes, row);
+        });
+
+        connect(workflow, &ProductShowcaseMultiVideoWorkflow::failed,
+                this, [this, row](const QString &err) {
+            _finishProgress(tr("Multi-video generation failed: %1").arg(err));
+            _updateResumeButtonState(row);
+        });
+    }
+}
+
+bool PaneGeneration::_promptIntroSelection(ProductShowcaseMultiVideoWorkflow *workflow,
+                                           const QList<AbstractMultiVideoWorkflow::TakeInfo> &introTakes,
+                                           int row)
+{
+    if (!workflow || introTakes.isEmpty())
+    {
+        return false;
+    }
+
+    DialogPickIntroVideo dlg(introTakes, qMax(0, workflow->selectedIntroTakeIndex()), this);
+    if (dlg.exec() == QDialog::Accepted)
+    {
+        if (dlg.isRegenerateRequested())
+        {
+            _logProgress(tr("Generating %1 more take(s) for Step 1 (Intro)...").arg(dlg.regenerateCount()));
+            _regenerateMultiVideoStep(row, m_projects->projectId(row), workflow, 0, dlg.regenerateCount(), false);
+            return false;
+        }
+        if (dlg.isResetRequested())
+        {
+            _logProgress(tr("Reset Step 1 (Intro)."));
+            _resetMultiVideoStep(row, m_projects->projectId(row), workflow, 0, false);
+            return false;
+        }
+
+        const int chosenIndex = dlg.selectedTakeIndex();
+        _logProgress(tr("Selected intro take %1 as base for subsequent steps.")
+            .arg(chosenIndex + 1));
+        workflow->selectIntroTake(chosenIndex);
+        _updateResumeButtonState(row);
+        return true;
+    }
+    else
+    {
+        _finishProgress(tr("Multi-video paused: waiting for intro video selection.\n"
+                           "Click 'Resume generation' to choose your intro video and continue."));
+        _updateResumeButtonState(row);
+        return false;
+    }
+}
+
+bool PaneGeneration::_promptTakeSelection(ProductShowcaseMultiVideoWorkflow *workflow,
+                                          int stepIndex,
+                                          const QList<AbstractMultiVideoWorkflow::TakeInfo> &takes,
+                                          int row)
+{
+    if (!workflow || takes.isEmpty())
+    {
+        return false;
+    }
+
+    const QString stepTitle = (stepIndex >= 0 && stepIndex < workflow->steps().size())
+        ? workflow->steps().at(stepIndex).title
+        : QString{};
+
+    DialogPickIntroVideo dlg(stepIndex, stepTitle, takes,
+                             qMax(0, workflow->selectedTakeIndex(stepIndex)), this);
+    if (dlg.exec() == QDialog::Accepted)
+    {
+        if (dlg.isRegenerateRequested())
+        {
+            _logProgress(tr("Generating %1 more take(s) for %2...")
+                .arg(dlg.regenerateCount())
+                .arg(stepTitle.isEmpty() ? tr("Step %1").arg(stepIndex + 1) : stepTitle));
+            _regenerateMultiVideoStep(row, m_projects->projectId(row), workflow, stepIndex, dlg.regenerateCount(), false);
+            return false;
+        }
+        if (dlg.isResetRequested())
+        {
+            _logProgress(tr("Reset %1.")
+                .arg(stepTitle.isEmpty() ? tr("Step %1").arg(stepIndex + 1) : stepTitle));
+            _resetMultiVideoStep(row, m_projects->projectId(row), workflow, stepIndex, false);
+            return false;
+        }
+
+        const int chosenIndex = dlg.selectedTakeIndex();
+        _logProgress(tr("Selected take %1 for %2.")
+            .arg(chosenIndex + 1)
+            .arg(stepTitle.isEmpty() ? tr("Step %1").arg(stepIndex + 1) : stepTitle));
+        workflow->selectTake(stepIndex, chosenIndex);
+        _updateResumeButtonState(row);
+        return true;
+    }
+    else
+    {
+        if (workflow->completedVideoCount() < workflow->totalVideoCount())
+        {
+            _finishProgress(tr("Multi-video paused: waiting for video selection for %1.\n"
+                               "Click 'Resume generation' to choose your video and continue.")
+                .arg(stepTitle.isEmpty() ? tr("step %1").arg(stepIndex + 1) : stepTitle));
+        }
+        _updateResumeButtonState(row);
+        return false;
+    }
+}
+
 void PaneGeneration::_removeProject()
 {
     const auto &selRows = ui->tableViewProjects->selectionModel()->selectedRows();
@@ -572,6 +1235,7 @@ void PaneGeneration::_currentProjectChanged(const QModelIndex &current)
         ui->buttonPublish->setEnabled(false);
         ui->buttonPublish->setText(tr("Mark published"));
         ui->buttonPublish->setToolTip(tr("Mark this video as published"));
+        _updateResumeButtonState(-1);
         return;
     }
     m_projectMapper->setCurrentModelIndex(current);
@@ -611,6 +1275,7 @@ void PaneGeneration::_currentProjectChanged(const QModelIndex &current)
         ui->labelImage2->setPixmap(pixmap2.scaled(
             ui->labelImage2->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     }
+    _updateResumeButtonState(row);
 }
 
 AbstractCli *PaneGeneration::_promptCli() const
@@ -2123,6 +2788,10 @@ void PaneGeneration::_refreshHooksView(const QDir &hooksDir)
 
 void PaneGeneration::_refreshGenerationsView(int row)
 {
+    const auto *current = ui->treeViewGenerations->currentItem();
+    const QUuid selectedId = current
+        ? (current->parent() ? current->parent() : current)->data(0, Qt::UserRole).toUuid()
+        : QUuid{};
     ui->treeViewGenerations->clear();
     if (row < 0)
     {
@@ -2143,16 +2812,47 @@ void PaneGeneration::_refreshGenerationsView(int row)
             : node->name;
     };
 
+    ProductShowcaseMultiVideoWorkflow workflow;
+    const QString manifestName = QStringLiteral("multi_video_workflow.json");
+    if (!workflow.loadFromFile(m_projects->projectGenerationsDir(row).absoluteFilePath(manifestName)))
+    {
+        workflow.loadFromFile(m_projects->projectDir(row).absoluteFilePath(manifestName));
+    }
+    const QString workflowCode = workflow.generationShortCode();
+    const auto *workflowRecord = m_videos->recordFromShortCode(workflowCode);
+    const bool hasWorkflowRecord = workflowRecord
+        && workflowRecord->projectId == m_projects->projectId(row);
+    QTreeWidgetItem *selectedItem = nullptr;
+    QTreeWidgetItem *workflowItem = nullptr;
     const auto records = m_videos->recordsForProject(m_projects->projectId(row));
     for (const auto *record : records)
     {
+        const QDir generationDir = m_projects->generationDir(row, record->shortCode, false);
+        const QString type = _generationTypeLabel(generationDir);
+        if (hasWorkflowRecord && record->shortCode != workflowCode
+            && !record->published && record->publications.isEmpty()
+            && !m_videos->hasRetrievedStatistics(record->id))
+        {
+            ProductShowcaseMultiVideoWorkflow previous;
+            const bool sameWorkflow = previous.loadFromFile(generationDir.absoluteFilePath(manifestName))
+                && previous.generationShortCode() == workflowCode;
+            // Legacy retries allocated extra records and moved their takes
+            // into the latest folder. Keep their records/files on disk, but
+            // present the current workflow once. Published history stays visible.
+            if (sameWorkflow || (type == tr("(files deleted)")
+                                 && !generationDir.exists(manifestName)))
+            {
+                continue;
+            }
+        }
         auto *topItem = new QTreeWidgetItem{ui->treeViewGenerations};
         topItem->setText(0, record->shortCode);
-        topItem->setText(1, _generationTypeLabel(
-            m_projects->generationDir(row, record->shortCode)));
+        topItem->setText(1, type);
         topItem->setText(2, record->generatedDate.toLocalTime()
             .toString(QStringLiteral("yyyy-MM-dd hh:mm")));
         topItem->setData(0, Qt::UserRole, record->id);
+        if (record->id == selectedId) selectedItem = topItem;
+        if (record->shortCode == workflowCode) workflowItem = topItem;
         if (m_videos->isPublished(record->id))
         {
             _applyGenerationPublishedStyle(topItem, true);
@@ -2163,6 +2863,10 @@ void PaneGeneration::_refreshGenerationsView(int row)
         }
     }
     ui->treeViewGenerations->expandAll();
+    if (selectedItem || workflowItem)
+    {
+        ui->treeViewGenerations->setCurrentItem(selectedItem ? selectedItem : workflowItem);
+    }
 }
 
 void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidgetItem *)
@@ -2196,6 +2900,11 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
     }
 
     const QDir genDir = m_projects->generationDir(row, record->shortCode);
+    if (m_projects->isMultiVideoProject(row))
+    {
+        m_filesModel->setRootPath(genDir.absolutePath());
+        ui->treeViewFiles->setRootIndex(m_filesModel->index(genDir.absolutePath()));
+    }
     QString hook, description;
     readHookDescriptionFile(genDir, &hook, &description);
     // The generation's prompt (video only — image prompts aren't persisted
@@ -2228,9 +2937,23 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
 
 QString PaneGeneration::_generationTypeLabel(const QDir &generationDir)
 {
-    if (!generationDir.entryList(
-            {QStringLiteral("*.mp4"), QStringLiteral("*.mov"), QStringLiteral("*.webm"),
-             QStringLiteral("*.mkv")}, QDir::Files).isEmpty())
+    if (generationDir.exists(QStringLiteral("final_video.mp4")))
+    {
+        return tr("Final merged video");
+    }
+    if (generationDir.exists(QStringLiteral("takes"))
+        && generationDir.exists(QStringLiteral("multi_video_workflow.json")))
+    {
+        return tr("Multi-video (select takes / merging)");
+    }
+    const int videoCount = generationDir.entryList(
+        {QStringLiteral("*.mp4"), QStringLiteral("*.mov"), QStringLiteral("*.webm"),
+         QStringLiteral("*.mkv")}, QDir::Files).size();
+    if (videoCount > 1)
+    {
+        return tr("Multi-Video (%1 parts)").arg(videoCount);
+    }
+    if (videoCount == 1)
     {
         return tr("Video");
     }
@@ -2316,8 +3039,10 @@ void PaneGeneration::_showPreview(const QDir &generationDir)
          QStringLiteral("*.mkv")}, QDir::Files);
     if (!videoFiles.isEmpty())
     {
+        const QString preferred = QFileInfo::exists(generationDir.absoluteFilePath(QStringLiteral("final_video.mp4")))
+            ? QStringLiteral("final_video.mp4") : videoFiles.first();
         m_mediaPlayer->setSource(
-            QUrl::fromLocalFile(generationDir.absoluteFilePath(videoFiles.first())));
+            QUrl::fromLocalFile(generationDir.absoluteFilePath(preferred)));
         m_stackedPreview->setCurrentWidget(m_videoPreview);
         m_mediaPlayer->play();
         return;
@@ -3052,10 +3777,15 @@ void PaneGeneration::_openHooksDialog()
     const QDir tempDir = !shortCode.isEmpty()
         ? m_projects->generationTempDir(row, shortCode)
         : m_projects->stagingDir(row);
-    auto hooks = loadHooksFile(tempDir, nullptr);
+    QString savedVideoIdea;
+    auto hooks = loadHooksFile(tempDir, nullptr, &savedVideoIdea);
     if (hooks.isEmpty() && !shortCode.isEmpty())
     {
-        hooks = loadHooksFile(m_projects->stagingDir(row), nullptr);
+        hooks = loadHooksFile(genDir, nullptr, &savedVideoIdea);
+    }
+    if (hooks.isEmpty() && !shortCode.isEmpty())
+    {
+        hooks = loadHooksFile(m_projects->stagingDir(row), nullptr, &savedVideoIdea);
     }
 
     QString existingHook, existingDescription;
@@ -3066,6 +3796,7 @@ void PaneGeneration::_openHooksDialog()
         m_projects->index(row, TableProjects::IND_KEYWORD)).toString().trimmed();
     context.hookIdea = m_projects->data(
         m_projects->index(row, TableProjects::IND_HOOK)).toString().trimmed();
+    context.videoIdea = savedVideoIdea;
     context.videoFormatLabel = m_runVideoFormatLabel.isEmpty()
         ? QStringLiteral("9:16 vertical") : m_runVideoFormatLabel;
     context.preferredHashtags = m_hashtags ? m_hashtags->hashtags() : QStringList{};
@@ -3088,6 +3819,33 @@ void PaneGeneration::_openHooksDialog()
         }
     }
 
+    if (context.videoPrompt.isEmpty())
+    {
+        QFile wfFile{genDir.filePath(QStringLiteral("multi_video_workflow.json"))};
+        if (!wfFile.exists())
+        {
+            wfFile.setFileName(tempDir.filePath(QStringLiteral("multi_video_workflow.json")));
+        }
+        if (wfFile.open(QFile::ReadOnly))
+        {
+            const QJsonObject wf = QJsonDocument::fromJson(wfFile.readAll()).object();
+            const QJsonArray steps = wf.value(QStringLiteral("steps")).toArray();
+            QStringList stepPrompts;
+            for (const QJsonValue &sVal : steps)
+            {
+                const QString sp = sVal.toObject().value(QStringLiteral("prompt")).toString().trimmed();
+                if (!sp.isEmpty() && !stepPrompts.contains(sp))
+                {
+                    stepPrompts << sp;
+                }
+            }
+            if (!stepPrompts.isEmpty())
+            {
+                context.videoPrompt = stepPrompts.join(QStringLiteral(" | "));
+            }
+        }
+    }
+
     DialogHooks dialog{hooks, context, this};
     dialog.preselect(existingHook, existingDescription);
     if (dialog.exec() != QDialog::Accepted)
@@ -3101,12 +3859,13 @@ void PaneGeneration::_openHooksDialog()
     }
     if (!shortCode.isEmpty())
     {
-        saveHooksFile(tempDir, dialog.allHooks(), shortCode);
+        saveHooksFile(tempDir, dialog.allHooks(), shortCode, dialog.videoIdea());
+        saveHooksFile(genDir, dialog.allHooks(), shortCode, dialog.videoIdea());
         _refreshHooksView(tempDir);
     }
     else
     {
-        saveHooksFile(m_projects->stagingDir(row), dialog.allHooks(), QString{});
+        saveHooksFile(m_projects->stagingDir(row), dialog.allHooks(), QString{}, dialog.videoIdea());
         _refreshHooksView(m_projects->stagingDir(row));
     }
 }
@@ -3125,6 +3884,10 @@ void PaneGeneration::_openProgress()
     {
         connect(m_progress.cancelBtn, &QPushButton::clicked, m_progressDlg, [this]() {
             m_batchCancelled = true;
+            if (m_activeMultiVideoWorkflow)
+            {
+                m_activeMultiVideoWorkflow->cancel();
+            }
             _logProgress(tr("Cancelling remaining generations after the current steps finish..."));
         });
     }

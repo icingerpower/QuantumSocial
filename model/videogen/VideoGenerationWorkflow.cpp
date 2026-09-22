@@ -3,6 +3,7 @@
 #pragma GCC optimize("O1")
 
 #include "VideoGenerationWorkflow.h"
+#include "VideoClipProcessing.h"
 
 #include <chrono>
 
@@ -137,6 +138,8 @@ void VideoGenerationWorkflow::start(const Request &request)
     }
     m_running = true;
     m_cancelled = false;
+    m_promptSubmitted = false;
+    m_lastConversationUrl.clear();
     m_task = _run(request);
 }
 
@@ -170,6 +173,18 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
         }
         QVariantMap settings = request.settings;
         settings.insert(QStringLiteral("preservePrompt"), true);
+        if (!request.chatMode.isEmpty())
+        {
+            settings.insert(QStringLiteral("chatMode"), request.chatMode);
+        }
+        if (!request.messageAction.isEmpty())
+        {
+            settings.insert(QStringLiteral("messageAction"), request.messageAction);
+        }
+        if (!request.conversationUrl.isEmpty())
+        {
+            settings.insert(QStringLiteral("conversationUrl"), request.conversationUrl);
+        }
         emit progress(tr("Generating another video with the saved prompt and configuration..."));
         AbstractVideoGenerator::Result result;
         constexpr int maxBrowserRecoveries = 2;
@@ -181,8 +196,12 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                 co_return;
             }
             result = co_await generator->generate(request.prompt, images, request.outputDir, settings);
+            if (!result.conversationUrl.isEmpty())
+            {
+                m_lastConversationUrl = result.conversationUrl;
+            }
             if (!result.videoPath.isEmpty() || !result.browserLost || !result.retryable
-                || result.rejected || recovery == maxBrowserRecoveries || m_cancelled)
+                || result.rejected || result.quotaExceeded || recovery == maxBrowserRecoveries || m_cancelled)
             {
                 break;
             }
@@ -217,6 +236,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
     // this prefix entirely from that round onward.
     const QString pitfallsPrefix = request.knownPitfalls.isEmpty()
         ? QString{} : request.knownPitfalls + QStringLiteral("\n");
+    bool promptPostedInChat = (request.messageAction == QLatin1String("edit_last"));
 
     while (true)
     {
@@ -252,10 +272,35 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             // regenerates currentImage).
             images << request.extraImagePaths;
             const QString outputDirLocal = request.outputDir;
-            const QVariantMap settingsLocal = request.settings;
+            QVariantMap settingsLocal = request.settings;
+            if (!request.chatMode.isEmpty())
+            {
+                settingsLocal.insert(QStringLiteral("chatMode"), request.chatMode);
+            }
+            if (!request.conversationUrl.isEmpty())
+            {
+                settingsLocal.insert(QStringLiteral("conversationUrl"), request.conversationUrl);
+            }
+            const QString currentAction = (round == 1 && attempt == 0)
+                ? request.messageAction
+                : (request.chatMode == QLatin1String("conversation") && promptPostedInChat
+                    ? QStringLiteral("edit_last")
+                    : request.messageAction);
+            settingsLocal.insert(QStringLiteral("messageAction"), currentAction);
+
             AbstractVideoGenerator::Result result;
             result = co_await generator->generate(variantPrompt, images,
                                                   outputDirLocal, settingsLocal);
+            m_promptSubmitted |= result.promptSubmitted || result.rejected || !result.videoPath.isEmpty();
+            if (m_promptSubmitted)
+            {
+                promptPostedInChat = true;
+            }
+            if (!result.conversationUrl.isEmpty())
+            {
+                m_lastConversationUrl = result.conversationUrl;
+                request.conversationUrl = result.conversationUrl;
+            }
             if (!result.videoPath.isEmpty())
             {
                 videoPath = result.videoPath;
@@ -264,6 +309,50 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                 // so it can never end up duplicated across rounds.
                 currentPrompt = perturbed;
                 break;
+            }
+            if (result.quotaExceeded)
+            {
+                _finish({}, result.errorMessage);
+                co_return;
+            }
+            if (!result.quotaExceeded && request.decisionCli && !result.errorMessage.isEmpty())
+            {
+                static const QStringList quotaClues = {
+                    QStringLiteral("quota"), QStringLiteral("limit"), QStringLiteral("allowance"),
+                    QStringLiteral("tomorrow"), QStringLiteral("today"), QStringLiteral("demain"),
+                    QStringLiteral("aujourd'hui"), QStringLiteral("rate limit"), QStringLiteral("rate-limit"),
+                    QStringLiteral("try again later"), QStringLiteral("plus de vidéo")
+                };
+                const QString lowerErr = result.errorMessage.toLower();
+                bool hasClue = false;
+                for (const auto &clue : quotaClues)
+                {
+                    if (lowerErr.contains(clue))
+                    {
+                        hasClue = true;
+                        break;
+                    }
+                }
+                if (hasClue)
+                {
+                    const QString checkPrompt = tr(
+                        "An automated video generator gave this message instead of generating a video:\n"
+                        "\"%1\"\n\n"
+                        "Did the user hit an account rate limit, hourly limit, or daily quota for video creation?\n"
+                        "Reply with STRICT JSON only:\n"
+                        "{\"quota\": true, \"reason\": \"<brief explanation>\"} or {\"quota\": false}")
+                        .arg(result.errorMessage);
+                    CliRunResult checkRes = co_await request.decisionCli->runPrompt(checkPrompt, outputDirLocal);
+                    const QJsonObject replyObj = parseJsonReply(checkRes.output);
+                    if (replyObj.value(QStringLiteral("quota")).toBool())
+                    {
+                        result.quotaExceeded = true;
+                        const QString reason = replyObj.value(QStringLiteral("reason")).toString();
+                        _finish({}, tr("Video quota reached (%1): %2")
+                            .arg(generator->getName(), reason.isEmpty() ? result.errorMessage : reason));
+                        co_return;
+                    }
+                }
             }
             if (!result.retryable)
             {
@@ -311,7 +400,11 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                 "in a row (last error: %3).\n"
                 "Video brief: %4\n"
                 "Current prompt:\n%5\n\n"
-                "Decide how to unblock generation. Reply with STRICT JSON only:\n"
+                "First, if the error indicates that the account reached a daily limit, "
+                "rate limit, or video creation quota (e.g. daily limit reached, come back tomorrow, etc.), "
+                "reply with:\n"
+                "{\"action\": \"quota\", \"reason\": \"<explanation>\"}\n\n"
+                "Otherwise, decide how to unblock generation. Reply with STRICT JSON only:\n"
                 "{\"action\": \"prompt\", \"prompt\": \"<a rewritten prompt that "
                 "keeps the intent but avoids the rejection>\"}")
                 .arg(generator->getName()).arg(maxTries)
@@ -335,6 +428,13 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             }
 
             const QJsonObject reply = parseJsonReply(decision.output);
+            if (reply.value(QStringLiteral("action")).toString() == QLatin1String("quota"))
+            {
+                const QString reason = reply.value(QStringLiteral("reason")).toString();
+                _finish({}, tr("Video quota reached (%1): %2")
+                    .arg(generator->getName(), reason.isEmpty() ? lastError : reason));
+                co_return;
+            }
             if (imagePossible
                 && reply.value(QStringLiteral("action")).toString()
                     == QLatin1String("image"))
@@ -383,13 +483,28 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             continue; // next round
         }
 
+        if (request.multiVideoContinuation)
+        {
+            emit progress(tr("Preparing the new video segment..."));
+            const double duration = generator->continuationDurationSeconds(request.settings);
+            const auto clip = co_await VideoClipProcessing::trimTail(videoPath, duration);
+            if (!clip.error.isEmpty())
+            {
+                _finish({}, tr("Could not prepare the video segment: %1").arg(clip.error));
+                co_return;
+            }
+            videoPath = clip.path;
+        }
+
         // --- A video exists: extract key frames and judge the clip. ---
         emit progress(tr("Video downloaded — extracting key frames..."));
         const QString framesDir = QDir(request.outputDir).absoluteFilePath(
             QStringLiteral("frames_check"));
         QString frameError;
         QStringList frames;
-        frames = co_await _extractKeyFrames(videoPath, framesDir, &frameError);
+        const int frameCount = qBound(5, request.settings.value(QStringLiteral("validationFramesCount"),
+                                         request.settings.value(QStringLiteral("extractedFramesCount"), 5)).toInt(), 10);
+        frames = co_await _extractKeyFrames(videoPath, framesDir, &frameError, frameCount);
         if (m_cancelled)
         {
             _finish({}, tr("Cancelled."));
@@ -598,7 +713,7 @@ QCoro::Task<QString> VideoGenerationWorkflow::_regenerateImage(
 }
 
 QCoro::Task<QStringList> VideoGenerationWorkflow::_extractKeyFrames(
-    QString videoPath, QString framesDir, QString *errorMessage)
+    QString videoPath, QString framesDir, QString *errorMessage, int frameCount)
 {
     const QString ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
     if (ffmpeg.isEmpty())
@@ -614,13 +729,39 @@ QCoro::Task<QStringList> VideoGenerationWorkflow::_extractKeyFrames(
         dir.remove(old);
     }
 
-    // Up to 5 frames, at least 2 seconds apart (the escaped comma keeps the
-    // expression's comma out of ffmpeg's filter separator).
+    double duration = 0.0;
+    const QString ffprobe = QStandardPaths::findExecutable(QStringLiteral("ffprobe"));
+    if (!ffprobe.isEmpty())
+    {
+        QProcess probeProcess;
+        probeProcess.start(ffprobe, {
+            QStringLiteral("-v"), QStringLiteral("error"),
+            QStringLiteral("-show_entries"), QStringLiteral("format=duration"),
+            QStringLiteral("-of"), QStringLiteral("default=noprint_wrappers=1:nokey=1"),
+            videoPath
+        });
+        if (probeProcess.waitForFinished(5000))
+        {
+            duration = QString::fromUtf8(probeProcess.readAllStandardOutput()).trimmed().toDouble();
+        }
+    }
+
+    QString selectFilter;
+    if (duration > 1.0)
+    {
+        const double interval = duration / (frameCount + 1);
+        selectFilter = QStringLiteral("select=isnan(prev_selected_t)+gte(t-prev_selected_t\\,%1)")
+            .arg(QString::number(interval, 'f', 2));
+    }
+    else
+    {
+        selectFilter = QStringLiteral("select=isnan(prev_selected_t)+gte(t-prev_selected_t\\,0.5)");
+    }
+
     const QStringList args{
         QStringLiteral("-y"), QStringLiteral("-i"), videoPath,
-        QStringLiteral("-vf"),
-        QStringLiteral("select=isnan(prev_selected_t)+gte(t-prev_selected_t\\,2)"),
-        QStringLiteral("-frames:v"), QStringLiteral("5"),
+        QStringLiteral("-vf"), selectFilter,
+        QStringLiteral("-frames:v"), QString::number(frameCount),
         QStringLiteral("-vsync"), QStringLiteral("vfr"),
         dir.absoluteFilePath(QStringLiteral("frame_%02d.jpg")),
     };

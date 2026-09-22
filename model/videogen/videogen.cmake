@@ -1,4 +1,6 @@
 set(VIDEOGEN_FILES
+    ${CMAKE_CURRENT_LIST_DIR}/VideoClipProcessing.h
+    ${CMAKE_CURRENT_LIST_DIR}/VideoClipProcessing.cpp
     ${CMAKE_CURRENT_LIST_DIR}/VideoGenerationRecipe.h
     ${CMAKE_CURRENT_LIST_DIR}/VideoGenerationRecipe.cpp
     ${CMAKE_CURRENT_LIST_DIR}/AbstractVideoGenerator.h
@@ -9,4 +11,8 @@ set(VIDEOGEN_FILES
     ${CMAKE_CURRENT_LIST_DIR}/TableGenerationSettings.cpp
     ${CMAKE_CURRENT_LIST_DIR}/VideoGenerationWorkflow.h
     ${CMAKE_CURRENT_LIST_DIR}/VideoGenerationWorkflow.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/AbstractMultiVideoWorkflow.h
+    ${CMAKE_CURRENT_LIST_DIR}/AbstractMultiVideoWorkflow.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/ProductShowcaseMultiVideoWorkflow.h
+    ${CMAKE_CURRENT_LIST_DIR}/ProductShowcaseMultiVideoWorkflow.cpp
 )

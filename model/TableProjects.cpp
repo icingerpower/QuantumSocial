@@ -106,7 +106,7 @@ QStringList splitCsvLine(const QString &line)
 
 const QStringList TableProjects::HEADER{
     "Name", "Created", "Keyword", "Hook idea", "Image", "Gen prompt",
-    "Gen hook", "Gen description", "Image 2", "Id"};
+    "Gen hook", "Gen description", "Image 2", "Type", "Id"};
 const int TableProjects::IND_NAME{0};
 const int TableProjects::IND_CREATED{1};
 const int TableProjects::IND_KEYWORD{2};
@@ -116,7 +116,8 @@ const int TableProjects::IND_GEN_PROMPT{5};
 const int TableProjects::IND_GEN_HOOK{6};
 const int TableProjects::IND_GEN_DESC{7};
 const int TableProjects::IND_IMAGE2{8};
-const int TableProjects::IND_ID{9};
+const int TableProjects::IND_TYPE{9};
+const int TableProjects::IND_ID{10};
 
 TableProjects::TableProjects(const QString &workingDirectory, QObject *parent)
     : QAbstractTableModel(parent)
@@ -264,11 +265,71 @@ int TableProjects::addProject(const QString &imagePath, const QString &imagePath
         , QString{} // picked hook
         , QString{} // picked description (with hashtags)
         , storedImagePath2
+        , QStringLiteral("single")
         , idString
     };
     endInsertRows();
     _saveInFile();
     return row;
+}
+
+int TableProjects::addMultiVideoProject(const QString &keyword, const QString &firstImagePath)
+{
+    const QUuid id = QUuid::createUuid();
+    const QString idString = id.toString(QUuid::WithoutBraces);
+    m_workingDir.mkpath(PROJECTS_SUBDIR + QLatin1Char('/') + idString);
+
+    const QString storedImagePath = !firstImagePath.isEmpty()
+        ? storeProjectImage(m_workingDir, idString, QStringLiteral("source"), firstImagePath)
+        : QString{};
+
+    const QString name = keyword.trimmed().isEmpty()
+        ? tr("Multi-Video %1").arg(m_listOfVariantList.size() + 1)
+        : keyword.trimmed();
+
+    const int row = m_listOfVariantList.size();
+    beginInsertRows(QModelIndex{}, row, row);
+    m_listOfVariantList << QVariantList{
+        name
+        , QDateTime::currentDateTimeUtc().toString(Qt::ISODate)
+        , keyword
+        , QString{} // hook idea
+        , storedImagePath
+        , QString{} // gen prompt
+        , QString{} // gen hook
+        , QString{} // gen desc
+        , QString{} // image 2
+        , QStringLiteral("multi_video")
+        , idString
+    };
+    endInsertRows();
+    _saveInFile();
+    return row;
+}
+
+bool TableProjects::isMultiVideoProject(int row) const
+{
+    if (row < 0 || row >= m_listOfVariantList.size())
+    {
+        return false;
+    }
+    const QString type = m_listOfVariantList[row][IND_TYPE].toString();
+    if (type == QLatin1String("multi_video"))
+    {
+        return true;
+    }
+    return projectDir(row).exists(QStringLiteral("multi_video_workflow.json"))
+        || projectGenerationsDir(row).exists(QStringLiteral("multi_video_workflow.json"));
+}
+
+QString TableProjects::projectType(int row) const
+{
+    if (row < 0 || row >= m_listOfVariantList.size())
+    {
+        return QString{};
+    }
+    const QString type = m_listOfVariantList[row][IND_TYPE].toString();
+    return type.isEmpty() ? QStringLiteral("single") : type;
 }
 
 void TableProjects::removeProject(int row)
@@ -382,7 +443,7 @@ QString TableProjects::absoluteImagePath2(int row) const
     return m_workingDir.absoluteFilePath(stored);
 }
 
-QDir TableProjects::generationDir(int row, const QString &shortCode) const
+QDir TableProjects::generationDir(int row, const QString &shortCode, bool create) const
 {
     if (row < 0 || row >= m_listOfVariantList.size() || shortCode.isEmpty())
     {
@@ -396,7 +457,10 @@ QDir TableProjects::generationDir(int row, const QString &shortCode) const
     {
         return legacyDir;
     }
-    newDir.mkpath(QStringLiteral("."));
+    if (create)
+    {
+        newDir.mkpath(QStringLiteral("."));
+    }
     return newDir;
 }
 
@@ -483,6 +547,7 @@ void TableProjects::_loadFromFile()
             , elements[IND_GEN_HOOK]
             , elements[IND_GEN_DESC]
             , elements[IND_IMAGE2]
+            , elements[IND_TYPE]
             , id
         };
     }

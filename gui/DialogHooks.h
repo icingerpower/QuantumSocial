@@ -36,6 +36,7 @@ public:
         QString hookIdea;
         QString videoFormatLabel;
         QString videoPrompt;
+        QString videoIdea;
         QStringList preferredHashtags;
         QString favoriteHooksPrompt;
         QString codeTag;
@@ -59,6 +60,8 @@ public:
 
     QString selectedHook() const;
     QString selectedDescription() const;
+    QString videoIdea() const;
+    void setVideoIdea(const QString &idea);
     QList<QPair<QString, QString>> allHooks() const;
     AbstractCli *selectedCli() const;
 

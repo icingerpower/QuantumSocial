@@ -70,6 +70,11 @@ public:
         // refuses a clip — the caller persists these and feeds them back
         // into future prompts (see knownPitfalls above).
         std::function<void(const QString &)> recordLesson;
+        // Multi-video options
+        QString chatMode = QStringLiteral("fresh"); // "fresh" or "conversation"
+        QString messageAction = QStringLiteral("new"); // "new" or "edit_last"
+        QString conversationUrl;
+        bool multiVideoContinuation = false;
     };
 
     explicit VideoGenerationWorkflow(QObject *parent = nullptr);
@@ -80,6 +85,9 @@ public:
     // CLI call) finishes first.
     void cancel();
 
+    QString lastConversationUrl() const { return m_lastConversationUrl; }
+    bool promptSubmitted() const { return m_promptSubmitted; }
+
 signals:
     void progress(const QString &message);
     // videoPath is empty when cancelled or on a setup error (errorMessage).
@@ -88,13 +96,15 @@ signals:
 private:
     bool m_running = false;
     bool m_cancelled = false;
+    QString m_lastConversationUrl;
+    bool m_promptSubmitted = false;
     QCoro::Task<void> m_task;
 
     QCoro::Task<void> _run(Request request);
-    // Extracts up to 5 key frames into framesDir; returns the frame file
+    // Extracts 5 to 10 key frames into framesDir; returns the frame file
     // names, or empty with errorMessage set.
     QCoro::Task<QStringList> _extractKeyFrames(QString videoPath, QString framesDir,
-                                               QString *errorMessage);
+                                               QString *errorMessage, int frameCount = 5);
     // Asks imageCli to produce a new generation_source.png from currentImage
     // per instruction (free text — "make something different" when a whole
     // round of prompts got rejected, or "remove the watermark in the
