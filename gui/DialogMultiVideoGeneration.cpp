@@ -1,26 +1,67 @@
 #include "DialogMultiVideoGeneration.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSpinBox>
+#include <QSplitter>
 #include <QVBoxLayout>
 
 #include "AbstractCli.h"
 #include "MultiVideoStepWidget.h"
+#include "model/SavedPrompts.h"
+#include "model/properties/PropertySampler.h"
+#include "model/properties/TreeProperties.h"
 #include "model/videogen/AbstractVideoGenerator.h"
+#include "model/videos/TableVideos.h"
+
+namespace {
+QString withTrailingPeriod(QString text)
+{
+    text = text.trimmed();
+    if (!text.isEmpty() && !text.endsWith(QLatin1Char('.')))
+    {
+        text += QLatin1Char('.');
+    }
+    return text;
+}
+}
 
 DialogMultiVideoGeneration::DialogMultiVideoGeneration(
     const QList<AbstractCli *> &availableClis, QWidget *parent)
+    : DialogMultiVideoGeneration(availableClis, nullptr, nullptr, nullptr, parent)
+{
+}
+
+DialogMultiVideoGeneration::DialogMultiVideoGeneration(
+    const QList<AbstractCli *> &availableClis,
+    SavedPrompts *savedPrompts,
+    QWidget *parent)
+    : DialogMultiVideoGeneration(availableClis, savedPrompts, nullptr, nullptr, parent)
+{
+}
+
+DialogMultiVideoGeneration::DialogMultiVideoGeneration(
+    const QList<AbstractCli *> &availableClis,
+    SavedPrompts *savedPrompts,
+    TreeProperties *properties,
+    TableVideos *videos,
+    QWidget *parent)
     : QDialog(parent)
     , m_availableClis(availableClis)
+    , m_savedPrompts(savedPrompts)
+    , m_properties(properties)
+    , m_videos(videos)
 {
     setWindowTitle(tr("New Multi-Video Generation"));
     resize(980, 850);
@@ -92,41 +133,250 @@ DialogMultiVideoGeneration::DialogMultiVideoGeneration(
 
     // --- Section 2: Prompts and Takes (1 for Intro, 1 for After-Intro) ---
     auto *groupPrompts = new QGroupBox(tr("2. Prompts & Takes"), this);
-    auto *layoutPrompts = new QGridLayout(groupPrompts);
+    auto *layoutPrompts = new QVBoxLayout(groupPrompts);
     layoutPrompts->setSpacing(8);
 
-    m_editIntroPrompt = new QPlainTextEdit(groupPrompts);
-    m_editIntroPrompt->setPlaceholderText(tr(
-        "Hook & opener video prompt: fast dynamic camera zoom on product collection, bold catchy atmosphere, smooth cinematic lighting..."));
-    m_editIntroPrompt->setMaximumHeight(70);
+    // Intro header toolbar & editor
+    auto *layoutIntroHeader = new QHBoxLayout();
+    layoutIntroHeader->setSpacing(6);
+    layoutIntroHeader->addWidget(new QLabel(tr("Intro step prompt:"), groupPrompts));
 
+    m_comboSavedIntroPrompt = new QComboBox(groupPrompts);
+    m_comboSavedIntroPrompt->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    m_comboSavedIntroPrompt->setPlaceholderText(tr("Saved prompts..."));
+    layoutIntroHeader->addWidget(m_comboSavedIntroPrompt);
+
+    m_buttonLoadIntroPrompt = new QPushButton(tr("Load"), groupPrompts);
+    m_buttonLoadIntroPrompt->setToolTip(tr("Load selected saved prompt into intro prompt editor"));
+    layoutIntroHeader->addWidget(m_buttonLoadIntroPrompt);
+
+    m_buttonEditIntroPrompt = new QPushButton(tr("Edit..."), groupPrompts);
+    m_buttonEditIntroPrompt->setToolTip(tr("Edit selected saved prompt"));
+    layoutIntroHeader->addWidget(m_buttonEditIntroPrompt);
+
+    m_buttonSaveIntroPrompt = new QPushButton(tr("Save..."), groupPrompts);
+    m_buttonSaveIntroPrompt->setToolTip(tr("Save current intro prompt text to saved prompts library"));
+    layoutIntroHeader->addWidget(m_buttonSaveIntroPrompt);
+
+    layoutIntroHeader->addStretch(1);
+
+    layoutIntroHeader->addWidget(new QLabel(tr("Intro takes:"), groupPrompts));
     m_spinIntroTakes = new QSpinBox(groupPrompts);
     m_spinIntroTakes->setRange(1, 10);
     m_spinIntroTakes->setValue(2);
+    layoutIntroHeader->addWidget(m_spinIntroTakes);
+
+    layoutPrompts->addLayout(layoutIntroHeader);
+
+    struct PlanProp
+    {
+        QUuid id;
+        QString name;
+        QList<PropertySampler::SiblingOption> options;
+        QUuid selectedId;
+    };
+    QList<PlanProp> propList;
+    if (m_properties)
+    {
+        if (m_videos)
+        {
+            const auto variants = PropertySampler::sampleVariants(*m_properties, *m_videos, 1);
+            if (!variants.isEmpty())
+            {
+                for (const auto &sampled : variants.first())
+                {
+                    PlanProp prop;
+                    prop.id = sampled.propertyId;
+                    prop.name = sampled.propertyName;
+                    prop.options = sampled.siblings;
+                    prop.selectedId = sampled.id;
+                    propList << prop;
+                }
+            }
+        }
+        if (propList.isEmpty())
+        {
+            for (TreeProperties::PropertyNode *node : m_properties->topLevelNodes())
+            {
+                if (node->children.isEmpty())
+                {
+                    continue;
+                }
+                PlanProp prop;
+                prop.id = node->id;
+                prop.name = node->name;
+                for (TreeProperties::PropertyNode *child : node->children)
+                {
+                    prop.options << PropertySampler::SiblingOption{
+                        child->id, child->name, child->promptFragment};
+                }
+                prop.selectedId = node->children.first()->id;
+                propList << prop;
+            }
+        }
+    }
+
+    if (!propList.isEmpty())
+    {
+        auto *introSplitter = new QSplitter(Qt::Horizontal, groupPrompts);
+        introSplitter->setChildrenCollapsible(false);
+
+        auto *panelLeft = new QWidget(introSplitter);
+        auto *layoutLeft = new QVBoxLayout(panelLeft);
+        layoutLeft->setContentsMargins(0, 0, 0, 0);
+        layoutLeft->setSpacing(4);
+
+        m_editIntroPrompt = new QPlainTextEdit(panelLeft);
+        m_editIntroPrompt->setPlaceholderText(tr(
+            "Hook & opener video prompt: fast dynamic camera zoom on product collection, bold catchy atmosphere, smooth cinematic lighting..."));
+        m_editIntroPrompt->setMaximumHeight(70);
+        layoutLeft->addWidget(m_editIntroPrompt);
+
+        auto *labelProps = new QLabel(tr("A/B properties (applied to Intro step only):"), panelLeft);
+        labelProps->setStyleSheet(QStringLiteral("font-weight: bold; color: #555;"));
+        layoutLeft->addWidget(labelProps);
+
+        auto *scrollProps = new QScrollArea(panelLeft);
+        scrollProps->setWidgetResizable(true);
+        scrollProps->setFrameShape(QFrame::NoFrame);
+        scrollProps->setMaximumHeight(140);
+
+        auto *contentProps = new QWidget(scrollProps);
+        auto *layoutProps = new QVBoxLayout(contentProps);
+        layoutProps->setContentsMargins(0, 0, 0, 0);
+        layoutProps->setSpacing(4);
+
+        for (const auto &prop : propList)
+        {
+            auto *rowWidget = new QWidget(contentProps);
+            auto *rowLayout = new QHBoxLayout(rowWidget);
+            rowLayout->setContentsMargins(0, 0, 0, 0);
+            rowLayout->setSpacing(6);
+
+            PropertyRow row;
+            row.propertyId = prop.id;
+
+            row.checkBox = new QCheckBox(prop.name, rowWidget);
+            row.checkBox->setChecked(true);
+            row.checkBox->setMinimumWidth(110);
+            rowLayout->addWidget(row.checkBox);
+
+            row.valueCombo = new QComboBox(rowWidget);
+            for (const auto &opt : prop.options)
+            {
+                row.valueCombo->addItem(opt.name);
+                const int idx = row.valueCombo->count() - 1;
+                row.valueCombo->setItemData(idx, opt.id, Qt::UserRole);
+                row.valueCombo->setItemData(idx, opt.promptFragment, Qt::UserRole + 1);
+            }
+            for (int idx = 0; idx < row.valueCombo->count(); ++idx)
+            {
+                if (row.valueCombo->itemData(idx, Qt::UserRole).toUuid() == prop.selectedId)
+                {
+                    row.valueCombo->setCurrentIndex(idx);
+                    break;
+                }
+            }
+            rowLayout->addWidget(row.valueCombo, 1);
+            layoutProps->addWidget(rowWidget);
+
+            connect(row.checkBox, &QCheckBox::toggled, this, [this, row](bool checked) {
+                row.valueCombo->setEnabled(checked);
+                _recomputeIntroFinal();
+            });
+            connect(row.valueCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [this]() {
+                _recomputeIntroFinal();
+            });
+
+            m_propertyRows << row;
+        }
+        layoutProps->addStretch(1);
+        scrollProps->setWidget(contentProps);
+        layoutLeft->addWidget(scrollProps);
+
+        introSplitter->addWidget(panelLeft);
+
+        auto *panelRight = new QWidget(introSplitter);
+        auto *layoutRight = new QVBoxLayout(panelRight);
+        layoutRight->setContentsMargins(0, 0, 0, 0);
+        layoutRight->setSpacing(4);
+
+        auto *labelFinalTitle = new QLabel(tr("Final Intro Prompt Preview:"), panelRight);
+        labelFinalTitle->setStyleSheet(QStringLiteral("font-weight: bold; color: #555;"));
+        layoutRight->addWidget(labelFinalTitle);
+
+        auto *scrollPreview = new QScrollArea(panelRight);
+        scrollPreview->setWidgetResizable(true);
+        scrollPreview->setFrameShape(QFrame::StyledPanel);
+
+        m_labelIntroFinalPreview = new QLabel(scrollPreview);
+        m_labelIntroFinalPreview->setWordWrap(true);
+        m_labelIntroFinalPreview->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+        m_labelIntroFinalPreview->setAlignment(Qt::AlignLeading | Qt::AlignLeft | Qt::AlignTop);
+        m_labelIntroFinalPreview->setMargin(6);
+        m_labelIntroFinalPreview->setStyleSheet(QStringLiteral("background-color: #FAFAFA; color: #222; font-size: 11px;"));
+
+        scrollPreview->setWidget(m_labelIntroFinalPreview);
+        layoutRight->addWidget(scrollPreview);
+
+        introSplitter->addWidget(panelRight);
+        introSplitter->setStretchFactor(0, 3);
+        introSplitter->setStretchFactor(1, 2);
+        introSplitter->setSizes({550, 350});
+
+        layoutPrompts->addWidget(introSplitter);
+    }
+    else
+    {
+        m_editIntroPrompt = new QPlainTextEdit(groupPrompts);
+        m_editIntroPrompt->setPlaceholderText(tr(
+            "Hook & opener video prompt: fast dynamic camera zoom on product collection, bold catchy atmosphere, smooth cinematic lighting..."));
+        m_editIntroPrompt->setMaximumHeight(70);
+        layoutPrompts->addWidget(m_editIntroPrompt);
+    }
+
+    // After-intro header toolbar & editor
+    auto *layoutAfterIntroHeader = new QHBoxLayout();
+    layoutAfterIntroHeader->setSpacing(6);
+    layoutAfterIntroHeader->addWidget(new QLabel(tr("After-intro steps prompt:"), groupPrompts));
+
+    m_comboSavedAfterIntroPrompt = new QComboBox(groupPrompts);
+    m_comboSavedAfterIntroPrompt->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    m_comboSavedAfterIntroPrompt->setPlaceholderText(tr("Saved prompts..."));
+    layoutAfterIntroHeader->addWidget(m_comboSavedAfterIntroPrompt);
+
+    m_buttonLoadAfterIntroPrompt = new QPushButton(tr("Load"), groupPrompts);
+    m_buttonLoadAfterIntroPrompt->setToolTip(tr("Load selected saved prompt into after-intro prompt editor"));
+    layoutAfterIntroHeader->addWidget(m_buttonLoadAfterIntroPrompt);
+
+    m_buttonEditAfterIntroPrompt = new QPushButton(tr("Edit..."), groupPrompts);
+    m_buttonEditAfterIntroPrompt->setToolTip(tr("Edit selected saved prompt"));
+    layoutAfterIntroHeader->addWidget(m_buttonEditAfterIntroPrompt);
+
+    m_buttonSaveAfterIntroPrompt = new QPushButton(tr("Save..."), groupPrompts);
+    m_buttonSaveAfterIntroPrompt->setToolTip(tr("Save current after-intro prompt text to saved prompts library"));
+    layoutAfterIntroHeader->addWidget(m_buttonSaveAfterIntroPrompt);
+
+    layoutAfterIntroHeader->addStretch(1);
+
+    layoutAfterIntroHeader->addWidget(new QLabel(tr("Takes per step:"), groupPrompts));
+    m_spinAfterIntroTakes = new QSpinBox(groupPrompts);
+    m_spinAfterIntroTakes->setRange(1, 10);
+    m_spinAfterIntroTakes->setValue(2);
+    layoutAfterIntroHeader->addWidget(m_spinAfterIntroTakes);
+
+    layoutPrompts->addLayout(layoutAfterIntroHeader);
 
     m_editAfterIntroPrompt = new QPlainTextEdit(groupPrompts);
     m_editAfterIntroPrompt->setPlaceholderText(tr(
         "Product showcase prompt: clean 360 rotation highlighting material quality and fine craftsmanship, elegant backdrop..."));
     m_editAfterIntroPrompt->setMaximumHeight(70);
-
-    m_spinAfterIntroTakes = new QSpinBox(groupPrompts);
-    m_spinAfterIntroTakes->setRange(1, 10);
-    m_spinAfterIntroTakes->setValue(2);
+    layoutPrompts->addWidget(m_editAfterIntroPrompt);
 
     m_labelTotalSummary = new QLabel(groupPrompts);
     m_labelTotalSummary->setStyleSheet(QStringLiteral("font-weight: bold; color: #4CAF50;"));
-
-    layoutPrompts->addWidget(new QLabel(tr("Intro step prompt:"), groupPrompts), 0, 0);
-    layoutPrompts->addWidget(m_editIntroPrompt, 0, 1);
-    layoutPrompts->addWidget(new QLabel(tr("Intro takes:"), groupPrompts), 0, 2);
-    layoutPrompts->addWidget(m_spinIntroTakes, 0, 3);
-
-    layoutPrompts->addWidget(new QLabel(tr("After-intro steps prompt:"), groupPrompts), 1, 0);
-    layoutPrompts->addWidget(m_editAfterIntroPrompt, 1, 1);
-    layoutPrompts->addWidget(new QLabel(tr("Takes per step:"), groupPrompts), 1, 2);
-    layoutPrompts->addWidget(m_spinAfterIntroTakes, 1, 3);
-
-    layoutPrompts->addWidget(m_labelTotalSummary, 2, 0, 1, 4);
+    layoutPrompts->addWidget(m_labelTotalSummary);
 
     mainLayout->addWidget(groupPrompts);
 
@@ -194,12 +444,56 @@ DialogMultiVideoGeneration::DialogMultiVideoGeneration(
 
     connect(m_editKeyword, &QLineEdit::textChanged, this, &DialogMultiVideoGeneration::_updateOkButton);
     connect(m_editIntroPrompt, &QPlainTextEdit::textChanged, this, &DialogMultiVideoGeneration::_updateOkButton);
+    connect(m_editIntroPrompt, &QPlainTextEdit::textChanged, this, &DialogMultiVideoGeneration::_recomputeIntroFinal);
     connect(m_editAfterIntroPrompt, &QPlainTextEdit::textChanged, this, &DialogMultiVideoGeneration::_updateOkButton);
     connect(m_buttonApplyAllRegen, &QPushButton::clicked, this, &DialogMultiVideoGeneration::_applyDefaultRegenToAllSlots);
+
+    connect(m_comboSavedIntroPrompt, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        m_buttonLoadIntroPrompt->setEnabled(index >= 0);
+        m_buttonEditIntroPrompt->setEnabled(index >= 0);
+    });
+    connect(m_buttonLoadIntroPrompt, &QPushButton::clicked, this, [this]() {
+        _loadPrompt(m_comboSavedIntroPrompt, m_editIntroPrompt);
+    });
+    connect(m_buttonEditIntroPrompt, &QPushButton::clicked, this, [this]() {
+        _editPrompt(m_comboSavedIntroPrompt, m_editIntroPrompt);
+    });
+    connect(m_buttonSaveIntroPrompt, &QPushButton::clicked, this, [this]() {
+        _savePrompt(m_comboSavedIntroPrompt, m_editIntroPrompt);
+    });
+
+    connect(m_comboSavedAfterIntroPrompt, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        m_buttonLoadAfterIntroPrompt->setEnabled(index >= 0);
+        m_buttonEditAfterIntroPrompt->setEnabled(index >= 0);
+    });
+    connect(m_buttonLoadAfterIntroPrompt, &QPushButton::clicked, this, [this]() {
+        _loadPrompt(m_comboSavedAfterIntroPrompt, m_editAfterIntroPrompt);
+    });
+    connect(m_buttonEditAfterIntroPrompt, &QPushButton::clicked, this, [this]() {
+        _editPrompt(m_comboSavedAfterIntroPrompt, m_editAfterIntroPrompt);
+    });
+    connect(m_buttonSaveAfterIntroPrompt, &QPushButton::clicked, this, [this]() {
+        _savePrompt(m_comboSavedAfterIntroPrompt, m_editAfterIntroPrompt);
+    });
+
+    const bool hasSaved = (m_savedPrompts != nullptr);
+    m_comboSavedIntroPrompt->setVisible(hasSaved);
+    m_buttonLoadIntroPrompt->setVisible(hasSaved);
+    m_buttonEditIntroPrompt->setVisible(hasSaved);
+    m_buttonSaveIntroPrompt->setVisible(hasSaved);
+    m_comboSavedAfterIntroPrompt->setVisible(hasSaved);
+    m_buttonLoadAfterIntroPrompt->setVisible(hasSaved);
+    m_buttonEditAfterIntroPrompt->setVisible(hasSaved);
+    m_buttonSaveAfterIntroPrompt->setVisible(hasSaved);
+
+    _refreshSavedPromptCombos();
 
     _rebuildStepWidgets(m_spinTotalSteps->value());
     _updateTotalCountLabel();
     _updateOkButton();
+    _recomputeIntroFinal();
 }
 
 void DialogMultiVideoGeneration::_applyDefaultRegenToAllSlots()
@@ -307,7 +601,73 @@ int DialogMultiVideoGeneration::totalSteps() const
 
 QString DialogMultiVideoGeneration::introPrompt() const
 {
-    return m_editIntroPrompt->toPlainText().trimmed();
+    return _computeIntroFinal();
+}
+
+QString DialogMultiVideoGeneration::rawIntroPrompt() const
+{
+    return m_editIntroPrompt ? m_editIntroPrompt->toPlainText().trimmed() : QString();
+}
+
+QList<QUuid> DialogMultiVideoGeneration::introPropertyValueIds() const
+{
+    QList<QUuid> ids;
+    for (const auto &row : m_propertyRows)
+    {
+        if (row.checkBox && row.checkBox->isChecked() && row.valueCombo)
+        {
+            const QUuid id = row.valueCombo->currentData(Qt::UserRole).toUuid();
+            if (!id.isNull())
+            {
+                ids << id;
+            }
+        }
+    }
+    return ids;
+}
+
+QString DialogMultiVideoGeneration::_computeIntroFinal() const
+{
+    if (!m_editIntroPrompt)
+    {
+        return QString();
+    }
+    const QString basePrompt = m_editIntroPrompt->toPlainText().trimmed();
+    QStringList fragments;
+    for (const PropertyRow &row : m_propertyRows)
+    {
+        if (row.checkBox && row.checkBox->isChecked() && row.valueCombo)
+        {
+            const QString fragment
+                = row.valueCombo->currentData(Qt::UserRole + 1).toString().trimmed();
+            if (!fragment.isEmpty())
+            {
+                fragments << withTrailingPeriod(fragment);
+            }
+        }
+    }
+
+    if (fragments.isEmpty())
+    {
+        return basePrompt;
+    }
+
+    QStringList parts;
+    if (!basePrompt.isEmpty())
+    {
+        parts << withTrailingPeriod(basePrompt);
+    }
+    parts.append(fragments);
+    return parts.join(QStringLiteral(" "));
+}
+
+void DialogMultiVideoGeneration::_recomputeIntroFinal()
+{
+    const QString computed = _computeIntroFinal();
+    if (m_labelIntroFinalPreview)
+    {
+        m_labelIntroFinalPreview->setText(computed);
+    }
 }
 
 int DialogMultiVideoGeneration::introTakes() const
@@ -359,4 +719,152 @@ DialogGenerationOptions::VideoFormat DialogMultiVideoGeneration::videoFormat() c
 QString DialogMultiVideoGeneration::videoFormatLabel() const
 {
     return DialogGenerationOptions::formatLabel(videoFormat());
+}
+
+void DialogMultiVideoGeneration::setKeyword(const QString &keyword)
+{
+    if (m_editKeyword)
+    {
+        m_editKeyword->setText(keyword);
+    }
+}
+
+void DialogMultiVideoGeneration::setIntroPrompt(const QString &prompt)
+{
+    if (m_editIntroPrompt)
+    {
+        m_editIntroPrompt->setPlainText(prompt);
+    }
+}
+
+void DialogMultiVideoGeneration::setAfterIntroPrompt(const QString &prompt)
+{
+    if (m_editAfterIntroPrompt)
+    {
+        m_editAfterIntroPrompt->setPlainText(prompt);
+    }
+}
+
+void DialogMultiVideoGeneration::_refreshSavedPromptCombos()
+{
+    if (!m_savedPrompts)
+    {
+        return;
+    }
+    QStringList names;
+    for (const auto &entry : m_savedPrompts->entries())
+    {
+        names << entry.name;
+    }
+    const auto updateCombo = [&names](QComboBox *combo, QPushButton *btnEdit, QPushButton *btnLoad) {
+        if (!combo)
+        {
+            return;
+        }
+        const QString current = combo->currentText();
+        const QSignalBlocker blocker{combo};
+        combo->clear();
+        combo->addItems(names);
+        const int idx = combo->findText(current);
+        combo->setCurrentIndex(idx);
+        if (btnEdit)
+        {
+            btnEdit->setEnabled(idx >= 0);
+        }
+        if (btnLoad)
+        {
+            btnLoad->setEnabled(idx >= 0);
+        }
+    };
+    updateCombo(m_comboSavedIntroPrompt, m_buttonEditIntroPrompt, m_buttonLoadIntroPrompt);
+    updateCombo(m_comboSavedAfterIntroPrompt, m_buttonEditAfterIntroPrompt, m_buttonLoadAfterIntroPrompt);
+}
+
+void DialogMultiVideoGeneration::_loadPrompt(QComboBox *combo, QPlainTextEdit *edit)
+{
+    if (!m_savedPrompts || !combo || !edit || combo->currentIndex() < 0)
+    {
+        return;
+    }
+    const QString selectedName = combo->currentText();
+    for (const auto &entry : m_savedPrompts->entries())
+    {
+        if (entry.name == selectedName)
+        {
+            edit->setPlainText(entry.prompt);
+            break;
+        }
+    }
+}
+
+void DialogMultiVideoGeneration::_editPrompt(QComboBox *combo, QPlainTextEdit *edit)
+{
+    if (!m_savedPrompts || !combo || !edit || combo->currentIndex() < 0)
+    {
+        return;
+    }
+    const QString selectedName = combo->currentText();
+    for (const auto &entry : m_savedPrompts->entries())
+    {
+        if (entry.name != selectedName)
+        {
+            continue;
+        }
+        bool accepted = false;
+        const QString edited = QInputDialog::getMultiLineText(
+            this, tr("Edit saved prompt — %1").arg(entry.name),
+            tr("Prompt:"), entry.prompt, &accepted);
+        if (accepted)
+        {
+            if (edited.trimmed().isEmpty())
+            {
+                QMessageBox::warning(this, tr("Edit saved prompt"),
+                                     tr("A saved prompt cannot be empty."));
+                return;
+            }
+            m_savedPrompts->savePrompt(entry.name, edited);
+            if (m_editIntroPrompt && m_editIntroPrompt->toPlainText() == entry.prompt)
+            {
+                m_editIntroPrompt->setPlainText(edited);
+            }
+            if (m_editAfterIntroPrompt && m_editAfterIntroPrompt->toPlainText() == entry.prompt)
+            {
+                m_editAfterIntroPrompt->setPlainText(edited);
+            }
+            _refreshSavedPromptCombos();
+            combo->setCurrentText(entry.name);
+        }
+        return;
+    }
+}
+
+void DialogMultiVideoGeneration::_savePrompt(QComboBox *combo, QPlainTextEdit *edit)
+{
+    if (!m_savedPrompts || !combo || !edit)
+    {
+        return;
+    }
+    const QString promptText = edit->toPlainText().trimmed();
+    if (promptText.isEmpty())
+    {
+        QMessageBox::warning(this, tr("Save prompt"),
+                             tr("Write a prompt first before saving it."));
+        return;
+    }
+    bool accepted = false;
+    const QString name = QInputDialog::getText(this, tr("Save prompt"),
+        tr("Name (an existing name overwrites/edits that saved prompt):"),
+        QLineEdit::Normal, combo->currentText(), &accepted).trimmed();
+    if (!accepted || name.isEmpty())
+    {
+        return;
+    }
+    m_savedPrompts->savePrompt(name, promptText);
+    _refreshSavedPromptCombos();
+    combo->setCurrentText(name);
+    const int idx = combo->findText(name);
+    if (idx >= 0)
+    {
+        combo->setCurrentIndex(idx);
+    }
 }
