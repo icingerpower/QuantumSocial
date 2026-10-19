@@ -9,7 +9,9 @@ namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
 
 class AbstractCli;
+class AvailableCliTable;
 class TreeProperties;
+class TableAccounts;
 class TableGenerationSettings;
 class TableVideos;
 class StatisticsScheduler;
@@ -31,6 +33,7 @@ private:
     Ui::MainWindow *ui;
     // Shared by the panes: one ground truth (videos + snapshots), one active
     // property tree, one archive tree, and the background snapshot fetcher.
+    TableAccounts *m_accounts;
     TableVideos *m_videos;
     TreeProperties *m_properties;
     TreeProperties *m_archive;
@@ -43,6 +46,7 @@ private:
     FavoriteHooks *m_favoriteHooks;
     FavoriteVideoPrompts *m_favoriteVideoPrompts;
     SavedPrompts *m_savedPrompts;
+    AvailableCliTable *m_availableCliTable;
     QList<AbstractCli *> m_availableClis;
 };
 #endif // MAINWINDOW_H

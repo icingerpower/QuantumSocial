@@ -1,34 +1,68 @@
 #ifndef PREFERREDHASHTAGS_H
 #define PREFERREDHASHTAGS_H
 
+#include <QAbstractTableModel>
+#include <QList>
 #include <QString>
 #include <QStringList>
 
 // The user's own curated hashtag list, persisted in the working directory
-// (preferred_hashtags.json, editable any time from the Settings pane).
+// (preferred_hashtags.json, editable any time from the Inspiration pane).
 // Exists because CLI-suggested hashtags are pure guesswork with no
 // engagement data behind them — once the user has hashtags they trust (or
 // specifically want to test), the hook-generation step in
 // PaneGeneration::_suggestPlan is told to pick from this list instead of
 // inventing new ones.
-class PreferredHashtags
+//
+// Displayed in a QTableView with columns:
+//   0 — Hashtag
+//   1 — Human / AI source
+class PreferredHashtags : public QAbstractTableModel
 {
-public:
-    explicit PreferredHashtags(const QString &workingDirectory);
+    Q_OBJECT
 
-    QStringList hashtags() const;
+public:
+    static const int IND_TAG{0};
+    static const int IND_SOURCE{1};
+    static const QString SOURCE_HUMAN;
+    static const QString SOURCE_AI;
+
+    explicit PreferredHashtags(const QString &workingDirectory, QObject *parent = nullptr);
+
+    // QAbstractTableModel interface
+    int rowCount(const QModelIndex &parent = QModelIndex()) const override;
+    int columnCount(const QModelIndex &parent = QModelIndex()) const override;
+    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
+    bool setData(const QModelIndex &index, const QVariant &value, int role = Qt::EditRole) override;
+    QVariant headerData(int section, Qt::Orientation orientation, int role = Qt::DisplayRole) const override;
+    Qt::ItemFlags flags(const QModelIndex &index) const override;
+    bool removeRows(int row, int count, const QModelIndex &parent = QModelIndex()) override;
+
+    QStringList hashtags(bool onlyHuman = false) const;
+    QString asPromptSection(bool onlyHuman = false) const;
     // Normalizes (ensures a leading '#', trims, case-insensitive dedupe,
     // drops empties) and persists immediately.
     void setHashtags(const QStringList &hashtags);
 
+    void addHashtag(const QString &tag, const QString &source = QStringLiteral("Human"));
+    void addRow(const QString &source = QStringLiteral("Human"));
+    void removeHashtag(int row);
+
     // Splits free-form text (newlines, spaces or commas as separators) into
-    // a plain list — used by both the Settings editor and the first-run
+    // a plain list — used by both the Inspiration editor and the first-run
     // setup prompt so typed input is parsed identically everywhere.
     static QStringList parse(const QString &freeformText);
 
 private:
+    struct Item
+    {
+        QString tag;
+        QString source;
+    };
+
+    static const QStringList HEADER;
     QString m_filePath;
-    QStringList m_hashtags;
+    QList<Item> m_items;
 
     void _loadFromFile();
     void _saveInFile() const;

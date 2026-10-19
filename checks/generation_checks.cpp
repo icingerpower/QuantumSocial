@@ -34,12 +34,17 @@
 #include "gui/DialogGenerationPlan.h"
 #include "gui/GenerationPlanSection.h"
 #include "gui/panes/PaneGeneration.h"
+#include "gui/panes/PaneInspiration.h"
+#include "gui/panes/PaneProperties.h"
+#include "AvailableCliTable.h"
 #include "model/FavoriteHooks.h"
 #include "model/FavoriteVideoPrompts.h"
 #include "model/PreferredHashtags.h"
 #include "model/PromptLessons.h"
 #include "model/SavedPrompts.h"
 #include "model/TableProjects.h"
+#include "model/TableAccounts.h"
+#include "model/accounts/AbstractSocialAccount.h"
 #include "model/properties/TreeProperties.h"
 #include "model/videogen/AbstractVideoGenerator.h"
 #include "model/videogen/TableGenerationSettings.h"
@@ -967,6 +972,389 @@ static void checkMultiVideoIdentity(PaneGeneration &pane, TableVideos &videos, c
     require(tree->topLevelItemCount() == 2, "published older result stays visible");
 }
 
+static void checkInspirationModelsAndPane(const QDir &parentRoot)
+{
+    QTemporaryDir tempInspiration;
+    require(tempInspiration.isValid(), "temporary inspiration working directory");
+    const QDir root(tempInspiration.path());
+    WorkingDirectoryManager::instance()->setWorkingDir(root);
+
+    // 1. Test PreferredHashtags table model, addRow, addHashtag, setData, removeRows, and persistence
+    {
+        PreferredHashtags hashtags(root.path());
+        hashtags.setHashtags({});
+        require(hashtags.rowCount() == 0, "hashtags starts empty");
+        require(hashtags.columnCount() == 2, "hashtags has 2 columns (tag, source)");
+
+        hashtags.addHashtag("#firstTag", PreferredHashtags::SOURCE_HUMAN);
+        hashtags.addHashtag("#secondTag", PreferredHashtags::SOURCE_AI);
+        require(hashtags.rowCount() == 2, "two hashtags added");
+        require(hashtags.data(hashtags.index(0, PreferredHashtags::IND_TAG)).toString() == "#firstTag", "tag 0 correct");
+        require(hashtags.data(hashtags.index(0, PreferredHashtags::IND_SOURCE)).toString() == PreferredHashtags::SOURCE_HUMAN, "source 0 is Human");
+        require(hashtags.data(hashtags.index(1, PreferredHashtags::IND_TAG)).toString() == "#secondTag", "tag 1 correct");
+        require(hashtags.data(hashtags.index(1, PreferredHashtags::IND_SOURCE)).toString() == PreferredHashtags::SOURCE_AI, "source 1 is AI");
+
+        // Verify onlyHuman filtering
+        require(hashtags.hashtags(false).size() == 2, "both hashtags returned when onlyHuman is false");
+        require(hashtags.hashtags(true).size() == 1, "only 1 hashtag returned when onlyHuman is true");
+        require(hashtags.hashtags(true).first() == "#firstTag", "human hashtag is #firstTag");
+        require(hashtags.asPromptSection(true).contains("#firstTag"), "human prompt section contains #firstTag");
+        require(!hashtags.asPromptSection(true).contains("#secondTag"), "human prompt section does not contain #secondTag");
+        require(hashtags.asPromptSection(false).contains("#secondTag"), "both prompt section contains #secondTag");
+
+        // Edit via setData
+        hashtags.setData(hashtags.index(0, PreferredHashtags::IND_SOURCE), PreferredHashtags::SOURCE_AI, Qt::EditRole);
+        require(hashtags.data(hashtags.index(0, PreferredHashtags::IND_SOURCE)).toString() == PreferredHashtags::SOURCE_AI, "source edited to AI");
+
+        // addRow
+        hashtags.addRow(PreferredHashtags::SOURCE_HUMAN);
+        require(hashtags.rowCount() == 3, "addRow creates row");
+
+        // Reload from disk to verify persistence
+        PreferredHashtags reloaded(root.path());
+        require(reloaded.rowCount() == 3, "reloaded has 3 items");
+        require(reloaded.data(reloaded.index(0, PreferredHashtags::IND_SOURCE)).toString() == PreferredHashtags::SOURCE_AI, "reloaded item 0 has AI source");
+
+        // removeRows
+        hashtags.removeRow(1);
+        require(hashtags.rowCount() == 2, "removed row 1");
+    }
+
+    // 2. Test FavoriteHooks table model, persistence, and asPromptSection
+    {
+        FavoriteHooks hooks(root.path());
+        hooks.setHooks({});
+        require(hooks.rowCount() == 0, "hooks starts empty");
+        require(hooks.columnCount() == 2, "hooks has 2 columns");
+
+        hooks.addHook("The heel that owns the room.", FavoriteHooks::SOURCE_HUMAN);
+        hooks.addHook("Step into power.", FavoriteHooks::SOURCE_AI);
+        require(hooks.rowCount() == 2, "two hooks added");
+        require(hooks.data(hooks.index(0, FavoriteHooks::IND_HOOK)).toString() == "The heel that owns the room.", "hook 0 text");
+        require(hooks.data(hooks.index(0, FavoriteHooks::IND_SOURCE)).toString() == FavoriteHooks::SOURCE_HUMAN, "hook 0 source");
+        require(hooks.data(hooks.index(1, FavoriteHooks::IND_SOURCE)).toString() == FavoriteHooks::SOURCE_AI, "hook 1 source");
+
+        // Verify clean hooks() list and onlyHuman filtering
+        const QStringList hookList = hooks.hooks();
+        require(hookList.size() == 2, "hookList size 2");
+        require(hookList[0] == "The heel that owns the room.", "hook 0 in list");
+        require(!hooks.asPromptSection().contains("[Human]"), "prompt section has no [Human] tag");
+        require(hooks.hooks(true).size() == 1, "only 1 hook returned when onlyHuman is true");
+        require(hooks.asPromptSection(true).contains("The heel that owns the room."), "human section contains human hook");
+        require(!hooks.asPromptSection(true).contains("Step into power."), "human section does not contain AI hook");
+        require(hooks.asPromptSection(false).contains("Step into power."), "both section contains AI hook");
+
+        // Reload from disk to verify markdown persistence with [Human]/[AI]
+        FavoriteHooks reloaded(root.path());
+        require(reloaded.rowCount() == 2, "reloaded hooks size 2");
+        require(reloaded.data(reloaded.index(1, FavoriteHooks::IND_SOURCE)).toString() == FavoriteHooks::SOURCE_AI, "reloaded hook 1 is AI");
+    }
+
+    // 3. Test FavoriteVideoPrompts table model and persistence
+    {
+        FavoriteVideoPrompts prompts(root.path());
+        prompts.setPrompts({});
+        require(prompts.rowCount() == 0, "prompts starts empty");
+        require(prompts.columnCount() == 2, "prompts has 2 columns");
+
+        prompts.addPrompt("Fast cut on the heels, vertical 9:16.", FavoriteVideoPrompts::SOURCE_HUMAN);
+        prompts.addPrompt("Dynamic zoom and beat sync.", FavoriteVideoPrompts::SOURCE_AI);
+        require(prompts.rowCount() == 2, "two prompts added");
+        require(prompts.data(prompts.index(0, FavoriteVideoPrompts::IND_SOURCE)).toString() == FavoriteVideoPrompts::SOURCE_HUMAN, "prompt 0 source");
+        require(prompts.data(prompts.index(1, FavoriteVideoPrompts::IND_SOURCE)).toString() == FavoriteVideoPrompts::SOURCE_AI, "prompt 1 source");
+
+        // Verify onlyHuman filtering
+        require(prompts.prompts(false).size() == 2, "both prompts returned");
+        require(prompts.prompts(true).size() == 1, "only 1 prompt returned when onlyHuman is true");
+        require(prompts.asPromptSection(true).contains("Fast cut on the heels, vertical 9:16."), "human section contains human prompt");
+        require(!prompts.asPromptSection(true).contains("Dynamic zoom and beat sync."), "human section does not contain AI prompt");
+        require(prompts.asPromptSection(false).contains("Dynamic zoom and beat sync."), "both section contains AI prompt");
+
+        // Reload from disk
+        FavoriteVideoPrompts reloaded(root.path());
+        require(reloaded.rowCount() == 2, "reloaded prompts size 2");
+        require(reloaded.data(reloaded.index(1, FavoriteVideoPrompts::IND_SOURCE)).toString() == FavoriteVideoPrompts::SOURCE_AI, "reloaded prompt 1 is AI");
+    }
+
+    // 4. Test PaneInspiration setup, spin boxes, only-human checkboxes, and settings persistence
+    {
+        PreferredHashtags hashtags(root.path());
+        FavoriteHooks hooks(root.path());
+        FavoriteVideoPrompts prompts(root.path());
+        AvailableCliTable cliTable;
+        {
+            PaneInspiration pane(&hashtags, &hooks, &prompts, &cliTable);
+            auto *tabWidget = pane.findChild<QTabWidget *>("tabWidgetInspiration");
+            require(tabWidget != nullptr, "PaneInspiration has tabWidgetInspiration");
+            require(tabWidget->count() == 3, "PaneInspiration has 3 tabs");
+            require(pane.findChild<QTableView *>("tableViewHashtags") != nullptr, "has tableViewHashtags");
+            require(pane.findChild<QTableView *>("tableViewHooks") != nullptr, "has tableViewHooks");
+            require(pane.findChild<QTableView *>("tableViewPrompts") != nullptr, "has tableViewPrompts");
+            require(pane.findChild<QComboBox *>("comboCliHashtag") != nullptr, "has comboCliHashtag");
+            require(pane.findChild<QPlainTextEdit *>("editPromptHashtag") != nullptr, "has editPromptHashtag");
+            require(!pane.findChild<QPlainTextEdit *>("editPromptHashtag")->toPlainText().isEmpty(), "editPromptHashtag prefilled with default prompt");
+
+            // Verify spin boxes default to 10
+            auto *spinHashtag = pane.findChild<QSpinBox *>("spinCountHashtag");
+            require(spinHashtag != nullptr, "has spinCountHashtag");
+            require(spinHashtag->value() == 10, "spinCountHashtag defaults to 10");
+
+            auto *spinHook = pane.findChild<QSpinBox *>("spinCountHook");
+            require(spinHook != nullptr, "has spinCountHook");
+            require(spinHook->value() == 10, "spinCountHook defaults to 10");
+
+            auto *spinPrompt = pane.findChild<QSpinBox *>("spinCountPrompt");
+            require(spinPrompt != nullptr, "has spinCountPrompt");
+            require(spinPrompt->value() == 10, "spinCountPrompt defaults to 10");
+
+            // Verify onlyHuman checkboxes default to unchecked (both human and AI)
+            auto *checkHashtag = pane.findChild<QCheckBox *>("checkOnlyHumanHashtag");
+            require(checkHashtag != nullptr, "has checkOnlyHumanHashtag");
+            require(!checkHashtag->isChecked(), "checkOnlyHumanHashtag defaults to unchecked");
+
+            auto *checkHook = pane.findChild<QCheckBox *>("checkOnlyHumanHook");
+            require(checkHook != nullptr, "has checkOnlyHumanHook");
+            require(!checkHook->isChecked(), "checkOnlyHumanHook defaults to unchecked");
+
+            auto *checkPrompt = pane.findChild<QCheckBox *>("checkOnlyHumanPrompt");
+            require(checkPrompt != nullptr, "has checkOnlyHumanPrompt");
+            require(!checkPrompt->isChecked(), "checkOnlyHumanPrompt defaults to unchecked");
+
+            // Change spin box and checkbox values to test persistence to working directory settings
+            spinHashtag->setValue(15);
+            spinHook->setValue(7);
+            spinPrompt->setValue(20);
+            checkHashtag->setChecked(true);
+            checkPrompt->setChecked(true);
+
+            // Change prompt text to test persistence to working directory settings
+            auto *editPromptHashtag = pane.findChild<QPlainTextEdit *>("editPromptHashtag");
+            auto *editPromptHook = pane.findChild<QPlainTextEdit *>("editPromptHook");
+            auto *editPromptPrompt = pane.findChild<QPlainTextEdit *>("editPromptPrompt");
+            require(editPromptHashtag != nullptr, "has editPromptHashtag");
+            require(editPromptHook != nullptr, "has editPromptHook");
+            require(editPromptPrompt != nullptr, "has editPromptPrompt");
+
+            editPromptHashtag->setPlainText("Custom hashtag prompt for testing");
+            editPromptHook->setPlainText("Custom hook prompt for testing");
+            editPromptPrompt->setPlainText("Custom video prompt for testing");
+        }
+
+        // Verify values were persisted in working directory settings
+        auto settings = WorkingDirectoryManager::instance()->settings();
+        require(settings->value("Inspiration/HashtagsCount").toInt() == 15, "HashtagsCount persisted as 15");
+        require(settings->value("Inspiration/HooksCount").toInt() == 7, "HooksCount persisted as 7");
+        require(settings->value("Inspiration/PromptsCount").toInt() == 20, "PromptsCount persisted as 20");
+        require(settings->value("Inspiration/HashtagsOnlyHuman").toBool() == true, "HashtagsOnlyHuman persisted as true");
+        require(settings->value("Inspiration/HooksOnlyHuman").toBool() == false, "HooksOnlyHuman persisted as false");
+        require(settings->value("Inspiration/PromptsOnlyHuman").toBool() == true, "PromptsOnlyHuman persisted as true");
+        require(settings->value("Inspiration/HashtagsPrompt").toString() == "Custom hashtag prompt for testing", "HashtagsPrompt persisted");
+        require(settings->value("Inspiration/HooksPrompt").toString() == "Custom hook prompt for testing", "HooksPrompt persisted");
+        require(settings->value("Inspiration/PromptsPrompt").toString() == "Custom video prompt for testing", "PromptsPrompt persisted");
+
+        // Open a new PaneInspiration and verify restored values
+        {
+            PaneInspiration paneRestored(&hashtags, &hooks, &prompts, &cliTable);
+            require(paneRestored.findChild<QSpinBox *>("spinCountHashtag")->value() == 15, "restored spinCountHashtag is 15");
+            require(paneRestored.findChild<QSpinBox *>("spinCountHook")->value() == 7, "restored spinCountHook is 7");
+            require(paneRestored.findChild<QSpinBox *>("spinCountPrompt")->value() == 20, "restored spinCountPrompt is 20");
+            require(paneRestored.findChild<QCheckBox *>("checkOnlyHumanHashtag")->isChecked() == true, "restored checkOnlyHumanHashtag is checked");
+            require(paneRestored.findChild<QCheckBox *>("checkOnlyHumanHook")->isChecked() == false, "restored checkOnlyHumanHook is unchecked");
+            require(paneRestored.findChild<QCheckBox *>("checkOnlyHumanPrompt")->isChecked() == true, "restored checkOnlyHumanPrompt is checked");
+            require(paneRestored.findChild<QPlainTextEdit *>("editPromptHashtag")->toPlainText() == "Custom hashtag prompt for testing", "restored editPromptHashtag");
+            require(paneRestored.findChild<QPlainTextEdit *>("editPromptHook")->toPlainText() == "Custom hook prompt for testing", "restored editPromptHook");
+            require(paneRestored.findChild<QPlainTextEdit *>("editPromptPrompt")->toPlainText() == "Custom video prompt for testing", "restored editPromptPrompt");
+        }
+    }
+
+    // Restore working directory to parentRoot
+    WorkingDirectoryManager::instance()->setWorkingDir(parentRoot);
+}
+
+class FakeSocialAccount : public AbstractSocialAccount
+{
+public:
+    mutable AccountVideosResult nextAccountVideosResult;
+    mutable VideoStatistics nextVideoResult;
+
+    QString getId() const override { return QStringLiteral("test-social"); }
+    QString getName() const override { return QStringLiteral("TestSocial"); }
+
+    QCoro::Task<Statistics> fetchStatistics(const QString &) const override
+    {
+        Statistics r;
+        r.followers = nextAccountVideosResult.followers;
+        r.views = nextAccountVideosResult.views;
+        r.likes = nextAccountVideosResult.likes;
+        co_return r;
+    }
+
+    QSet<StatSource> supportedVideoStatSources() const override
+    {
+        return {StatSource::PublicView};
+    }
+
+    QCoro::Task<VideoStatistics> fetchVideoStatistics(const QString &, StatSource) const override
+    {
+        co_await QCoro::sleepFor(std::chrono::milliseconds(5));
+        co_return nextVideoResult;
+    }
+
+    bool supportsAccountVideoStatistics() const override
+    {
+        return true;
+    }
+
+    QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(const QString &) const override
+    {
+        co_await QCoro::sleepFor(std::chrono::milliseconds(5));
+        co_return nextAccountVideosResult;
+    }
+};
+
+static void checkPropertyRetrieveStatistics(const QDir &root)
+{
+    // 1. Short code extraction
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("Check out these heels! #fashion #qs0001 #style"))
+            == QStringLiteral("QS-0001"), "extract #qs0001");
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("Caption with #QS0042 uppercase"))
+            == QStringLiteral("QS-0042"), "extract #QS0042");
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("Direct QS-0007 code"))
+            == QStringLiteral("QS-0007"), "extract QS-0007");
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("No short code here #fashion")).isEmpty(),
+            "empty when no short code");
+
+    // 2. Built-in accounts registered via Recorder: only TikTok supports account video statistics
+    const auto &allSocial = AbstractSocialAccount::ALL_SOCIAL_ACCOUNTS();
+    require(allSocial.contains(QStringLiteral("tiktok")), "tiktok registered");
+    require(allSocial.contains(QStringLiteral("pinterest")), "pinterest registered");
+    require(allSocial.contains(QStringLiteral("youtube")), "youtube registered");
+    require(allSocial.contains(QStringLiteral("instagram")), "instagram registered");
+    require(allSocial.value(QStringLiteral("tiktok"))->supportsAccountVideoStatistics(),
+            "tiktok supports account video statistics");
+    require(!allSocial.value(QStringLiteral("pinterest"))->supportsAccountVideoStatistics(),
+            "pinterest does not support account video statistics yet");
+    require(!allSocial.value(QStringLiteral("youtube"))->supportsAccountVideoStatistics(),
+            "youtube does not support account video statistics yet");
+    require(!allSocial.value(QStringLiteral("instagram"))->supportsAccountVideoStatistics(),
+            "instagram does not support account video statistics yet");
+
+    // 3. Test PaneProperties "Retrieve statistics" flow
+    FakeSocialAccount fakeSocial;
+    AbstractSocialAccount::Recorder socialReg(&fakeSocial);
+
+    QTemporaryDir statDir;
+    require(statDir.isValid(), "statDir valid");
+    const QDir dir(statDir.path());
+
+    TableAccounts accounts(dir.path());
+    TableVideos videos(dir.path());
+    TreeProperties props(dir.filePath("props_stats.json"));
+    TreeProperties arch(dir.filePath("arch_stats.json"));
+    props.setVideosModel(&videos);
+    arch.setVideosModel(&videos);
+
+    const QModelIndex propIdx = props.addProperty(QStringLiteral("Camera Angle"));
+    const QModelIndex valIdx = props.addValue(propIdx, QStringLiteral("Low Angle"),
+                                              QStringLiteral("shot from a dramatic low angle"));
+    const QUuid valUuid = valIdx.data(TreeProperties::RoleId).toUuid();
+
+    const QUuid videoId = videos.addVideo({valUuid}, {}, QStringLiteral("original"));
+    const QString shortCode = videos.recordFromId(videoId)->shortCode; // e.g. "QS-0001"
+    const QString codeHashtag = QStringLiteral("#qs") + shortCode.mid(3); // e.g. "#qs0001"
+
+    // Register a supported account and an unsupported account (Instagram) in TableAccounts
+    accounts.addAccount();
+    accounts.setData(accounts.index(0, TableAccounts::IND_TYPE), QStringLiteral("TestSocial"));
+    accounts.setData(accounts.index(0, TableAccounts::IND_URL), QStringLiteral("https://example.com/@brand"));
+    accounts.addAccount();
+    accounts.setData(accounts.index(1, TableAccounts::IND_TYPE), QStringLiteral("Instagram"));
+    accounts.setData(accounts.index(1, TableAccounts::IND_URL), QStringLiteral("https://instagram.com/brand"));
+
+    // Prepare fake social response
+    fakeSocial.nextAccountVideosResult.followers = 1000;
+    fakeSocial.nextAccountVideosResult.views = 500;
+    fakeSocial.nextAccountVideosResult.likes = 50;
+    AbstractSocialAccount::AccountPostStatistics post;
+    post.postUrl = QStringLiteral("https://example.com/@brand/video/12345");
+    post.caption = QStringLiteral("Walking with confidence ") + codeHashtag + QStringLiteral(" #heels");
+    post.stats.views = 500;
+    post.stats.likes = 50;
+    post.stats.comments = 10;
+    post.stats.shares = 20;
+    post.publishDate = QDateTime::currentDateTimeUtc().addDays(-2);
+    fakeSocial.nextAccountVideosResult.posts = {post};
+
+    PaneProperties paneProps(&props, &arch, &videos, &accounts);
+    auto *btnRetrieve = paneProps.findChild<QPushButton *>(QStringLiteral("buttonRetrieveStatistics"));
+    require(btnRetrieve != nullptr, "buttonRetrieveStatistics exists in PaneProperties");
+    require(btnRetrieve->text() == QStringLiteral("Retrieve statistics"), "button label is Retrieve statistics");
+
+    bool sawNotSupportedDialog = false;
+    QTimer dialogWatcher;
+    QObject::connect(&dialogWatcher, &QTimer::timeout, [&]() {
+        for (QWidget *w : QApplication::topLevelWidgets())
+        {
+            if (auto *dlg = qobject_cast<QDialog *>(w))
+            {
+                if (dlg->isVisible() && dlg->windowTitle() == QStringLiteral("Not supported yet"))
+                {
+                    sawNotSupportedDialog = true;
+                    dlg->accept();
+                }
+            }
+        }
+    });
+    dialogWatcher.start(10);
+
+    btnRetrieve->click();
+    QElapsedTimer timer;
+    timer.start();
+    while ((!paneProps.isEnabled() || !sawNotSupportedDialog) && timer.elapsed() < 5000)
+    {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+    dialogWatcher.stop();
+    require(paneProps.isEnabled(), "Retrieve statistics finished");
+    require(sawNotSupportedDialog, "Not supported yet QDialog shown for non-TikTok social account");
+    QApplication::processEvents();
+
+    // Verify account stats updated
+    require(accounts.data(accounts.index(0, TableAccounts::IND_FOLLOWERS)).toLongLong() == 1000,
+            "account followers updated to 1000");
+    require(accounts.data(accounts.index(0, TableAccounts::IND_VIEW)).toLongLong() == 500,
+            "account views updated to 500");
+    require(accounts.data(accounts.index(0, TableAccounts::IND_LIKES)).toLongLong() == 50,
+            "account likes updated to 50");
+
+    // Verify video matched and publication recorded
+    const auto *videoRec = videos.recordFromId(videoId);
+    require(videoRec != nullptr && videoRec->published, "video marked published");
+    require(videoRec->publications.size() == 1, "1 publication attached to video");
+    require(videoRec->publications[0].postUrl == post.postUrl, "publication URL matches");
+    require(!videoRec->publications[0].snapshots.isEmpty(), "snapshot recorded on publication");
+
+    // Verify TreeProperties columns
+    const QModelIndex rowParent = propIdx;
+    const int valRow = valIdx.row();
+    require(props.data(props.index(valRow, TreeProperties::IND_VIDEO_COUNT, rowParent)).toInt() == 1,
+            "IND_VIDEO_COUNT is 1");
+    require(props.data(props.index(valRow, TreeProperties::IND_VIEWS, rowParent)).toLongLong() == 500,
+            "IND_VIEWS is 500");
+    require(props.data(props.index(valRow, TreeProperties::IND_LIKES, rowParent)).toLongLong() == 50,
+            "IND_LIKES is 50");
+    require(props.data(props.index(valRow, TreeProperties::IND_COMMENTS, rowParent)).toLongLong() == 10,
+            "IND_COMMENTS is 10");
+    require(props.data(props.index(valRow, TreeProperties::IND_SHARES, rowParent)).toLongLong() == 20,
+            "IND_SHARES is 20");
+    require(props.data(props.index(valRow, TreeProperties::IND_NORM_VIEWS, rowParent)).toString() == QStringLiteral("0.50"),
+            "IND_NORM_VIEWS is 0.50 (500 / 1000)");
+    require(props.data(props.index(valRow, TreeProperties::IND_ENGAGEMENT, rowParent)).toString() == QStringLiteral("16.0 %"),
+            "IND_ENGAGEMENT is 16.0 % ((50+10+20)/500)");
+    Q_UNUSED(root);
+}
+
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
@@ -983,6 +1371,7 @@ int main(int argc, char **argv)
         FakeGenerator generator;
         AbstractVideoGenerator::Recorder registration(&generator);
         checkRecipes(root);
+        checkPropertyRetrieveStatistics(root);
         TreeProperties properties(root.filePath("properties.json"));
         TreeProperties archive(root.filePath("archive.json"));
         TableVideos videos(root.path());
@@ -997,6 +1386,7 @@ int main(int argc, char **argv)
         checkMultiVideoPropertySelection(properties, videos, saved);
         checkExtraPromptPhrase();
         checkDialogHooksPickQuote(root);
+        checkInspirationModelsAndPane(root);
 
         TableProjects projects(root.path());
         const int row = projects.addProject({}, {}, "Test project", {});

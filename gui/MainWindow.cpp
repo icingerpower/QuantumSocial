@@ -2,6 +2,7 @@
 #include "./ui_MainWindow.h"
 #include "panes/PaneAccounts.h"
 #include "panes/PaneGeneration.h"
+#include "panes/PaneInspiration.h"
 #include "panes/PaneProperties.h"
 #include "panes/PaneSettings.h"
 #include "panes/PaneStatistics.h"
@@ -10,6 +11,7 @@
 #include <QStandardPaths>
 
 #include "AbstractCli.h"
+#include "AvailableCliTable.h"
 
 #include "../../common/workingdirectory/WorkingDirectoryManager.h"
 
@@ -18,6 +20,7 @@
 #include "model/PreferredHashtags.h"
 #include "model/PromptLessons.h"
 #include "model/SavedPrompts.h"
+#include "model/TableAccounts.h"
 #include "model/properties/TreeProperties.h"
 #include "model/videogen/TableGenerationSettings.h"
 #include "model/videos/StatisticsScheduler.h"
@@ -26,10 +29,12 @@
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
+    , m_availableCliTable(new AvailableCliTable(this))
 {
     ui->setupUi(this);
 
     const QDir workingDir{WorkingDirectoryManager::instance()->workingDir().absolutePath()};
+    m_accounts = new TableAccounts(workingDir.absolutePath(), this);
     m_videos = new TableVideos(workingDir.absolutePath(), this);
     m_properties = new TreeProperties(workingDir.absoluteFilePath(
         QStringLiteral("properties.json")), this);
@@ -55,10 +60,10 @@ MainWindow::MainWindow(QWidget *parent)
 
     m_scheduler = new StatisticsScheduler(m_videos, this);
     m_generationSettings = new TableGenerationSettings(workingDir.absolutePath(), this);
-    m_hashtags = new PreferredHashtags(workingDir.absolutePath());
+    m_hashtags = new PreferredHashtags(workingDir.absolutePath(), this);
     m_promptLessons = new PromptLessons(workingDir.absolutePath());
-    m_favoriteHooks = new FavoriteHooks(workingDir.absolutePath());
-    m_favoriteVideoPrompts = new FavoriteVideoPrompts(workingDir.absolutePath());
+    m_favoriteHooks = new FavoriteHooks(workingDir.absolutePath(), this);
+    m_favoriteVideoPrompts = new FavoriteVideoPrompts(workingDir.absolutePath(), this);
     m_savedPrompts = new SavedPrompts(workingDir.absolutePath());
 
     // Synchronous PATH-based CLI availability check (same approach as
@@ -83,18 +88,21 @@ MainWindow::MainWindow(QWidget *parent)
         }
     }
 
-    ui->tabWidget->addTab(new PaneAccounts(this), tr("Accounts"));
+    ui->tabWidget->addTab(new PaneAccounts(m_accounts, this), tr("Accounts"));
+    ui->tabWidget->addTab(new PaneInspiration(m_hashtags, m_favoriteHooks,
+                                              m_favoriteVideoPrompts,
+                                              m_availableCliTable, this),
+                          tr("Inspiration"));
     auto *paneGeneration = new PaneGeneration(m_properties, m_archive, m_videos,
                                               m_generationSettings, m_hashtags,
                                               m_promptLessons, m_favoriteHooks,
                                               m_favoriteVideoPrompts, m_savedPrompts, this);
     paneGeneration->setAvailableClis(m_availableClis);
     ui->tabWidget->addTab(paneGeneration, tr("Generation"));
-    ui->tabWidget->addTab(new PaneProperties(m_properties, m_archive, this),
+    ui->tabWidget->addTab(new PaneProperties(m_properties, m_archive, m_videos, m_accounts, this),
                           tr("Properties"));
     ui->tabWidget->addTab(new PaneStatistics(m_videos, m_scheduler, this), tr("Statistics"));
-    ui->tabWidget->addTab(new PaneSettings(m_generationSettings, m_hashtags,
-                                          m_favoriteHooks, m_favoriteVideoPrompts,
+    ui->tabWidget->addTab(new PaneSettings(m_generationSettings, m_availableCliTable,
                                           this),
                           tr("Settings"));
 }
@@ -102,9 +110,6 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow()
 {
     delete ui;
-    delete m_hashtags;
     delete m_promptLessons;
-    delete m_favoriteHooks;
-    delete m_favoriteVideoPrompts;
     delete m_savedPrompts;
 }
