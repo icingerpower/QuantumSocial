@@ -20,6 +20,7 @@
 
 #include "../DialogGenerationOptions.h"
 #include "model/videogen/AbstractMultiVideoWorkflow.h"
+#include "model/videos/TableVideos.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class PaneGeneration; }
@@ -41,7 +42,6 @@ class QStandardItemModel;
 class TreeProperties;
 class TableGenerationSettings;
 class TableProjects;
-class TableVideos;
 class PreferredHashtags;
 class PromptLessons;
 class FavoriteHooks;
@@ -87,6 +87,25 @@ public:
     // The image-step CLI is chosen separately in DialogGenerationOptions.
     void setAvailableClis(const QList<AbstractCli *> &clis);
 
+    struct GenerationPromptEntry
+    {
+        QString label;
+        QString prompt;
+    };
+
+    enum GenerationItemRole
+    {
+        RoleRecordId = Qt::UserRole,
+        RoleIsPromptItem = Qt::UserRole + 1,
+        RolePromptText = Qt::UserRole + 2,
+        RolePromptLabel = Qt::UserRole + 3,
+    };
+
+    QList<GenerationPromptEntry> generationPromptEntries(
+        int row, const TableVideos::VideoRecord *record) const;
+
+    static QString appendExtraPromptPhrase(const QString &basePrompt, const QString &extraPhrase);
+
 private slots:
     void _addProject();
     void _removeProject();
@@ -96,6 +115,9 @@ private slots:
     // treeViewGenerations (or the project's latest one) — copy-paste at any
     // time later.
     void _openHooksDialog();
+    // Context menu and prompt copying for past generations in treeViewGenerations
+    void _generationsContextMenu(const QPoint &position);
+    void _copySelectedGenerationPrompt();
     // Manage the A/B property catalog (add property/value, archive, delete)
     // from the properties tree.
     void _propertiesContextMenu(const QPoint &position);

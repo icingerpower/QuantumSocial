@@ -17,3 +17,16 @@ int DialogGenerateAgain::generationCount() const
 {
     return ui->spinCount->value();
 }
+
+QString DialogGenerateAgain::extraPrompt() const
+{
+    return ui->lineEditExtraPrompt ? ui->lineEditExtraPrompt->text().trimmed() : QString{};
+}
+
+void DialogGenerateAgain::setExtraPrompt(const QString &extra)
+{
+    if (ui->lineEditExtraPrompt)
+    {
+        ui->lineEditExtraPrompt->setText(extra);
+    }
+}

@@ -9,6 +9,7 @@
 #include <algorithm>
 
 #include <QAudioOutput>
+#include <QClipboard>
 #include <QColor>
 #include <QDataWidgetMapper>
 #include <QDateTime>
@@ -18,6 +19,7 @@
 #include <QFileInfo>
 #include <QFileDialog>
 #include <QFileSystemModel>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -29,6 +31,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSettings>
+#include <QShortcut>
 #include <QStackedWidget>
 #include <QStandardItemModel>
 #include <QTextEdit>
@@ -358,10 +361,30 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
     ui->treeViewGenerations->setColumnWidth(0, 90);
     ui->treeViewGenerations->setColumnWidth(1, 100);
     ui->treeViewGenerations->header()->setStretchLastSection(true);
+    ui->treeViewGenerations->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(ui->treeViewGenerations, &QWidget::customContextMenuRequested,
+            this, &PaneGeneration::_generationsContextMenu);
+
+    auto *copyShortcut = new QShortcut(QKeySequence::Copy, ui->treeViewGenerations);
+    connect(copyShortcut, &QShortcut::activated,
+            this, &PaneGeneration::_copySelectedGenerationPrompt);
+
     connect(ui->treeViewGenerations, &QTreeWidget::currentItemChanged,
             this, &PaneGeneration::_onGenerationSelected);
     connect(ui->treeViewGenerations, &QTreeWidget::itemDoubleClicked,
-            this, [this](QTreeWidgetItem *, int) { _openHooksDialog(); });
+            this, [this](QTreeWidgetItem *item, int) {
+        if (item && item->data(0, RoleIsPromptItem).toBool())
+        {
+            const QString promptText = item->data(0, RolePromptText).toString();
+            if (!promptText.isEmpty())
+            {
+                QGuiApplication::clipboard()->setText(promptText);
+                _logProgress(tr("Copied prompt to clipboard."));
+                return;
+            }
+        }
+        _openHooksDialog();
+    });
 
     // Generated content of the selected project: its folder (live — files
     // appear as soon as generation writes them). The 10 suggestions
@@ -395,6 +418,12 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
             this, &PaneGeneration::_favoriteCurrentVideoPrompt);
     connect(ui->buttonGenerateAgain, &QPushButton::clicked,
             this, &PaneGeneration::_generateAgain);
+    connect(ui->lineEditExtraPrompt, &QLineEdit::returnPressed, this, [this]() {
+        if (ui->buttonGenerateAgain->isEnabled())
+        {
+            ui->buttonGenerateAgain->click();
+        }
+    });
 
     m_stackedPreview = new QStackedWidget{ui->widgetPreview};
     m_labelPreviewEmpty = new QLabel{tr("Select a generation to preview its content."),
@@ -534,7 +563,7 @@ void PaneGeneration::_addProject()
 
 void PaneGeneration::_addMultiVideoProject()
 {
-    DialogMultiVideoGeneration dialog{m_availableClis, this};
+    DialogMultiVideoGeneration dialog{m_availableClis, m_savedPrompts, m_properties, m_videos, this};
     if (dialog.exec() != QDialog::Accepted)
     {
         return;
@@ -569,10 +598,9 @@ void PaneGeneration::_addMultiVideoProject()
     workflow->saveToFile(manifestPath);
 
     const QVariantMap settings = m_generationSettings->settingsFor(dialog.generatorId());
+    _startMultiVideoGeneration(row, projectId, workflow);
     workflow->start(projPath, genPath, dialog.generatorId(), settings,
                     dialog.decisionCli(), dialog.imageCli(), dialog.videoFormatLabel());
-
-    _startMultiVideoGeneration(row, projectId, workflow);
 }
 
 void PaneGeneration::_resumeMultiVideoGeneration()
@@ -662,10 +690,9 @@ void PaneGeneration::_resumeMultiVideoGeneration()
         : QStringLiteral("gemini-browser");
     const QVariantMap settings = m_generationSettings->settingsFor(genId);
 
+    _startMultiVideoGeneration(row, projectId, workflow);
     workflow->start(projDir.absolutePath(), genPath, genId, settings,
                     _promptCli(), _imageCli(), QStringLiteral("vertical (9:16)"));
-
-    _startMultiVideoGeneration(row, projectId, workflow);
 }
 
 void PaneGeneration::_resetStepClicked()
@@ -868,10 +895,9 @@ void PaneGeneration::_regenerateMultiVideoStep(int row, const QUuid &projectId,
         : QStringLiteral("gemini-browser");
     const QVariantMap settings = m_generationSettings->settingsFor(genId);
 
+    _startMultiVideoGeneration(row, projectId, workflow);
     workflow->start(projDir.absolutePath(), genPath, genId, settings,
                     _promptCli(), _imageCli(), QStringLiteral("vertical (9:16)"));
-
-    _startMultiVideoGeneration(row, projectId, workflow);
 }
 
 void PaneGeneration::_updateResumeButtonState(int row)
@@ -1033,7 +1059,7 @@ void PaneGeneration::_startMultiVideoGeneration(
                 .arg(videoPaths.size()));
             _updateResumeButtonState(row);
 
-            // At completion, prompt take selection for any multi-take steps that haven't been picked yet (e.g. Step 2, Step 3)
+            // Review the final step (and any unselected takes in older projects).
             for (int sIdx = 1; sIdx < workflow->steps().size(); ++sIdx)
             {
                 const auto &st = workflow->steps().at(sIdx);
@@ -1094,6 +1120,11 @@ bool PaneGeneration::_promptIntroSelection(ProductShowcaseMultiVideoWorkflow *wo
     {
         if (dlg.isRegenerateRequested())
         {
+            if (!dlg.extraPrompt().isEmpty() && !workflow->steps().isEmpty())
+            {
+                auto &st = workflow->steps()[0];
+                st.prompt = appendExtraPromptPhrase(st.prompt, dlg.extraPrompt());
+            }
             _logProgress(tr("Generating %1 more take(s) for Step 1 (Intro)...").arg(dlg.regenerateCount()));
             _regenerateMultiVideoStep(row, m_projects->projectId(row), workflow, 0, dlg.regenerateCount(), false);
             return false;
@@ -1108,6 +1139,8 @@ bool PaneGeneration::_promptIntroSelection(ProductShowcaseMultiVideoWorkflow *wo
         const int chosenIndex = dlg.selectedTakeIndex();
         _logProgress(tr("Selected intro take %1 as base for subsequent steps.")
             .arg(chosenIndex + 1));
+        if (workflow->state() == AbstractMultiVideoWorkflow::State::Paused
+            && workflow->completedVideoCount() < workflow->totalVideoCount()) _openProgress();
         workflow->selectIntroTake(chosenIndex);
         _updateResumeButtonState(row);
         return true;
@@ -1141,6 +1174,11 @@ bool PaneGeneration::_promptTakeSelection(ProductShowcaseMultiVideoWorkflow *wor
     {
         if (dlg.isRegenerateRequested())
         {
+            if (!dlg.extraPrompt().isEmpty() && stepIndex >= 0 && stepIndex < workflow->steps().size())
+            {
+                auto &st = workflow->steps()[stepIndex];
+                st.prompt = appendExtraPromptPhrase(st.prompt, dlg.extraPrompt());
+            }
             _logProgress(tr("Generating %1 more take(s) for %2...")
                 .arg(dlg.regenerateCount())
                 .arg(stepTitle.isEmpty() ? tr("Step %1").arg(stepIndex + 1) : stepTitle));
@@ -1159,6 +1197,8 @@ bool PaneGeneration::_promptTakeSelection(ProductShowcaseMultiVideoWorkflow *wor
         _logProgress(tr("Selected take %1 for %2.")
             .arg(chosenIndex + 1)
             .arg(stepTitle.isEmpty() ? tr("Step %1").arg(stepIndex + 1) : stepTitle));
+        if (workflow->state() == AbstractMultiVideoWorkflow::State::Paused
+            && workflow->completedVideoCount() < workflow->totalVideoCount()) _openProgress();
         workflow->selectTake(stepIndex, chosenIndex);
         _updateResumeButtonState(row);
         return true;
@@ -1232,6 +1272,7 @@ void PaneGeneration::_currentProjectChanged(const QModelIndex &current)
         m_currentPreviewVideoPrompt.clear();
         m_buttonFavoriteVideoPrompt->setEnabled(false);
         ui->buttonGenerateAgain->setEnabled(false);
+        ui->lineEditExtraPrompt->setEnabled(false);
         ui->buttonPublish->setEnabled(false);
         ui->buttonPublish->setText(tr("Mark published"));
         ui->buttonPublish->setToolTip(tr("Mark this video as published"));
@@ -2857,9 +2898,24 @@ void PaneGeneration::_refreshGenerationsView(int row)
         {
             _applyGenerationPublishedStyle(topItem, true);
         }
+        const auto promptEntries = generationPromptEntries(row, record);
+        for (const auto &entry : promptEntries)
+        {
+            auto *promptItem = new QTreeWidgetItem{topItem};
+            const QString displayText = QStringLiteral("%1: %2").arg(entry.label, entry.prompt);
+            promptItem->setText(0, displayText);
+            promptItem->setToolTip(0, displayText);
+            promptItem->setData(0, RoleIsPromptItem, true);
+            promptItem->setData(0, RolePromptText, entry.prompt);
+            promptItem->setData(0, RolePromptLabel, entry.label);
+            promptItem->setFirstColumnSpanned(true);
+        }
         for (const QUuid &valueId : record->propertyValueIds)
         {
-            new QTreeWidgetItem{topItem, {resolveLabel(valueId)}};
+            const QString propLabel = resolveLabel(valueId);
+            auto *propItem = new QTreeWidgetItem{topItem, {propLabel}};
+            propItem->setToolTip(0, propLabel);
+            propItem->setFirstColumnSpanned(true);
         }
     }
     ui->treeViewGenerations->expandAll();
@@ -2887,6 +2943,7 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
         m_currentPreviewVideoPrompt.clear();
         m_buttonFavoriteVideoPrompt->setEnabled(false);
         ui->buttonGenerateAgain->setEnabled(false);
+        ui->lineEditExtraPrompt->setEnabled(false);
         ui->buttonPublish->setEnabled(false);
         ui->buttonPublish->setText(tr("Mark published"));
         ui->buttonPublish->setToolTip(tr("Mark this video as published"));
@@ -2907,20 +2964,33 @@ void PaneGeneration::_onGenerationSelected(QTreeWidgetItem *current, QTreeWidget
     }
     QString hook, description;
     readHookDescriptionFile(genDir, &hook, &description);
-    // The generation's prompt (video only — image prompts aren't persisted
-    // the same way) lives in its temp/ folder as generation_prompt.txt,
-    // written by AbstractVideoGenerator::runGeneratorScript for whichever
-    // attempt actually succeeded.
-    const QString promptPath = m_projects->generationTempDir(row, record->shortCode)
-        .absoluteFilePath(QStringLiteral("generation_prompt.txt"));
-    QFile promptFile{promptPath};
     m_currentPreviewVideoPrompt.clear();
-    if (promptFile.open(QFile::ReadOnly))
+    if (current && current->parent() && current->data(0, RoleIsPromptItem).toBool())
     {
-        m_currentPreviewVideoPrompt = QString::fromUtf8(promptFile.readAll()).trimmed();
+        m_currentPreviewVideoPrompt = current->data(0, RolePromptText).toString();
     }
-    m_buttonFavoriteVideoPrompt->setEnabled(!m_currentPreviewVideoPrompt.isEmpty());
-    ui->buttonGenerateAgain->setEnabled(!m_currentPreviewVideoPrompt.isEmpty());
+    if (m_currentPreviewVideoPrompt.isEmpty())
+    {
+        const auto promptEntries = generationPromptEntries(row, record);
+        if (!promptEntries.isEmpty())
+        {
+            m_currentPreviewVideoPrompt = promptEntries.first().prompt;
+        }
+    }
+    if (m_currentPreviewVideoPrompt.isEmpty())
+    {
+        const QString promptPath = m_projects->generationTempDir(row, record->shortCode)
+            .absoluteFilePath(QStringLiteral("generation_prompt.txt"));
+        QFile promptFile{promptPath};
+        if (promptFile.open(QFile::ReadOnly))
+        {
+            m_currentPreviewVideoPrompt = QString::fromUtf8(promptFile.readAll()).trimmed();
+        }
+    }
+    const bool canGenerateAgain = !m_currentPreviewVideoPrompt.isEmpty();
+    m_buttonFavoriteVideoPrompt->setEnabled(canGenerateAgain);
+    ui->buttonGenerateAgain->setEnabled(canGenerateAgain);
+    ui->lineEditExtraPrompt->setEnabled(canGenerateAgain);
     const bool published = m_videos->isPublished(record->id);
     ui->buttonPublish->setEnabled(true);
     ui->buttonPublish->setText(published ? tr("Unpublish") : tr("Mark published"));
@@ -3200,9 +3270,23 @@ void PaneGeneration::_generateAgain()
     }
     DialogGenerateAgain dialog{tr("%1 — %2\n%3 source image(s).\n%4")
         .arg(shortCode, generator->getName()).arg(recipe.imagePaths.size()).arg(note), this};
+    if (ui->lineEditExtraPrompt)
+    {
+        dialog.setExtraPrompt(ui->lineEditExtraPrompt->text().trimmed());
+    }
     if (dialog.exec() != QDialog::Accepted)
     {
         return;
+    }
+
+    const QString extraPhrase = dialog.extraPrompt().trimmed();
+    if (ui->lineEditExtraPrompt)
+    {
+        ui->lineEditExtraPrompt->setText(extraPhrase);
+    }
+    if (!extraPhrase.isEmpty())
+    {
+        recipe.prompt = appendExtraPromptPhrase(recipe.prompt, extraPhrase);
     }
 
     _openProgress();
@@ -3422,6 +3506,7 @@ void PaneGeneration::_deleteGenerated()
     m_currentPreviewVideoPrompt.clear();
     m_buttonFavoriteVideoPrompt->setEnabled(false);
     ui->buttonGenerateAgain->setEnabled(false);
+    ui->lineEditExtraPrompt->setEnabled(false);
 
     _refreshGenerationsView(row);
     _logProgress(tr("Deleted generation %1.").arg(shortCode));
@@ -3801,6 +3886,7 @@ void PaneGeneration::_openHooksDialog()
         ? QStringLiteral("9:16 vertical") : m_runVideoFormatLabel;
     context.preferredHashtags = m_hashtags ? m_hashtags->hashtags() : QStringList{};
     context.favoriteHooksPrompt = m_favoriteHooks ? m_favoriteHooks->asPromptSection() : QString{};
+    context.favoriteHooks = m_favoriteHooks ? m_favoriteHooks->hooks() : QStringList{};
     context.codeTag = codeTagFromShortCode(shortCode);
     context.workingDir = tempDir.absolutePath();
     context.availableClis = m_availableClis;
@@ -3808,41 +3894,19 @@ void PaneGeneration::_openHooksDialog()
 
     if (!shortCode.isEmpty())
     {
-        QFile promptFile{tempDir.filePath(QStringLiteral("generation_prompt.txt"))};
-        if (!promptFile.exists())
+        const auto *record = m_videos->recordFromShortCode(shortCode);
+        const auto promptEntries = generationPromptEntries(row, record);
+        QStringList stepPrompts;
+        for (const auto &entry : promptEntries)
         {
-            promptFile.setFileName(genDir.filePath(QStringLiteral("generation_prompt.txt")));
-        }
-        if (promptFile.open(QFile::ReadOnly))
-        {
-            context.videoPrompt = QString::fromUtf8(promptFile.readAll()).trimmed();
-        }
-    }
-
-    if (context.videoPrompt.isEmpty())
-    {
-        QFile wfFile{genDir.filePath(QStringLiteral("multi_video_workflow.json"))};
-        if (!wfFile.exists())
-        {
-            wfFile.setFileName(tempDir.filePath(QStringLiteral("multi_video_workflow.json")));
-        }
-        if (wfFile.open(QFile::ReadOnly))
-        {
-            const QJsonObject wf = QJsonDocument::fromJson(wfFile.readAll()).object();
-            const QJsonArray steps = wf.value(QStringLiteral("steps")).toArray();
-            QStringList stepPrompts;
-            for (const QJsonValue &sVal : steps)
+            if (!entry.prompt.isEmpty() && !stepPrompts.contains(entry.prompt))
             {
-                const QString sp = sVal.toObject().value(QStringLiteral("prompt")).toString().trimmed();
-                if (!sp.isEmpty() && !stepPrompts.contains(sp))
-                {
-                    stepPrompts << sp;
-                }
+                stepPrompts << entry.prompt;
             }
-            if (!stepPrompts.isEmpty())
-            {
-                context.videoPrompt = stepPrompts.join(QStringLiteral(" | "));
-            }
+        }
+        if (!stepPrompts.isEmpty())
+        {
+            context.videoPrompt = stepPrompts.join(QStringLiteral(" | "));
         }
     }
 
@@ -3922,5 +3986,314 @@ void PaneGeneration::_finishProgress(const QString &message)
     if (m_progress.cancelBtn)
     {
         m_progress.cancelBtn->hide();
+    }
+}
+
+QList<PaneGeneration::GenerationPromptEntry> PaneGeneration::generationPromptEntries(
+    int row, const TableVideos::VideoRecord *record) const
+{
+    QList<GenerationPromptEntry> entries;
+    if (row < 0 || !record)
+    {
+        return entries;
+    }
+
+    const QDir genDir = m_projects->generationDir(row, record->shortCode, false);
+    const QDir tempDir = m_projects->generationTempDir(row, record->shortCode);
+    const QString manifestName = QStringLiteral("multi_video_workflow.json");
+
+    // 1. Check for multi-video workflow manifest
+    ProductShowcaseMultiVideoWorkflow workflow;
+    bool workflowLoaded = false;
+    if (genDir.exists(manifestName))
+    {
+        workflowLoaded = workflow.loadFromFile(genDir.absoluteFilePath(manifestName));
+    }
+    if (!workflowLoaded && tempDir.exists(manifestName))
+    {
+        workflowLoaded = workflow.loadFromFile(tempDir.absoluteFilePath(manifestName));
+    }
+    if (!workflowLoaded)
+    {
+        const QString projGenManifest
+            = m_projects->projectGenerationsDir(row).absoluteFilePath(manifestName);
+        if (QFile::exists(projGenManifest) && workflow.loadFromFile(projGenManifest)
+            && workflow.generationShortCode() == record->shortCode)
+        {
+            workflowLoaded = true;
+        }
+    }
+    if (!workflowLoaded)
+    {
+        const QString projManifest
+            = m_projects->projectDir(row).absoluteFilePath(manifestName);
+        if (QFile::exists(projManifest) && workflow.loadFromFile(projManifest)
+            && workflow.generationShortCode() == record->shortCode)
+        {
+            workflowLoaded = true;
+        }
+    }
+
+    if (workflowLoaded)
+    {
+        const auto &steps = workflow.steps();
+        for (int i = 0; i < steps.size(); ++i)
+        {
+            const auto &step = steps[i];
+            const QString prompt = step.prompt.trimmed();
+            if (prompt.isEmpty())
+            {
+                continue;
+            }
+            QString title = step.title.trimmed();
+            if (title.isEmpty())
+            {
+                title = (step.type == AbstractMultiVideoWorkflow::StepType::Intro)
+                    ? tr("Intro")
+                    : tr("Step %1").arg(i + 1);
+            }
+            entries.append({title, prompt});
+        }
+        if (!entries.isEmpty())
+        {
+            return entries;
+        }
+    }
+
+    auto cleanFormatSuffix = [](QString p) {
+        static const QRegularExpression formatRe{QStringLiteral("\\s*Video format:.*$")};
+        const QString cleaned = p.remove(formatRe).trimmed();
+        return cleaned.isEmpty() ? p.trimmed() : cleaned;
+    };
+
+    // 2. Single video / image / slideshow prompt from generation_prompt.txt
+    QString promptText;
+    QFile promptFile{tempDir.filePath(QStringLiteral("generation_prompt.txt"))};
+    if (!promptFile.exists())
+    {
+        promptFile.setFileName(genDir.filePath(QStringLiteral("generation_prompt.txt")));
+    }
+    if (promptFile.open(QFile::ReadOnly))
+    {
+        promptText = QString::fromUtf8(promptFile.readAll()).trimmed();
+    }
+
+    // 3. Fallback to generation_config.json (VideoGenerationRecipe)
+    if (promptText.isEmpty())
+    {
+        VideoGenerationRecipe recipe;
+        QString err;
+        if (tempDir.exists(QStringLiteral("generation_config.json"))
+            && VideoGenerationRecipe::load(tempDir, &recipe, &err))
+        {
+            promptText = recipe.prompt.trimmed();
+        }
+        else if (genDir.exists(QStringLiteral("generation_config.json"))
+                 && VideoGenerationRecipe::load(genDir, &recipe, &err))
+        {
+            promptText = recipe.prompt.trimmed();
+        }
+    }
+
+    // 4. Fallback to project's stored IND_GEN_PROMPT if still empty
+    if (promptText.isEmpty())
+    {
+        promptText = m_projects->data(
+            m_projects->index(row, TableProjects::IND_GEN_PROMPT)).toString().trimmed();
+    }
+
+    if (!promptText.isEmpty())
+    {
+        entries.append({tr("Prompt"), cleanFormatSuffix(promptText)});
+    }
+
+    return entries;
+}
+
+static QString withSentencePunctuation(const QString &text)
+{
+    if (text.isEmpty())
+    {
+        return text;
+    }
+    const QChar last = text.at(text.length() - 1);
+    if (last == QLatin1Char('.') || last == QLatin1Char('!') || last == QLatin1Char('?'))
+    {
+        return text;
+    }
+    return text + QLatin1Char('.');
+}
+
+QString PaneGeneration::appendExtraPromptPhrase(const QString &basePrompt, const QString &extraPhrase)
+{
+    const QString extra = extraPhrase.trimmed();
+    if (extra.isEmpty())
+    {
+        return basePrompt;
+    }
+
+    const QString punctuatedExtra = withSentencePunctuation(extra);
+
+    static const QRegularExpression formatRe{QStringLiteral("(\\s*Video format:.*$)")};
+    const auto match = formatRe.match(basePrompt);
+    if (match.hasMatch())
+    {
+        const int formatPos = match.capturedStart(1);
+        QString mainPart = basePrompt.left(formatPos).trimmed();
+        const QString formatPart = basePrompt.mid(formatPos);
+
+        mainPart = withSentencePunctuation(mainPart);
+        if (!mainPart.isEmpty())
+        {
+            mainPart += QLatin1Char(' ');
+        }
+        mainPart += punctuatedExtra;
+        return mainPart + formatPart;
+    }
+
+    QString prompt = withSentencePunctuation(basePrompt.trimmed());
+    if (!prompt.isEmpty())
+    {
+        prompt += QLatin1Char(' ');
+    }
+    prompt += punctuatedExtra;
+    return prompt;
+}
+
+
+void PaneGeneration::_generationsContextMenu(const QPoint &position)
+{
+    QTreeWidgetItem *item = ui->treeViewGenerations->itemAt(position);
+    if (!item)
+    {
+        return;
+    }
+    QMenu menu{this};
+
+    if (item->data(0, RoleIsPromptItem).toBool())
+    {
+        const QString promptText = item->data(0, RolePromptText).toString();
+        const QString label = item->data(0, RolePromptLabel).toString();
+        QAction *actionCopy = menu.addAction(tr("Copy prompt"));
+        connect(actionCopy, &QAction::triggered, this, [this, promptText]() {
+            QGuiApplication::clipboard()->setText(promptText);
+            _logProgress(tr("Copied prompt to clipboard."));
+        });
+
+        QAction *actionCopyFormatted = menu.addAction(
+            tr("Copy with label (\"%1: ...\")").arg(label));
+        const QString fullText = item->text(0);
+        connect(actionCopyFormatted, &QAction::triggered, this, [this, fullText]() {
+            QGuiApplication::clipboard()->setText(fullText);
+            _logProgress(tr("Copied prompt to clipboard."));
+        });
+
+        if (m_favoriteVideoPrompts)
+        {
+            menu.addSeparator();
+            QAction *actionFavorite = menu.addAction(tr("★ Favorite this video prompt"));
+            connect(actionFavorite, &QAction::triggered, this, [this, promptText]() {
+                m_favoriteVideoPrompts->addPrompt(promptText);
+                _logProgress(tr("Saved as a favorite video prompt: %1")
+                    .arg(promptText.left(150)));
+            });
+        }
+    }
+    else if (!item->parent())
+    {
+        // Top-level item
+        QStringList prompts;
+        for (int i = 0; i < item->childCount(); ++i)
+        {
+            QTreeWidgetItem *child = item->child(i);
+            if (child->data(0, RoleIsPromptItem).toBool())
+            {
+                const QString pt = child->data(0, RolePromptText).toString();
+                if (!pt.isEmpty())
+                {
+                    prompts << pt;
+                }
+            }
+        }
+        if (!prompts.isEmpty())
+        {
+            if (prompts.size() == 1)
+            {
+                const QString single = prompts.first();
+                QAction *actionCopy = menu.addAction(tr("Copy prompt"));
+                connect(actionCopy, &QAction::triggered, this, [this, single]() {
+                    QGuiApplication::clipboard()->setText(single);
+                    _logProgress(tr("Copied prompt to clipboard."));
+                });
+            }
+            else
+            {
+                const QString joined = prompts.join(QStringLiteral("\n\n"));
+                QAction *actionCopyAll = menu.addAction(
+                    tr("Copy all prompts (%1)").arg(prompts.size()));
+                connect(actionCopyAll, &QAction::triggered, this, [this, joined]() {
+                    QGuiApplication::clipboard()->setText(joined);
+                    _logProgress(tr("Copied prompts to clipboard."));
+                });
+            }
+        }
+        menu.addSeparator();
+        QAction *actionHooks = menu.addAction(tr("Hooks..."));
+        connect(actionHooks, &QAction::triggered, this, &PaneGeneration::_openHooksDialog);
+    }
+    else
+    {
+        // Property child item
+        const QString text = item->text(0);
+        QAction *actionCopy = menu.addAction(tr("Copy"));
+        connect(actionCopy, &QAction::triggered, this, [text]() {
+            QGuiApplication::clipboard()->setText(text);
+        });
+    }
+
+    menu.exec(ui->treeViewGenerations->viewport()->mapToGlobal(position));
+}
+
+void PaneGeneration::_copySelectedGenerationPrompt()
+{
+    QTreeWidgetItem *current = ui->treeViewGenerations->currentItem();
+    if (!current)
+    {
+        return;
+    }
+    if (current->data(0, RoleIsPromptItem).toBool())
+    {
+        const QString text = current->data(0, RolePromptText).toString();
+        if (!text.isEmpty())
+        {
+            QGuiApplication::clipboard()->setText(text);
+            _logProgress(tr("Copied prompt to clipboard."));
+        }
+        return;
+    }
+
+    // Top-level item: copy all prompt items
+    QTreeWidgetItem *topItem = current->parent() ? current->parent() : current;
+    QStringList prompts;
+    for (int i = 0; i < topItem->childCount(); ++i)
+    {
+        QTreeWidgetItem *child = topItem->child(i);
+        if (child->data(0, RoleIsPromptItem).toBool())
+        {
+            const QString pt = child->data(0, RolePromptText).toString();
+            if (!pt.isEmpty())
+            {
+                prompts << pt;
+            }
+        }
+    }
+    if (!prompts.isEmpty())
+    {
+        QGuiApplication::clipboard()->setText(prompts.join(QStringLiteral("\n\n")));
+        _logProgress(tr("Copied prompt(s) to clipboard."));
+    }
+    else
+    {
+        QGuiApplication::clipboard()->setText(current->text(0));
     }
 }

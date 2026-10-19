@@ -11,6 +11,7 @@ class QListWidgetItem;
 class QPushButton;
 class QSlider;
 class QLabel;
+class QLineEdit;
 class QMediaPlayer;
 class QAudioOutput;
 class QVideoWidget;
@@ -36,6 +37,8 @@ public:
     bool isRegenerateRequested() const { return m_regenerateRequested; }
     int regenerateCount() const { return m_regenerateCount; }
     bool isResetRequested() const { return m_resetRequested; }
+    QString extraPrompt() const { return m_extraPrompt; }
+    QLineEdit *extraPromptEdit() const { return m_lineEditExtraPrompt; }
 
 private slots:
     void _onTakeSelectionChanged();
@@ -61,7 +64,9 @@ private:
     QSlider *m_slider = nullptr;
     QLabel *m_labelTime = nullptr;
     QSpinBox *m_spinTakes = nullptr;
+    QLineEdit *m_lineEditExtraPrompt = nullptr;
     QPushButton *m_buttonGenerateAgain = nullptr;
+    QString m_extraPrompt;
     QPushButton *m_buttonResetStep = nullptr;
     QPushButton *m_buttonContinue = nullptr;
     QPushButton *m_buttonPause = nullptr;

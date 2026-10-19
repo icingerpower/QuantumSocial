@@ -6,6 +6,7 @@
 #include <QFrame>
 #include <QGroupBox>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QMediaPlayer>
 #include <QMessageBox>
@@ -59,7 +60,7 @@ DialogPickIntroVideo::DialogPickIntroVideo(int stepIndex,
     {
         labelTitle = new QLabel(tr("<h3>Select Intro Video for Subsequent Steps</h3>"), this);
         labelDesc = new QLabel(
-            tr("Multiple intro videos were generated. Please pick the best one to use as the base for the showcase.\n"
+            tr("Preview the intro takes and select the video to use as the base for the showcase.\n"
                "All subsequent steps will continue inside that video's conversation so the background, model, and lighting remain uniform."),
             this);
     }
@@ -67,7 +68,7 @@ DialogPickIntroVideo::DialogPickIntroVideo(int stepIndex,
     {
         labelTitle = new QLabel(tr("<h3>Select Preferred Video for %1</h3>").arg(displayTitle), this);
         labelDesc = new QLabel(
-            tr("Multiple takes were generated for %1. Please preview each take and select your preferred version for the showcase.")
+            tr("Preview the takes for %1 and select your preferred version for the showcase.")
                 .arg(displayTitle),
             this);
     }
@@ -189,6 +190,15 @@ DialogPickIntroVideo::DialogPickIntroVideo(int stepIndex,
     m_spinTakes->setValue(1);
     m_spinTakes->setToolTip(tr("Number of new takes/videos to generate for this step"));
     bottomLayout->addWidget(m_spinTakes);
+
+    m_lineEditExtraPrompt = new QLineEdit(this);
+    m_lineEditExtraPrompt->setPlaceholderText(tr("Extra prompt phrase (optional)..."));
+    m_lineEditExtraPrompt->setToolTip(tr("Optional extra prompt phrase to append to this step's prompt when generating again"));
+    m_lineEditExtraPrompt->setClearButtonEnabled(true);
+    m_lineEditExtraPrompt->setMinimumWidth(180);
+    m_lineEditExtraPrompt->setMaximumWidth(280);
+    connect(m_lineEditExtraPrompt, &QLineEdit::returnPressed, this, &DialogPickIntroVideo::_onGenerateAgainClicked);
+    bottomLayout->addWidget(m_lineEditExtraPrompt);
 
     m_buttonGenerateAgain = new QPushButton(tr("Generate again"), this);
     m_buttonGenerateAgain->setToolTip(tr("Generate additional takes for this step without restarting from the beginning"));
@@ -342,6 +352,7 @@ void DialogPickIntroVideo::_onGenerateAgainClicked()
 {
     m_regenerateRequested = true;
     m_regenerateCount = m_spinTakes ? m_spinTakes->value() : 1;
+    m_extraPrompt = m_lineEditExtraPrompt ? m_lineEditExtraPrompt->text().trimmed() : QString{};
     accept();
 }
 
@@ -362,4 +373,3 @@ void DialogPickIntroVideo::_onResetStepClicked()
         accept();
     }
 }
-

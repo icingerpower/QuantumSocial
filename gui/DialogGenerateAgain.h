@@ -11,6 +11,8 @@ public:
     explicit DialogGenerateAgain(const QString &configuration, QWidget *parent = nullptr);
     ~DialogGenerateAgain();
     int generationCount() const;
+    QString extraPrompt() const;
+    void setExtraPrompt(const QString &extra);
 
 private:
     Ui::DialogGenerateAgain *ui;
