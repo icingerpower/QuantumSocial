@@ -96,6 +96,7 @@ private:
     QCoro::Task<void> _mergeSelectedVideos();
 
     QCoro::Task<void> _runWorkflow();
+    bool _pauseForStepSelection(int stepIndex);
     void _saveState();
     QCoro::Task<ImagePrepStatus> _ensureStepImagesReady(Step &step, const QString &stepWorkingDir);
     QCoro::Task<ImageRegenResult> _regenerateImage(const QString &originalImage,

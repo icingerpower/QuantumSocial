@@ -1,5 +1,6 @@
 #include "ProductShowcaseMultiVideoWorkflow.h"
 
+#include <algorithm>
 #include <chrono>
 #include <QCoro/QCoroTimer>
 #include <QDateTime>
@@ -12,6 +13,17 @@
 #include "AbstractCli.h"
 #include "VideoClipProcessing.h"
 #include "model/imagegen/AbstractImageGenerator.h"
+
+namespace
+{
+void sortTakes(QList<AbstractMultiVideoWorkflow::TakeInfo> &takes)
+{
+    std::sort(takes.begin(), takes.end(), [](const auto &left, const auto &right) {
+        return left.stepIndex == right.stepIndex
+            ? left.takeIndex < right.takeIndex : left.stepIndex < right.stepIndex;
+    });
+}
+}
 
 ProductShowcaseMultiVideoWorkflow::ProductShowcaseMultiVideoWorkflow(QObject *parent)
     : AbstractMultiVideoWorkflow(parent)
@@ -147,12 +159,17 @@ void ProductShowcaseMultiVideoWorkflow::cancel()
 
 void ProductShowcaseMultiVideoWorkflow::selectIntroTake(int takeIndex)
 {
-    setSelectedTakeIndex(0, takeIndex);
-    m_selectedIntroTakeIndex = takeIndex;
+    selectTake(0, takeIndex);
+}
+
+void ProductShowcaseMultiVideoWorkflow::selectTake(int stepIndex, int takeIndex)
+{
+    bool found = false;
     for (const auto &take : m_takes)
     {
-        if (take.stepIndex == 0 && take.takeIndex == takeIndex)
+        if (take.stepIndex == stepIndex && take.takeIndex == takeIndex && take.completed)
         {
+            found = true;
             if (!take.conversationUrl.isEmpty())
             {
                 m_conversationUrl = take.conversationUrl;
@@ -160,25 +177,12 @@ void ProductShowcaseMultiVideoWorkflow::selectIntroTake(int takeIndex)
             break;
         }
     }
-    _saveState();
-    updateMergedVideo();
-    if (m_state != State::Completed && completedVideoCount() < totalVideoCount())
-    {
-        resume();
-    }
-}
-
-void ProductShowcaseMultiVideoWorkflow::selectTake(int stepIndex, int takeIndex)
-{
+    if (!found) return;
     setSelectedTakeIndex(stepIndex, takeIndex);
-    if (stepIndex == 0)
-    {
-        selectIntroTake(takeIndex);
-        return;
-    }
     _saveState();
     updateMergedVideo();
-    if (m_state != State::Completed && completedVideoCount() < totalVideoCount())
+    if (m_state == State::Paused
+        || (m_state != State::Completed && completedVideoCount() < totalVideoCount()))
     {
         resume();
     }
@@ -319,6 +323,8 @@ void ProductShowcaseMultiVideoWorkflow::regenerateStep(int stepIndex, int newTak
         }
     }
 
+    // New takes must run with their step, before any unfinished later steps.
+    sortTakes(m_takes);
     setState(State::Paused, tr("Ready to generate new take(s) for Step %1.").arg(stepIndex + 1));
     updateMergedVideo();
     _saveState();
@@ -343,6 +349,46 @@ void ProductShowcaseMultiVideoWorkflow::_saveState()
     {
         saveToFile(QDir{m_projectDir}.absoluteFilePath(QStringLiteral("multi_video_workflow.json")));
     }
+}
+
+bool ProductShowcaseMultiVideoWorkflow::_pauseForStepSelection(int stepIndex)
+{
+    // The final step is reviewed by the completion UI. Every earlier step
+    // requires an explicit choice before the next step may start.
+    if (stepIndex < 0 || stepIndex >= m_steps.size() - 1) return false;
+    QList<TakeInfo> stepTakes;
+    bool hasSelection = false;
+    for (const auto &take : m_takes)
+    {
+        if (take.stepIndex != stepIndex) continue;
+        if (!take.completed) return false;
+        stepTakes << take;
+        hasSelection |= take.takeIndex == selectedTakeIndex(stepIndex);
+    }
+    if (stepTakes.isEmpty() || hasSelection) return false;
+
+    const QString reason = tr("Please select a video for Step %1 before generating Step %2.")
+        .arg(stepIndex + 1).arg(stepIndex + 2);
+    setState(State::Paused, reason);
+    _saveState();
+    emit progress(reason);
+    emit paused(reason, completedVideoCount(), totalVideoCount());
+
+    // Let the coroutine finish before a modal picker can select a take and
+    // resume, regenerate, or reset the workflow.
+    const int selection = selectedTakeIndex(stepIndex);
+    QTimer::singleShot(0, this, [this, stepIndex, stepTakes, selection] {
+        if (m_state != State::Paused || selectedTakeIndex(stepIndex) != selection) return;
+        if (stepIndex == 0)
+        {
+            emit introSelectionRequested(stepTakes);
+        }
+        else
+        {
+            emit takeSelectionRequested(stepIndex, stepTakes);
+        }
+    });
+    return true;
 }
 
 QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
@@ -388,6 +434,7 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
         auto &take = m_takes[idx];
         if (take.completed)
         {
+            if (_pauseForStepSelection(take.stepIndex)) co_return;
             continue; // already successfully generated
         }
 
@@ -463,8 +510,7 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
         // Multi-video conversation management:
         // Clarification: Each video of step 1 is run in a new chat.
         // Only videos of step 2 and more are run in the previous chat.
-        // Before going to step 2, if multiple videos were generated for step 1,
-        // user selects which intro video to use for subsequent steps.
+        // Each preceding step must have a selected take before advancing.
         if (take.stepIndex == 0)
         {
             request.chatMode = QStringLiteral("fresh");
@@ -473,61 +519,16 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
         }
         else
         {
-            // Step 2 or later: check if intro video has been selected
-            if (m_selectedIntroTakeIndex < 0)
+            // Earlier steps have been approved. Continue from the selected
+            // take of the preceding step, including when restoring a project.
+            for (const auto &previous : m_takes)
             {
-                QList<TakeInfo> step1Takes;
-                bool step1AllDone = true;
-                for (const auto &t : m_takes)
+                if (previous.stepIndex == take.stepIndex - 1
+                    && previous.takeIndex == selectedTakeIndex(previous.stepIndex)
+                    && !previous.conversationUrl.isEmpty())
                 {
-                    if (t.stepIndex == 0)
-                    {
-                        step1Takes << t;
-                        if (!t.completed)
-                        {
-                            step1AllDone = false;
-                        }
-                    }
-                }
-
-                if (!step1AllDone)
-                {
-                    continue;
-                }
-
-                if (step1Takes.size() <= 1)
-                {
-                    m_selectedIntroTakeIndex = 0;
-                    if (!step1Takes.isEmpty())
-                    {
-                        if (step1Takes[0].conversationUrl.isEmpty())
-                        {
-                            step1Takes[0].conversationUrl = m_conversationUrl;
-                        }
-                        m_conversationUrl = step1Takes[0].conversationUrl;
-                    }
-                }
-                else
-                {
-                    // Multiple intro takes: pause and ask user to pick one
-                    const QString pauseMsg = tr("Please select the intro video to continue with subsequent steps.");
-                    setState(State::Paused, pauseMsg);
-                    _saveState();
-                    emit introSelectionRequested(step1Takes);
-                    emit progress(pauseMsg);
-                    emit paused(pauseMsg, completedVideoCount(), totalVideoCount());
-                    co_return;
-                }
-            }
-            else if (m_conversationUrl.isEmpty())
-            {
-                for (const auto &t : m_takes)
-                {
-                    if (t.stepIndex == 0 && t.takeIndex == m_selectedIntroTakeIndex)
-                    {
-                        m_conversationUrl = t.conversationUrl;
-                        break;
-                    }
+                    m_conversationUrl = previous.conversationUrl;
+                    break;
                 }
             }
 
@@ -654,28 +655,7 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
             {
                 emit stepCompleted(take.stepIndex);
 
-                // Only pause mid-generation for Step 1 (intro) if multiple takes were generated,
-                // because picking the intro take defines which Gemini conversation to continue in.
-                // For all subsequent steps, generation continues unattended without pausing;
-                // takes for remaining steps are reviewed and selected at the end.
-                if (take.stepIndex == 0 && step.videoCount > 1 && selectedTakeIndex(0) < 0)
-                {
-                    QList<TakeInfo> stepTakes;
-                    for (const auto &t : m_takes)
-                    {
-                        if (t.stepIndex == 0)
-                        {
-                            stepTakes << t;
-                        }
-                    }
-                    const QString pauseMsg = tr("Please select the intro video to continue with subsequent steps.");
-                    setState(State::Paused, pauseMsg);
-                    _saveState();
-                    emit introSelectionRequested(stepTakes);
-                    emit progress(pauseMsg);
-                    emit paused(pauseMsg, completedVideoCount(), totalVideoCount());
-                    co_return;
-                }
+                if (_pauseForStepSelection(take.stepIndex)) co_return;
             }
         }
         else
@@ -730,6 +710,8 @@ QJsonObject ProductShowcaseMultiVideoWorkflow::toJson() const
 bool ProductShowcaseMultiVideoWorkflow::fromJson(const QJsonObject &json)
 {
     if (!AbstractMultiVideoWorkflow::fromJson(json)) return false;
+    // Older manifests appended regenerated takes after subsequent steps.
+    sortTakes(m_takes);
     m_mergedVideoPath = json.value(QStringLiteral("mergedVideoPath")).toString();
     m_mergedSources.clear();
     for (const auto &source : json.value(QStringLiteral("mergedSources")).toArray())
