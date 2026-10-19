@@ -36,6 +36,11 @@ class GeminiSubmissionTests(unittest.TestCase):
         self.page.close()
         self.log_patch.stop()
 
+    def submission_state(self, images=()):
+        return {"promptSubmitted": True, "conversationUrl": self.page.url,
+                "userQuery": worker._last_query_identity(self.page),
+                "imageFingerprints": worker._image_fingerprints(images)}
+
     def composer(self, body="<textarea aria-label='Prompt'></textarea>", script=""):
         self.page.set_content(body + """
             <button id='send' aria-label='Envoyer'>Send</button>
@@ -321,13 +326,14 @@ class GeminiSubmissionTests(unittest.TestCase):
 
     def test_run_attempt_uses_edit_last_when_requested(self):
         self.page.set_content("<user-query><button aria-label='Modifier'></button></user-query>")
-        with patch.object(worker, "_video_quota_message", return_value=None), \
+        with tempfile.TemporaryDirectory() as output, \
+                patch.object(worker, "_video_quota_message", return_value=None), \
                 patch.object(worker, "_edit_last_message", return_value=True) as edit_mock, \
                 patch.object(worker, "_select_video_tool") as select_tool, \
                 patch.object(worker, "install_video_capture", return_value={"video": "/saved/take2.mp4", "error": None}):
             status, payload = worker._run_attempt(
-                self.page, "Take 2 prompt", [], "/tmp", time.time() + 10, time.time() + 10,
-                5, message_action="edit_last")
+                self.page, "Take 2 prompt", [], output, time.time() + 10, time.time() + 10,
+                5, message_action="edit_last", submission_state=self.submission_state())
             self.assertEqual(status, "video")
             self.assertEqual(payload, "/saved/take2.mp4")
             edit_mock.assert_called_once_with(self.page, "Take 2 prompt")
@@ -478,13 +484,15 @@ class GeminiSubmissionTests(unittest.TestCase):
                 <p>I can't make videos of real people in situations like that.</p>
             </model-response>
         """)
-        with patch.object(worker, "_video_quota_message", return_value=None), \
+        with tempfile.TemporaryDirectory() as output, \
+                patch.object(worker, "_video_quota_message", return_value=None), \
                 patch.object(worker, "_edit_last_message", return_value=True), \
                 patch.object(worker, "install_video_capture", return_value={"video": None, "error": None}), \
                 patch.object(worker.time, "time", side_effect=[100, 100, 100, 100, 100, 120]):
             status, payload = worker._run_attempt(
-                self.page, "Take 2 prompt variant", [], "/tmp",
-                105, 105, 5, message_action="edit_last", chat_mode="conversation")
+                self.page, "Take 2 prompt variant", [], output,
+                105, 105, 5, message_action="edit_last", chat_mode="conversation",
+                submission_state=self.submission_state())
             # Must NOT click Turn 1's download button or report video!
             self.assertEqual(status, "stalled")
 
@@ -695,22 +703,98 @@ class GeminiSubmissionTests(unittest.TestCase):
             self.assertEqual(attempt.call_args.kwargs["message_action"], "new")
             self.assertFalse(result["promptSubmitted"])
 
+    def test_restart_edits_only_the_same_take_with_unchanged_images(self):
+        # Steps 2 and 3 intentionally have identical prompt text, as in QS-001C.
+        for scenario in ("same_take", "later_step", "legacy", "changed_image",
+                         "other_conversation", "different_turn", "changed_attachment"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as output:
+                image = Path(output, "step2.png")
+                image.write_bytes(b"step 2 product")
+                self.page.set_content("""
+                    <user-query id="intro">Intro</user-query>
+                    <user-query id="step2">Show the attached heels</user-query>
+                    <textarea aria-label="Prompt"></textarea>
+                """)
+                state = self.submission_state([str(image)])
+                if scenario == "later_step":
+                    self.page.evaluate("""() => {
+                        const query = document.createElement('user-query');
+                        query.id = 'step3';
+                        query.textContent = 'Show the attached heels';
+                        document.body.append(query);
+                    }""")
+                elif scenario == "legacy":
+                    state = {"promptSubmitted": True, "conversationUrl": self.page.url}
+                elif scenario == "changed_image":
+                    image.write_bytes(b"replacement step 2 product")
+                elif scenario == "other_conversation":
+                    state["conversationUrl"] = "https://gemini.google.com/app/other"
+                elif scenario == "different_turn":
+                    self.page.locator("#step2").evaluate("el => el.id = 'step3'")
+                elif scenario == "changed_attachment":
+                    self.page.locator("#step2").evaluate("""el => {
+                        const img = document.createElement('img');
+                        img.alt = 'step 3 product';
+                        el.append(img);
+                    }""")
+                Path(output, "gemini_submission.json").write_text(worker.json.dumps(state))
+
+                def submit(*args, **kwargs):
+                    self.page.evaluate("""() => {
+                        const query = document.createElement('user-query');
+                        query.id = 'step2_retry';
+                        query.textContent = 'Show the attached heels';
+                        document.body.append(query);
+                    }""")
+                    return True
+
+                with patch.object(worker, "_video_quota_message", return_value=None), \
+                        patch.object(worker, "_switch_to_video_capable_model"), \
+                        patch.object(worker, "_select_video_tool", return_value=True), \
+                        patch.object(worker, "_handle_tool_switch_dialog"), \
+                        patch.object(worker, "_select_aspect"), \
+                        patch.object(worker, "_edit_last_message", return_value=True) as edit, \
+                        patch.object(worker, "_attach_image", return_value=True) as attach, \
+                        patch.object(worker, "_submit_prompt", side_effect=submit) as send, \
+                        patch.object(worker, "install_video_capture", return_value={"video": "/clip.mp4", "error": None}):
+                    result, _ = worker._generate_once(None, self.page,
+                        "Show the attached heels", [str(image)], output, {},
+                        chat_mode="conversation", message_action="edit_last")
+                self.assertEqual(result["video"], "/clip.mp4")
+                if scenario == "same_take":
+                    edit.assert_called_once()
+                    attach.assert_not_called()
+                    send.assert_not_called()
+                else:
+                    edit.assert_not_called()
+                    attach.assert_called_once_with(self.page, str(image))
+                    send.assert_called_once()
+                saved = worker._saved_submission(output)
+                self.assertEqual(saved["userQuery"], worker._last_query_identity(self.page))
+                self.assertEqual(saved["imageFingerprints"], worker._image_fingerprints([str(image)]))
+
     def test_edit_unavailable_falls_back_to_new_submission(self):
-        self.composer()
+        self.composer("<user-query>Prompt</user-query><textarea aria-label='Prompt'></textarea>")
+
+        def submit(*args, **kwargs):
+            self.page.evaluate("document.body.append(document.createElement('user-query'))")
+            return True
+
         with tempfile.TemporaryDirectory() as output, \
-                patch.object(worker, "_edit_last_message", return_value=False), \
+                patch.object(worker, "_edit_last_message", return_value=False) as edit, \
                 patch.object(worker, "_video_quota_message", return_value=None), \
                 patch.object(worker, "_switch_to_video_capable_model"), \
                 patch.object(worker, "_select_video_tool", return_value=True), \
                 patch.object(worker, "_handle_tool_switch_dialog"), \
                 patch.object(worker, "_select_aspect"), \
-                patch.object(worker, "_submit_prompt", return_value=True) as submit, \
+                patch.object(worker, "_submit_prompt", side_effect=submit) as send, \
                 patch.object(worker, "install_video_capture", return_value={"video": "/clip.mp4", "error": None}):
-            state = {}
+            state = self.submission_state()
             status, _ = worker._run_attempt(self.page, "Prompt", [], output,
                 time.time() + 10, time.time() + 10, 5, message_action="edit_last", submission_state=state)
             self.assertEqual(status, "video")
-            submit.assert_called_once()
+            edit.assert_called_once()
+            send.assert_called_once()
             self.assertTrue(worker._saved_submission(output)["promptSubmitted"])
 
     def test_browser_recovery_edits_only_after_a_confirmed_submission(self):

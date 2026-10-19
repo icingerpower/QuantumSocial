@@ -56,6 +56,7 @@ Settings used: generationTimeoutSec (default 900),
 useSystemChromeProfile (default true), requireUltra (default true).
 """
 import glob
+import hashlib
 import json
 import os
 import re
@@ -960,6 +961,51 @@ def _find_target_response(page, target_query_index=None, initial_response_count=
     return None
 
 
+def _last_query_identity(page):
+    """Identify the submitted turn, including its position in the conversation."""
+    try:
+        return page.locator("user-query").evaluate_all("""queries => {
+            if (!queries.length) return null;
+            const query = queries[queries.length - 1];
+            const copy = query.cloneNode(true);
+            copy.querySelectorAll('button').forEach(button => button.remove());
+            return {
+                count: queries.length,
+                text: copy.textContent.trim(),
+                ids: [query.id, ...Array.from(query.querySelectorAll('[id]'), el => el.id)],
+                images: Array.from(query.querySelectorAll('img'),
+                    img => [img.getAttribute('src'), img.getAttribute('alt')])
+            };
+        }""")
+    except Exception:
+        return None
+
+
+def _image_fingerprints(image_paths):
+    # Paths can stay the same when a CLI replaces an image, or change when a
+    # project moves. Compare the actual attachments before reusing a message.
+    fingerprints = []
+    try:
+        for path in image_paths:
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            fingerprints.append(digest.hexdigest())
+    except OSError:
+        return None
+    return fingerprints
+
+
+def _can_edit_submission(page, state, image_fingerprints):
+    return bool(state and state.get("promptSubmitted")
+                and state.get("conversationUrl") == page.url
+                and state.get("userQuery")
+                and state["userQuery"] == _last_query_identity(page)
+                and image_fingerprints is not None
+                and state.get("imageFingerprints") == image_fingerprints)
+
+
 def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadline,
                  stall_timeout_s, message_action="new", chat_mode="fresh",
                  submission_state=None):
@@ -987,6 +1033,18 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
         return ("quota", quota_message)
     capture = install_video_capture(page, output_dir, _log)
     _switch_to_video_capable_model(page)
+
+    image_fingerprints = _image_fingerprints(image_paths)
+    if message_action == "edit_last" and not _can_edit_submission(
+            page, submission_state, image_fingerprints):
+        # A conversation URL alone is not a take identity: later steps share
+        # the same chat, often with identical prompts but different images.
+        # Legacy receipts also lack proof, so reattach the requested inputs.
+        _log("run_attempt: last message is not verified for this take and its "
+             "images — submitting a new message with the requested attachments")
+        message_action = "new"
+        if submission_state is not None:
+            submission_state.clear()
 
     target_query_index = None
     attempt_start_time = time.time()
@@ -1024,6 +1082,7 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
             if cancel.count() and cancel.last.is_visible():
                 cancel.last.click(timeout=3000)
             target_query_index = None
+            message_action = "new"
 
     in_existing_conversation = (chat_mode == "conversation" and
                                 bool(re.search(r"/app/[a-zA-Z0-9_-]{6,}", page.url or "")))
@@ -1084,7 +1143,9 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
             return ("error", "Gemini submission could not be confirmed: new user prompt did not appear in the chat.")
 
     if submission_state is not None:
-        submission_state.update(promptSubmitted=True, conversationUrl=page.url)
+        submission_state.update(promptSubmitted=True, conversationUrl=page.url,
+                                userQuery=_last_query_identity(page),
+                                imageFingerprints=image_fingerprints)
         # A take's working directory survives app/worker restarts. Record only
         # confirmed submissions, so a pre-submit failure cannot edit step 1.
         with open(os.path.join(output_dir, "gemini_submission.json"), "w",
@@ -1756,7 +1817,8 @@ def _worker_main():
             conversation_url = request.get("conversationUrl") or settings.get("conversationUrl")
             if chat_mode == "conversation":
                 saved = _saved_submission(output_dir)
-                if saved.get("promptSubmitted") and saved.get("conversationUrl"):
+                if (saved.get("promptSubmitted") and saved.get("conversationUrl")
+                        and (not conversation_url or conversation_url == saved["conversationUrl"])):
                     conversation_url = saved["conversationUrl"]
                     message_action = "edit_last"
 
