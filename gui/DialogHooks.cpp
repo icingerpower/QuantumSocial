@@ -2,6 +2,7 @@
 #include "ui_DialogHooks.h"
 
 #include "AbstractCli.h"
+#include "model/FavoriteHooks.h"
 
 #include <QClipboard>
 #include <QDialogButtonBox>
@@ -14,14 +15,128 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QPushButton>
+#include <QRegularExpression>
 #include <QVBoxLayout>
 
 namespace {
 
 const QString HOOKS_REPLY_FILE_NAME = QStringLiteral("hooks_reply.json");
+
+class DialogPickQuote : public QDialog
+{
+public:
+    explicit DialogPickQuote(const QStringList &quotes, QWidget *parent = nullptr)
+        : QDialog(parent)
+    {
+        setWindowTitle(tr("Pick Quote"));
+        resize(560, 380);
+
+        auto *layout = new QVBoxLayout(this);
+
+        auto *labelHint = new QLabel(tr("Select a hook / quote from settings:"), this);
+        layout->addWidget(labelHint);
+
+        auto *editFilter = new QLineEdit(this);
+        editFilter->setPlaceholderText(tr("Search quotes..."));
+        editFilter->setClearButtonEnabled(true);
+        layout->addWidget(editFilter);
+
+        auto *listWidget = new QListWidget(this);
+        listWidget->setWordWrap(true);
+        listWidget->setSelectionMode(QAbstractItemView::SingleSelection);
+        for (const QString &quote : quotes)
+        {
+            const QString trimmed = quote.trimmed();
+            if (!trimmed.isEmpty())
+            {
+                auto *item = new QListWidgetItem(trimmed, listWidget);
+                item->setToolTip(trimmed);
+            }
+        }
+        layout->addWidget(listWidget, 1);
+
+        auto *buttonBox = new QDialogButtonBox(
+            QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+        layout->addWidget(buttonBox);
+
+        auto *okButton = buttonBox->button(QDialogButtonBox::Ok);
+        auto updateOkState = [listWidget, okButton]() {
+            if (okButton)
+            {
+                auto *current = listWidget->currentItem();
+                okButton->setEnabled(current != nullptr && !current->isHidden());
+            }
+        };
+
+        connect(buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+        connect(buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        connect(listWidget, &QListWidget::itemSelectionChanged, this, updateOkState);
+
+        connect(listWidget, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
+            if (item && !item->isHidden())
+            {
+                accept();
+            }
+        });
+
+        connect(editFilter, &QLineEdit::textChanged, this, [listWidget, updateOkState](const QString &text) {
+            const QString filter = text.trimmed();
+            QListWidgetItem *firstVisible = nullptr;
+            for (int i = 0; i < listWidget->count(); ++i)
+            {
+                auto *item = listWidget->item(i);
+                const bool matches = filter.isEmpty()
+                    || item->text().contains(filter, Qt::CaseInsensitive);
+                item->setHidden(!matches);
+                if (matches && !firstVisible)
+                {
+                    firstVisible = item;
+                }
+            }
+            if (firstVisible && (!listWidget->currentItem() || listWidget->currentItem()->isHidden()))
+            {
+                listWidget->setCurrentItem(firstVisible);
+            }
+            updateOkState();
+        });
+
+        connect(editFilter, &QLineEdit::returnPressed, this, [this, listWidget]() {
+            auto *current = listWidget->currentItem();
+            if (current && !current->isHidden())
+            {
+                accept();
+            }
+        });
+
+        if (listWidget->count() > 0)
+        {
+            listWidget->setCurrentRow(0);
+        }
+        updateOkState();
+        m_listWidget = listWidget;
+    }
+
+    QString selectedQuote() const
+    {
+        if (m_listWidget)
+        {
+            auto *item = m_listWidget->currentItem();
+            if (item && !item->isHidden())
+            {
+                return item->text().trimmed();
+            }
+        }
+        return QString{};
+    }
+
+private:
+    QListWidget *m_listWidget = nullptr;
+};
 
 class DialogEditHook : public QDialog
 {
@@ -218,6 +333,7 @@ void DialogHooks::_initUi(const QList<QPair<QString, QString>> &hooks)
     connect(ui->buttonEdit, &QPushButton::clicked, this, &DialogHooks::_editHook);
     connect(ui->buttonDelete, &QPushButton::clicked, this, &DialogHooks::_deleteHook);
     connect(ui->buttonRegenerate, &QPushButton::clicked, this, &DialogHooks::_regenerateHooks);
+    connect(ui->buttonPickQuote, &QPushButton::clicked, this, &DialogHooks::_pickQuote);
 
     if (!m_context.videoIdea.trimmed().isEmpty())
     {
@@ -430,6 +546,107 @@ void DialogHooks::_deleteHook()
     _updateButtonStates();
 }
 
+void DialogHooks::_pickQuote()
+{
+    if (m_context.favoriteHooks.isEmpty() && !m_context.workingDir.isEmpty())
+    {
+        FavoriteHooks loader(m_context.workingDir);
+        m_context.favoriteHooks = loader.hooks();
+    }
+
+    if (m_context.favoriteHooks.isEmpty())
+    {
+        QMessageBox::information(this, tr("No Quotes Found"),
+            tr("No favorite hooks or quotes found in settings.\n"
+               "You can add them in the Settings tab under \"Favorite hooks\"."));
+        return;
+    }
+
+    DialogPickQuote dialog(m_context.favoriteHooks, this);
+    if (dialog.exec() != QDialog::Accepted)
+    {
+        return;
+    }
+
+    const QString quote = dialog.selectedQuote().trimmed();
+    if (quote.isEmpty())
+    {
+        return;
+    }
+
+    QStringList hashtags;
+    if (ui->tableHooks->rowCount() > 0)
+    {
+        const QString firstDesc = _cellText(0, 1);
+        static const QRegularExpression tagRegex(
+            QStringLiteral("#[A-Za-z0-9_\\p{L}-]+"),
+            QRegularExpression::UseUnicodePropertiesOption);
+        auto it = tagRegex.globalMatch(firstDesc);
+        while (it.hasNext())
+        {
+            const QString tag = it.next().captured(0);
+            if (!hashtags.contains(tag, Qt::CaseInsensitive))
+            {
+                hashtags << tag;
+            }
+        }
+    }
+
+    if (hashtags.isEmpty() && !m_context.preferredHashtags.isEmpty())
+    {
+        for (const QString &tag : m_context.preferredHashtags)
+        {
+            QString clean = tag.trimmed();
+            if (!clean.isEmpty())
+            {
+                if (!clean.startsWith(QLatin1Char('#')))
+                {
+                    clean.prepend(QLatin1Char('#'));
+                }
+                if (!hashtags.contains(clean, Qt::CaseInsensitive))
+                {
+                    hashtags << clean;
+                }
+            }
+        }
+    }
+
+    if (!m_context.codeTag.isEmpty())
+    {
+        bool hasCodeTag = false;
+        for (const QString &tag : hashtags)
+        {
+            if (tag.compare(m_context.codeTag, Qt::CaseInsensitive) == 0)
+            {
+                hasCodeTag = true;
+                break;
+            }
+        }
+        if (!hasCodeTag)
+        {
+            hashtags << m_context.codeTag;
+        }
+    }
+
+    QString description = quote;
+    if (!hashtags.isEmpty())
+    {
+        description += QLatin1Char(' ') + hashtags.join(QLatin1Char(' '));
+    }
+
+    const int newRow = ui->tableHooks->rowCount();
+    _insertHookRow(newRow, quote, description);
+    m_hookRow = newRow;
+    m_descriptionRow = newRow;
+    ui->tableHooks->setCurrentCell(newRow, 0);
+    if (auto *newItem = ui->tableHooks->item(newRow, 0))
+    {
+        ui->tableHooks->scrollToItem(newItem);
+    }
+    _applyHighlights();
+    _updateButtonStates();
+}
+
 void DialogHooks::_regenerateHooks()
 {
     AbstractCli *cli = selectedCli();
@@ -448,6 +665,7 @@ void DialogHooks::_regenerateHooks()
     QFile::remove(replyFilePath);
 
     ui->buttonRegenerate->setEnabled(false);
+    ui->buttonPickQuote->setEnabled(false);
     ui->comboCli->setEnabled(false);
     ui->editVideoIdea->setEnabled(false);
     ui->buttonUsePrompt->setEnabled(false);
@@ -460,6 +678,7 @@ void DialogHooks::_regenerateHooks()
 
     cli->runPromptAsync(prompt, workingDir, this, [this, cli, workingDir, replyFilePath](CliRunResult result) {
         ui->buttonRegenerate->setEnabled(true);
+        ui->buttonPickQuote->setEnabled(true);
         ui->comboCli->setEnabled(true);
         ui->editVideoIdea->setEnabled(true);
         ui->buttonUsePrompt->setEnabled(!m_context.videoPrompt.trimmed().isEmpty());
@@ -580,6 +799,7 @@ void DialogHooks::_showContextMenu(const QPoint &pos)
     menu.addAction(tr("Edit..."), this, &DialogHooks::_editHook);
     menu.addAction(tr("Duplicate"), this, &DialogHooks::_duplicateHook);
     menu.addAction(tr("Add..."), this, &DialogHooks::_addHook);
+    menu.addAction(tr("Pick quote..."), this, &DialogHooks::_pickQuote);
     menu.addAction(tr("Delete"), this, &DialogHooks::_deleteHook);
     menu.addSeparator();
     menu.addAction(tr("Copy Hook"), this, &DialogHooks::_copyHook);

@@ -15,6 +15,7 @@ DialogNewProject::DialogNewProject(QWidget *parent)
     connect(ui->buttonBrowse, &QPushButton::clicked, this, &DialogNewProject::_browseImage);
     connect(ui->buttonBrowse2, &QPushButton::clicked, this, &DialogNewProject::_browseImage2);
     connect(ui->editImage, &QLineEdit::textChanged, this, &DialogNewProject::_updateOkButton);
+    connect(ui->editImage2, &QLineEdit::textChanged, this, &DialogNewProject::_updateOkButton);
     _updateOkButton();
 }
 
@@ -48,7 +49,7 @@ void DialogNewProject::_browseImage()
     const QString startDir = imagePath().isEmpty()
         ? QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)
         : QFileInfo{imagePath()}.absolutePath();
-    const QString path = QFileDialog::getOpenFileName(this, tr("Select the source image"),
+    const QString path = QFileDialog::getOpenFileName(this, tr("Select the source image (optional)"),
         startDir, tr("Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)"));
     if (!path.isEmpty())
     {
@@ -75,5 +76,6 @@ void DialogNewProject::_browseImage2()
 void DialogNewProject::_updateOkButton()
 {
     ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(
-        QFileInfo{imagePath()}.isFile());
+        (imagePath().isEmpty() || QFileInfo{imagePath()}.isFile())
+        && (imagePath2().isEmpty() || QFileInfo{imagePath2()}.isFile()));
 }

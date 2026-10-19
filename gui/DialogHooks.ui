@@ -85,6 +85,16 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="buttonPickQuote">
+       <property name="text">
+        <string>Pick quote</string>
+       </property>
+       <property name="toolTip">
+        <string>Pick a hook from settings and add it as a new line with the first line's hashtags.</string>
+       </property>
+      </widget>
+     </item>
+     <item>
       <widget class="QProgressBar" name="progressBar">
        <property name="maximumSize">
         <size>

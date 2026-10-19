@@ -39,6 +39,7 @@ public:
         QString videoIdea;
         QStringList preferredHashtags;
         QString favoriteHooksPrompt;
+        QStringList favoriteHooks;
         QString codeTag;
         QString workingDir;
         QList<AbstractCli *> availableClis;
@@ -74,6 +75,7 @@ private slots:
     void _duplicateHook();
     void _editHook();
     void _deleteHook();
+    void _pickQuote();
     void _regenerateHooks();
     void _showContextMenu(const QPoint &pos);
 
