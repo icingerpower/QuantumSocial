@@ -5,8 +5,10 @@
 
 #include "AbstractSocialAccount.h"
 
-#include <QCoro/QCoroProcess>
+#include <QCoro/QCoroTimer>
+#include <chrono>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -98,8 +100,20 @@ QCoro::Task<QJsonObject> AbstractSocialAccount::_runJsonScript(
     QProcess process;
     process.start(python, QStringList{scriptPath} + args);
 
-    if (!co_await qCoro(process).waitForStarted())
+    // Observe the process on timer ticks, outside its signal delivery. A
+    // QCoroProcess signal callback can otherwise outlive its awaiter when
+    // this coroutine returns and destroys the local QProcess.
+    QElapsedTimer timer;
+    timer.start();
+    while (process.state() == QProcess::Starting && timer.elapsed() < 30'000)
     {
+        co_await QCoro::sleepFor(std::chrono::milliseconds(100));
+    }
+    if (process.state() == QProcess::Starting
+        || process.error() == QProcess::FailedToStart)
+    {
+        process.kill();
+        process.waitForFinished(5'000);
         co_return errorObject(QObject::tr("Could not start the statistics fetcher (%1).")
             .arg(process.errorString()));
     }
@@ -108,9 +122,15 @@ QCoro::Task<QJsonObject> AbstractSocialAccount::_runJsonScript(
     // Pinterest, or any analytics fetch) may open a visible browser and wait
     // several minutes for the user to log in interactively before they can
     // proceed.
-    if (!co_await qCoro(process).waitForFinished(360'000))
+    timer.restart();
+    while (process.state() != QProcess::NotRunning && timer.elapsed() < 360'000)
+    {
+        co_await QCoro::sleepFor(std::chrono::milliseconds(100));
+    }
+    if (process.state() != QProcess::NotRunning)
     {
         process.kill();
+        process.waitForFinished(5'000);
         co_return errorObject(QObject::tr("The statistics fetcher timed out."));
     }
 
