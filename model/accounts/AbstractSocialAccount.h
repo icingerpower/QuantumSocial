@@ -1,7 +1,9 @@
 #ifndef ABSTRACTSOCIALACCOUNT_H
 #define ABSTRACTSOCIALACCOUNT_H
 
+#include <QDateTime>
 #include <QJsonObject>
+#include <QList>
 #include <QMap>
 #include <QSet>
 #include <QString>
@@ -59,6 +61,29 @@ public:
         QString errorMessage;
     };
 
+    // One published post/video discovered on an account profile page.
+    struct AccountPostStatistics
+    {
+        QString postUrl;
+        QString shortCode;
+        QString caption;
+        QDateTime publishDate;
+        StatSource source = StatSource::PublicView;
+        VideoStatistics stats;
+    };
+
+    // Result of scanning a registered account profile URL for published
+    // videos and their statistics.
+    struct AccountVideosResult
+    {
+        qint64 followers = -1;
+        qint64 views = -1;
+        qint64 likes = -1;
+        QList<AccountPostStatistics> posts;
+        bool notSupported = false;
+        QString errorMessage;
+    };
+
     virtual ~AbstractSocialAccount() = default;
 
     // Unique id identifying the platform (e.g. "tiktok").
@@ -83,6 +108,24 @@ public:
     // subclasses override for the sources they declared above.
     virtual QCoro::Task<VideoStatistics> fetchVideoStatistics(
         const QString &postUrl, StatSource source) const;
+
+    // Whether this platform supports scanning a profile URL for published
+    // videos and their statistics. Default: false — only platforms that
+    // override this and fetchAccountVideoStatistics() are scanned; other
+    // registered platforms display a "not supported yet" dialog.
+    virtual bool supportsAccountVideoStatistics() const;
+
+    // Scans a profile URL for published posts/videos (matching #qsXXXX
+    // short-code tags in captions/descriptions) and returns their per-post
+    // statistics along with any profile-level follower/view/like counts.
+    virtual QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(
+        const QString &profileUrl,
+        const QStringList &knownShortCodes = {}) const;
+
+    // Extracts the first short-code tag (e.g. "#qs0001" or "QS-0001") from
+    // a post caption/description, returning the normalized code ("QS-0001")
+    // or an empty string if none is present.
+    static QString extractShortCode(const QString &text);
 
     // Stable string form of a StatSource, used both in persisted snapshots
     // and as the argv[2] passed to the fetch scripts ("public"/"analytics").
@@ -119,6 +162,22 @@ protected:
     //      "follows": <int|null>, "error": <string|null>}
     QCoro::Task<VideoStatistics> runVideoStatsScript(
         const QString &scriptFileName, const QString &postUrl, StatSource source) const;
+
+    // Same infrastructure for scanning a profile URL for published posts:
+    // launches `<script> <profileUrl> [comma-separated-short-codes]` and parses
+    // its stdout as one JSON line:
+    //     {"followers": <int|null>, "views": <int|null>, "likes": <int|null>,
+    //      "posts": [{"url": <string>, "short_code": <string|null>,
+    //                 "caption": <string|null>, "publish_date": <string|int|null>,
+    //                 "source": <"public"|"analytics">,
+    //                 "views": <int|null>, "likes": <int|null>,
+    //                 "comments": <int|null>, "shares": <int|null>,
+    //                 "impressions": <int|null>, "watch_time_seconds": <int|null>,
+    //                 "avg_watch_percent": <float|null>, "follows": <int|null>}],
+    //      "error": <string|null>}
+    QCoro::Task<AccountVideosResult> runAccountVideosScript(
+        const QString &scriptFileName, const QString &profileUrl,
+        const QStringList &knownShortCodes = {}) const;
 
 private:
     // Runs `python3 <script> <args...>` and parses its stdout as one JSON

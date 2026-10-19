@@ -1205,8 +1205,13 @@ public:
         return true;
     }
 
-    QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(const QString &) const override
+    mutable QStringList lastKnownShortCodes;
+
+    QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(
+        const QString &,
+        const QStringList &knownShortCodes = {}) const override
     {
+        lastKnownShortCodes = knownShortCodes;
         co_await QCoro::sleepFor(std::chrono::milliseconds(5));
         co_return nextAccountVideosResult;
     }
@@ -1352,7 +1357,12 @@ static void checkPropertyRetrieveStatistics(const QDir &root)
             "IND_NORM_VIEWS is 0.50 (500 / 1000)");
     require(props.data(props.index(valRow, TreeProperties::IND_ENGAGEMENT, rowParent)).toString() == QStringLiteral("16.0 %"),
             "IND_ENGAGEMENT is 16.0 % ((50+10+20)/500)");
-    Q_UNUSED(root);
+    require(fakeSocial.lastKnownShortCodes.contains(shortCode),
+            "knownShortCodes passed to fetchAccountVideoStatistics");
+    require(QFileInfo::exists(root.filePath(QStringLiteral("logs/retrieve_statistics.log"))),
+            "retrieve_statistics.log written in working directory logs/");
+    require(!readFile(root.filePath(QStringLiteral("logs/retrieve_statistics.log"))).isEmpty(),
+            "retrieve_statistics.log is non-empty");
 }
 
 int main(int argc, char **argv)

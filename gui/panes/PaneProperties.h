@@ -3,11 +3,16 @@
 
 #include <QWidget>
 
+#include <QCoro/QCoroTask>
+
 QT_BEGIN_NAMESPACE
 namespace Ui { class PaneProperties; }
 QT_END_NAMESPACE
 
+class QPushButton;
 class QTreeView;
+class TableAccounts;
+class TableVideos;
 class TreeProperties;
 
 // Read/browse AND manage surface for the A/B property catalog — same
@@ -30,6 +35,9 @@ class PaneProperties : public QWidget
 public:
     explicit PaneProperties(TreeProperties *properties, TreeProperties *archive,
                             QWidget *parent = nullptr);
+    explicit PaneProperties(TreeProperties *properties, TreeProperties *archive,
+                            TableVideos *videos, TableAccounts *accounts,
+                            QWidget *parent = nullptr);
     ~PaneProperties();
 
 private slots:
@@ -47,9 +55,14 @@ private:
     Ui::PaneProperties *ui;
     TreeProperties *m_properties;
     TreeProperties *m_archive;
+    TableVideos *m_videos;
+    TableAccounts *m_accounts;
     QTreeView *m_treeActive;
     QTreeView *m_treeArchive;
+    QPushButton *m_buttonRetrieveStatistics = nullptr;
+    QCoro::Task<void> m_retrieveStatisticsTask;
 
+    QCoro::Task<void> _retrieveStatistics();
     static void _setupTree(QTreeView *tree, TreeProperties *model);
 };
 

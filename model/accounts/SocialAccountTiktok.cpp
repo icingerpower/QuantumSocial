@@ -30,4 +30,17 @@ QCoro::Task<AbstractSocialAccount::VideoStatistics> SocialAccountTiktok::fetchVi
     return runVideoStatsScript(QStringLiteral("fetch_video_stats_tiktok.py"), postUrl, source);
 }
 
+bool SocialAccountTiktok::supportsAccountVideoStatistics() const
+{
+    return true;
+}
+
+QCoro::Task<AbstractSocialAccount::AccountVideosResult>
+SocialAccountTiktok::fetchAccountVideoStatistics(
+    const QString &profileUrl, const QStringList &knownShortCodes) const
+{
+    return runAccountVideosScript(
+        QStringLiteral("fetch_account_videos_tiktok.py"), profileUrl, knownShortCodes);
+}
+
 DECLARE_SOCIAL_ACCOUNT(SocialAccountTiktok)

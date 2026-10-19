@@ -116,8 +116,6 @@ AbstractSocialAccount::VideoStatistics statsFromJson(const QJsonObject &obj)
 // The age at which videos are compared: raw counts on these platforms have
 // mostly plateaued by then, so sparse/late fetching barely hurts accuracy.
 constexpr double CANONICAL_AGE_HOURS = 7.0 * 24.0;
-// Snapshots younger than this cannot stand in for the canonical age.
-constexpr double MIN_USABLE_AGE_HOURS = 5.0 * 24.0;
 
 struct PublicationMetric
 {
@@ -125,96 +123,162 @@ struct PublicationMetric
     double engagement = -1.0;
 };
 
-// Estimates the view count of one publication at the canonical age from
-// whatever snapshots exist: log-time interpolation when snapshots bracket
-// it (view growth is roughly logarithmic), else the snapshot nearest to the
-// canonical age as long as it is old enough to be on the plateau.
+qint64 effectiveViewsOf(const AbstractSocialAccount::VideoStatistics &stats)
+{
+    return stats.views >= 0 ? stats.views : stats.impressions;
+}
+
+AbstractSocialAccount::VideoStatistics latestEffectiveStats(
+    const TableVideos::Publication &publication)
+{
+    AbstractSocialAccount::VideoStatistics merged;
+    QDateTime bestViewsDate;
+    QDateTime bestLikesDate;
+    QDateTime bestCommentsDate;
+    QDateTime bestSharesDate;
+    QDateTime bestImpressionsDate;
+
+    for (const TableVideos::StatSnapshot &snapshot : publication.snapshots)
+    {
+        const qint64 v = effectiveViewsOf(snapshot.stats);
+        if (v >= 0 && (!bestViewsDate.isValid() || snapshot.fetchDate >= bestViewsDate))
+        {
+            merged.views = v;
+            bestViewsDate = snapshot.fetchDate;
+        }
+        if (snapshot.stats.likes >= 0
+            && (!bestLikesDate.isValid() || snapshot.fetchDate >= bestLikesDate))
+        {
+            merged.likes = snapshot.stats.likes;
+            bestLikesDate = snapshot.fetchDate;
+        }
+        if (snapshot.stats.comments >= 0
+            && (!bestCommentsDate.isValid() || snapshot.fetchDate >= bestCommentsDate))
+        {
+            merged.comments = snapshot.stats.comments;
+            bestCommentsDate = snapshot.fetchDate;
+        }
+        if (snapshot.stats.shares >= 0
+            && (!bestSharesDate.isValid() || snapshot.fetchDate >= bestSharesDate))
+        {
+            merged.shares = snapshot.stats.shares;
+            bestSharesDate = snapshot.fetchDate;
+        }
+        if (snapshot.stats.impressions >= 0
+            && (!bestImpressionsDate.isValid() || snapshot.fetchDate >= bestImpressionsDate))
+        {
+            merged.impressions = snapshot.stats.impressions;
+            bestImpressionsDate = snapshot.fetchDate;
+        }
+    }
+    return merged;
+}
+
+// Estimates the view count and engagement of one publication: log-time
+// interpolation at the canonical age when snapshots bracket it, else the
+// nearest/latest snapshot immediately so freshly retrieved statistics show
+// up without waiting several days.
 bool metricAtCanonicalAge(const TableVideos::Publication &publication,
                           PublicationMetric &metric)
 {
-    if (!publication.publishDate.isValid())
+    if (publication.snapshots.isEmpty())
     {
         return false;
     }
 
-    // Never mix sources: public and analytics counts are not comparable.
-    // Public is preferred (available for every video, not only our own).
-    for (const auto wantedSource : {AbstractSocialAccount::StatSource::PublicView,
-                                    AbstractSocialAccount::StatSource::Analytics})
+    const AbstractSocialAccount::VideoStatistics mergedLatest = latestEffectiveStats(publication);
+
+    if (publication.publishDate.isValid())
     {
-        struct Point
+        for (const auto wantedSource : {AbstractSocialAccount::StatSource::PublicView,
+                                        AbstractSocialAccount::StatSource::Analytics})
         {
-            double ageHours;
-            const TableVideos::StatSnapshot *snapshot;
-        };
-        QList<Point> points;
-        for (const auto &snapshot : publication.snapshots)
-        {
-            if (snapshot.source != wantedSource || snapshot.stats.views < 0)
+            struct Point
+            {
+                double ageHours;
+                const TableVideos::StatSnapshot *snapshot;
+            };
+            QList<Point> points;
+            for (const auto &snapshot : publication.snapshots)
+            {
+                const qint64 v = effectiveViewsOf(snapshot.stats);
+                if (snapshot.source != wantedSource || v < 0)
+                {
+                    continue;
+                }
+                const double ageHours = std::max(
+                    0.0, publication.publishDate.msecsTo(snapshot.fetchDate) / 3'600'000.0);
+                points << Point{ageHours, &snapshot};
+            }
+            if (points.isEmpty())
             {
                 continue;
             }
-            const double ageHours
-                = publication.publishDate.msecsTo(snapshot.fetchDate) / 3'600'000.0;
-            if (ageHours > 0.0)
-            {
-                points << Point{ageHours, &snapshot};
-            }
-        }
-        if (points.isEmpty())
-        {
-            continue;
-        }
-        std::sort(points.begin(), points.end(),
-                  [](const Point &a, const Point &b) { return a.ageHours < b.ageHours; });
+            std::sort(points.begin(), points.end(),
+                      [](const Point &a, const Point &b) { return a.ageHours < b.ageHours; });
 
-        const Point *before = nullptr;
-        const Point *after = nullptr;
-        const Point *nearest = &points.first();
-        for (const Point &point : points)
-        {
-            if (point.ageHours <= CANONICAL_AGE_HOURS)
+            const Point *before = nullptr;
+            const Point *after = nullptr;
+            const Point *nearest = &points.last();
+            for (const Point &point : points)
             {
-                before = &point;
+                if (point.ageHours > 0.0 && point.ageHours <= CANONICAL_AGE_HOURS)
+                {
+                    before = &point;
+                }
+                else if (point.ageHours > CANONICAL_AGE_HOURS && !after)
+                {
+                    after = &point;
+                }
+                if (std::abs(point.ageHours - CANONICAL_AGE_HOURS)
+                    <= std::abs(nearest->ageHours - CANONICAL_AGE_HOURS))
+                {
+                    nearest = &point;
+                }
             }
-            else if (!after)
-            {
-                after = &point;
-            }
-            if (std::abs(point.ageHours - CANONICAL_AGE_HOURS)
-                < std::abs(nearest->ageHours - CANONICAL_AGE_HOURS))
-            {
-                nearest = &point;
-            }
-        }
 
-        if (before && after)
-        {
-            const double logT = std::log(CANONICAL_AGE_HOURS);
-            const double logBefore = std::log(before->ageHours);
-            const double logAfter = std::log(after->ageHours);
-            const double fraction = logAfter > logBefore
-                ? (logT - logBefore) / (logAfter - logBefore)
-                : 0.0;
-            metric.views = before->snapshot->stats.views
-                + fraction * (after->snapshot->stats.views - before->snapshot->stats.views);
-        }
-        else if (nearest->ageHours >= MIN_USABLE_AGE_HOURS)
-        {
-            metric.views = nearest->snapshot->stats.views;
-        }
-        else
-        {
-            return false; // Only young snapshots so far — try again later.
-        }
+            if (before && after)
+            {
+                const double logT = std::log(CANONICAL_AGE_HOURS);
+                const double logBefore = std::log(before->ageHours);
+                const double logAfter = std::log(after->ageHours);
+                const double fraction = logAfter > logBefore
+                    ? (logT - logBefore) / (logAfter - logBefore)
+                    : 0.0;
+                const double vBefore = static_cast<double>(effectiveViewsOf(before->snapshot->stats));
+                const double vAfter = static_cast<double>(effectiveViewsOf(after->snapshot->stats));
+                metric.views = vBefore + fraction * (vAfter - vBefore);
+            }
+            else
+            {
+                metric.views = static_cast<double>(effectiveViewsOf(nearest->snapshot->stats));
+            }
 
-        const auto &stats = nearest->snapshot->stats;
-        if (stats.views > 0)
+            const auto &stats = nearest->snapshot->stats;
+            const qint64 likes = stats.likes >= 0 ? stats.likes : mergedLatest.likes;
+            const qint64 comments = stats.comments >= 0 ? stats.comments : mergedLatest.comments;
+            const qint64 shares = stats.shares >= 0 ? stats.shares : mergedLatest.shares;
+            if (metric.views > 0.0 && (likes >= 0 || comments >= 0 || shares >= 0))
+            {
+                const double interactions = std::max<qint64>(likes, 0)
+                    + std::max<qint64>(comments, 0)
+                    + std::max<qint64>(shares, 0);
+                metric.engagement = interactions / metric.views;
+            }
+            return true;
+        }
+    }
+
+    if (mergedLatest.views >= 0)
+    {
+        metric.views = static_cast<double>(mergedLatest.views);
+        if (metric.views > 0.0
+            && (mergedLatest.likes >= 0 || mergedLatest.comments >= 0 || mergedLatest.shares >= 0))
         {
-            const double interactions = std::max<qint64>(stats.likes, 0)
-                + std::max<qint64>(stats.comments, 0)
-                + std::max<qint64>(stats.shares, 0);
-            metric.engagement = interactions / static_cast<double>(stats.views);
+            const double interactions = std::max<qint64>(mergedLatest.likes, 0)
+                + std::max<qint64>(mergedLatest.comments, 0)
+                + std::max<qint64>(mergedLatest.shares, 0);
+            metric.engagement = interactions / metric.views;
         }
         return true;
     }
@@ -339,19 +403,12 @@ QVariant TableVideos::data(const QModelIndex &index, int role) const
         qint64 total = -1;
         for (const Publication &publication : record.publications)
         {
-            const StatSnapshot *latest = nullptr;
-            for (const StatSnapshot &snapshot : publication.snapshots)
-            {
-                if (!latest || snapshot.fetchDate > latest->fetchDate)
-                {
-                    latest = &snapshot;
-                }
-            }
-            if (!latest)
+            if (publication.snapshots.isEmpty())
             {
                 continue;
             }
-            const qint64 value = index.column() == 5 ? latest->stats.views : latest->stats.likes;
+            const auto merged = latestEffectiveStats(publication);
+            const qint64 value = index.column() == 5 ? merged.views : merged.likes;
             if (value >= 0)
             {
                 total = std::max<qint64>(total, 0) + value;
@@ -429,6 +486,26 @@ const TableVideos::VideoRecord *TableVideos::recordFromShortCode(const QString &
     return nullptr;
 }
 
+const TableVideos::VideoRecord *TableVideos::recordFromPostUrl(const QString &postUrl) const
+{
+    const QString trimmed = postUrl.trimmed();
+    if (trimmed.isEmpty())
+    {
+        return nullptr;
+    }
+    for (const VideoRecord &record : m_videos)
+    {
+        for (const Publication &publication : record.publications)
+        {
+            if (publication.postUrl.trimmed() == trimmed)
+            {
+                return &record;
+            }
+        }
+    }
+    return nullptr;
+}
+
 QList<const TableVideos::VideoRecord *> TableVideos::recordsForProject(
     const QUuid &projectId) const
 {
@@ -491,6 +568,27 @@ void TableVideos::addPublication(const QUuid &videoId, const QString &platformId
         return;
     }
     record->published = true;
+    for (Publication &existing : record->publications)
+    {
+        if (!postUrl.isEmpty() && existing.postUrl == postUrl)
+        {
+            if (existing.platformId.isEmpty() && !platformId.isEmpty())
+            {
+                existing.platformId = platformId;
+            }
+            if (!existing.publishDate.isValid() && publishDate.isValid())
+            {
+                existing.publishDate = publishDate;
+            }
+            if (existing.followersAtPublish <= 0 && followersAtPublish > 0)
+            {
+                existing.followersAtPublish = followersAtPublish;
+            }
+            _emitRowChanged(rowOfId(videoId));
+            _saveInFile();
+            return;
+        }
+    }
     Publication publication;
     publication.platformId = platformId;
     publication.postUrl = postUrl;
@@ -634,6 +732,29 @@ TableVideos::AggregateStats TableVideos::aggregateForValue(const QUuid &valueId)
             ? 1.0 : 0.5;
         for (const Publication &publication : record.publications)
         {
+            if (publication.snapshots.isEmpty())
+            {
+                continue;
+            }
+            const AbstractSocialAccount::VideoStatistics latest = latestEffectiveStats(publication);
+            if (latest.views >= 0)
+            {
+                aggregate.totalViews = std::max<qint64>(aggregate.totalViews, 0) + latest.views;
+            }
+            if (latest.likes >= 0)
+            {
+                aggregate.totalLikes = std::max<qint64>(aggregate.totalLikes, 0) + latest.likes;
+            }
+            if (latest.comments >= 0)
+            {
+                aggregate.totalComments
+                    = std::max<qint64>(aggregate.totalComments, 0) + latest.comments;
+            }
+            if (latest.shares >= 0)
+            {
+                aggregate.totalShares = std::max<qint64>(aggregate.totalShares, 0) + latest.shares;
+            }
+
             PublicationMetric metric;
             if (!metricAtCanonicalAge(publication, metric))
             {

@@ -65,17 +65,23 @@ TreeProperties::PropertyNode *findById(TreeProperties::PropertyNode *node, const
 } // namespace
 
 const QStringList TreeProperties::HEADER{
-    "Name", "Prompt", "Origin", "Videos", "Views/Follower", "Engagement",
+    "Name", "Prompt", "Origin", "Videos",
+    "Views", "Likes", "Comments", "Shares/Saves",
+    "Views/Follower", "Engagement",
     "Last used", "Generated", "Stats"};
 const int TreeProperties::IND_NAME{0};
 const int TreeProperties::IND_PROMPT{1};
 const int TreeProperties::IND_ORIGIN{2};
 const int TreeProperties::IND_VIDEO_COUNT{3};
-const int TreeProperties::IND_NORM_VIEWS{4};
-const int TreeProperties::IND_ENGAGEMENT{5};
-const int TreeProperties::IND_LAST_USED{6};
-const int TreeProperties::IND_GENERATED{7};
-const int TreeProperties::IND_STATS{8};
+const int TreeProperties::IND_VIEWS{4};
+const int TreeProperties::IND_LIKES{5};
+const int TreeProperties::IND_COMMENTS{6};
+const int TreeProperties::IND_SHARES{7};
+const int TreeProperties::IND_NORM_VIEWS{8};
+const int TreeProperties::IND_ENGAGEMENT{9};
+const int TreeProperties::IND_LAST_USED{10};
+const int TreeProperties::IND_GENERATED{11};
+const int TreeProperties::IND_STATS{12};
 
 TreeProperties::PropertyNode::~PropertyNode()
 {
@@ -169,16 +175,17 @@ QVariant TreeProperties::data(const QModelIndex &index, int role) const
         return QVariant{};
     }
 
-    switch (index.column())
+    if (index.column() == IND_NAME)
     {
-    case 0: // IND_NAME
         return node->name;
-    case 1: // IND_PROMPT
+    }
+    if (index.column() == IND_PROMPT)
+    {
         return node->promptFragment;
-    case 2: // IND_ORIGIN
+    }
+    if (index.column() == IND_ORIGIN)
+    {
         return node->origin;
-    default:
-        break;
     }
 
     // Statistics columns only make sense on testable values, and only for
@@ -192,26 +199,46 @@ QVariant TreeProperties::data(const QModelIndex &index, int role) const
     {
         return QVariant{};
     }
-    switch (index.column())
+    if (index.column() == IND_VIDEO_COUNT)
     {
-    case 3: // IND_VIDEO_COUNT
         return aggregate->videoCount > 0 ? QVariant{aggregate->videoCount} : QVariant{};
-    case 4: // IND_NORM_VIEWS
+    }
+    if (index.column() == IND_VIEWS)
+    {
+        return aggregate->totalViews >= 0 ? QVariant{aggregate->totalViews} : QVariant{};
+    }
+    if (index.column() == IND_LIKES)
+    {
+        return aggregate->totalLikes >= 0 ? QVariant{aggregate->totalLikes} : QVariant{};
+    }
+    if (index.column() == IND_COMMENTS)
+    {
+        return aggregate->totalComments >= 0 ? QVariant{aggregate->totalComments} : QVariant{};
+    }
+    if (index.column() == IND_SHARES)
+    {
+        return aggregate->totalShares >= 0 ? QVariant{aggregate->totalShares} : QVariant{};
+    }
+    if (index.column() == IND_NORM_VIEWS)
+    {
         return aggregate->medianNormViews >= 0.0
             ? QVariant{QString::number(aggregate->medianNormViews, 'f', 2)}
             : QVariant{};
-    case 5: // IND_ENGAGEMENT
+    }
+    if (index.column() == IND_ENGAGEMENT)
+    {
         return aggregate->medianEngagement >= 0.0
             ? QVariant{QStringLiteral("%1 %")
                   .arg(QString::number(aggregate->medianEngagement * 100.0, 'f', 1))}
             : QVariant{};
-    case 6: // IND_LAST_USED
+    }
+    if (index.column() == IND_LAST_USED)
+    {
         return aggregate->lastUsed.isValid()
             ? QVariant{aggregate->lastUsed.toLocalTime().toString(QStringLiteral("yyyy-MM-dd"))}
             : QVariant{};
-    default:
-        return QVariant{};
     }
+    return QVariant{};
 }
 
 bool TreeProperties::setData(const QModelIndex &index, const QVariant &value, int role)

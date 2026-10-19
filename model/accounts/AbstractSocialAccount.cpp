@@ -10,10 +10,13 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
+#include <QTimeZone>
 
 #ifndef SOCIAL_STATS_SCRIPT_DIR
 #define SOCIAL_STATS_SCRIPT_DIR ""
@@ -27,6 +30,56 @@ qint64 jsonStat(const QJsonObject &obj, const QString &key)
 {
     const QJsonValue value = obj.value(key);
     return value.isDouble() ? static_cast<qint64>(value.toDouble()) : -1;
+}
+
+AbstractSocialAccount::VideoStatistics parseVideoStatsObject(const QJsonObject &object)
+{
+    AbstractSocialAccount::VideoStatistics stats;
+    stats.views = jsonStat(object, QStringLiteral("views"));
+    stats.likes = jsonStat(object, QStringLiteral("likes"));
+    stats.comments = jsonStat(object, QStringLiteral("comments"));
+    stats.shares = jsonStat(object, QStringLiteral("shares"));
+    stats.impressions = jsonStat(object, QStringLiteral("impressions"));
+    stats.watchTimeSeconds = jsonStat(object, QStringLiteral("watch_time_seconds"));
+    stats.followsFromVideo = jsonStat(object, QStringLiteral("follows"));
+    const QJsonValue watchPercent = object.value(QStringLiteral("avg_watch_percent"));
+    if (watchPercent.isDouble())
+    {
+        stats.avgWatchPercent = watchPercent.toDouble();
+    }
+    stats.errorMessage = object.value(QStringLiteral("error")).toString();
+    return stats;
+}
+
+QDateTime parsePublishDate(const QJsonValue &value)
+{
+    if (value.isDouble())
+    {
+        const qint64 timestamp = static_cast<qint64>(value.toDouble());
+        if (timestamp > 0)
+        {
+            return QDateTime::fromSecsSinceEpoch(timestamp, QTimeZone::UTC);
+        }
+    }
+    else if (value.isString())
+    {
+        const QString text = value.toString().trimmed();
+        if (!text.isEmpty())
+        {
+            bool ok = false;
+            const qint64 ts = text.toLongLong(&ok);
+            if (ok && ts > 0)
+            {
+                return QDateTime::fromSecsSinceEpoch(ts, QTimeZone::UTC);
+            }
+            const QDateTime dt = QDateTime::fromString(text, Qt::ISODate);
+            if (dt.isValid())
+            {
+                return dt.toUTC();
+            }
+        }
+    }
+    return QDateTime{};
 }
 
 } // namespace
@@ -60,6 +113,37 @@ QCoro::Task<AbstractSocialAccount::VideoStatistics> AbstractSocialAccount::fetch
     stats.errorMessage = QObject::tr("%1 does not support fetching per-post statistics (%2).")
         .arg(getName(), statSourceKey(source));
     co_return stats;
+}
+
+bool AbstractSocialAccount::supportsAccountVideoStatistics() const
+{
+    return false;
+}
+
+QCoro::Task<AbstractSocialAccount::AccountVideosResult>
+AbstractSocialAccount::fetchAccountVideoStatistics(
+    const QString &profileUrl, const QStringList &knownShortCodes) const
+{
+    Q_UNUSED(profileUrl);
+    Q_UNUSED(knownShortCodes);
+    AccountVideosResult result;
+    result.notSupported = true;
+    result.errorMessage = QObject::tr("Retrieving published video statistics for %1 is not supported yet.")
+        .arg(getName());
+    co_return result;
+}
+
+QString AbstractSocialAccount::extractShortCode(const QString &text)
+{
+    static const QRegularExpression pattern(
+        QStringLiteral(R"((?:#\s*qs[-_]?|\bqs-)([0-9a-hjkmnp-tv-z]{4,})\b)"),
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch match = pattern.match(text);
+    if (!match.hasMatch())
+    {
+        return QString{};
+    }
+    return QStringLiteral("QS-") + match.captured(1).toUpper();
 }
 
 QString AbstractSocialAccount::statSourceKey(StatSource source)
@@ -174,19 +258,49 @@ QCoro::Task<AbstractSocialAccount::VideoStatistics> AbstractSocialAccount::runVi
     QJsonObject object;
     object = co_await _runJsonScript(scriptFileName, args);
 
-    VideoStatistics stats;
-    stats.views = jsonStat(object, QStringLiteral("views"));
-    stats.likes = jsonStat(object, QStringLiteral("likes"));
-    stats.comments = jsonStat(object, QStringLiteral("comments"));
-    stats.shares = jsonStat(object, QStringLiteral("shares"));
-    stats.impressions = jsonStat(object, QStringLiteral("impressions"));
-    stats.watchTimeSeconds = jsonStat(object, QStringLiteral("watch_time_seconds"));
-    stats.followsFromVideo = jsonStat(object, QStringLiteral("follows"));
-    const QJsonValue watchPercent = object.value(QStringLiteral("avg_watch_percent"));
-    if (watchPercent.isDouble())
-    {
-        stats.avgWatchPercent = watchPercent.toDouble();
-    }
-    stats.errorMessage = object.value(QStringLiteral("error")).toString();
+    VideoStatistics stats = parseVideoStatsObject(object);
     co_return stats;
+}
+
+QCoro::Task<AbstractSocialAccount::AccountVideosResult>
+AbstractSocialAccount::runAccountVideosScript(
+    const QString &scriptFileName, const QString &profileUrl,
+    const QStringList &knownShortCodes) const
+{
+    QStringList args{profileUrl};
+    if (!knownShortCodes.isEmpty())
+    {
+        args << knownShortCodes.join(QStringLiteral(","));
+    }
+    QJsonObject object;
+    object = co_await _runJsonScript(scriptFileName, args);
+
+    AccountVideosResult result;
+    result.followers = jsonStat(object, QStringLiteral("followers"));
+    result.views = jsonStat(object, QStringLiteral("views"));
+    result.likes = jsonStat(object, QStringLiteral("likes"));
+    result.errorMessage = object.value(QStringLiteral("error")).toString();
+
+    for (const QJsonValue &postValue : object.value(QStringLiteral("posts")).toArray())
+    {
+        if (!postValue.isObject())
+        {
+            continue;
+        }
+        const QJsonObject postObj = postValue.toObject();
+        AccountPostStatistics post;
+        post.postUrl = postObj.value(QStringLiteral("url")).toString().trimmed();
+        post.caption = postObj.value(QStringLiteral("caption")).toString();
+        post.shortCode = postObj.value(QStringLiteral("short_code")).toString().trimmed();
+        if (post.shortCode.isEmpty() && !post.caption.isEmpty())
+        {
+            post.shortCode = extractShortCode(post.caption);
+        }
+        post.publishDate = parsePublishDate(postObj.value(QStringLiteral("publish_date")));
+        post.source = statSourceFromKey(postObj.value(QStringLiteral("source")).toString());
+        post.stats = parseVideoStatsObject(postObj);
+        result.posts << post;
+    }
+
+    co_return result;
 }

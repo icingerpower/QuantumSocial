@@ -38,6 +38,10 @@ public:
     static const int IND_PROMPT;
     static const int IND_ORIGIN;
     static const int IND_VIDEO_COUNT;
+    static const int IND_VIEWS;
+    static const int IND_LIKES;
+    static const int IND_COMMENTS;
+    static const int IND_SHARES;
     static const int IND_NORM_VIEWS;
     static const int IND_ENGAGEMENT;
     static const int IND_LAST_USED;

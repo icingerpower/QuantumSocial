@@ -17,6 +17,7 @@ class PaneAccounts : public QWidget
 
 public:
     explicit PaneAccounts(QWidget *parent = nullptr);
+    explicit PaneAccounts(TableAccounts *accounts, QWidget *parent = nullptr);
     ~PaneAccounts();
 
 private slots:

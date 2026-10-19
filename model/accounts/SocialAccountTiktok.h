@@ -12,6 +12,10 @@ public:
     QSet<StatSource> supportedVideoStatSources() const override;
     QCoro::Task<VideoStatistics> fetchVideoStatistics(
         const QString &postUrl, StatSource source) const override;
+    bool supportsAccountVideoStatistics() const override;
+    QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(
+        const QString &profileUrl,
+        const QStringList &knownShortCodes = {}) const override;
 };
 
 #endif // SOCIALACCOUNTTIKTOK_H

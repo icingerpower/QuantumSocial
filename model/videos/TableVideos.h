@@ -82,9 +82,13 @@ public:
     struct AggregateStats
     {
         int videoCount = 0;
+        qint64 totalViews = -1;
+        qint64 totalLikes = -1;
+        qint64 totalComments = -1;
+        qint64 totalShares = -1;
         QDateTime lastUsed;
-        double medianNormViews = -1.0;   // views at ~7d / followers at publish
-        double medianEngagement = -1.0;  // (likes+comments+shares) / views at ~7d
+        double medianNormViews = -1.0;   // views / followers at publish
+        double medianEngagement = -1.0;  // (likes+comments+shares) / views
     };
 
     struct DuePublication
@@ -130,6 +134,7 @@ public:
     // Tolerant lookup: case-insensitive, "QS-0001", "qs0001" and "#qs0001"
     // all match — the code may come back from a caption in the wild.
     const VideoRecord *recordFromShortCode(const QString &shortCode) const;
+    const VideoRecord *recordFromPostUrl(const QString &postUrl) const;
     int rowOfId(const QUuid &videoId) const;
     // Every record generated from the given project, most recent first —
     // drives the per-project "Generations" view.

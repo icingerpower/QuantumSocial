@@ -7,4 +7,6 @@ set(ACCOUNTS_FILES
     ${CMAKE_CURRENT_LIST_DIR}/SocialAccountPinterest.cpp
     ${CMAKE_CURRENT_LIST_DIR}/SocialAccountYoutube.h
     ${CMAKE_CURRENT_LIST_DIR}/SocialAccountYoutube.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountInstagram.h
+    ${CMAKE_CURRENT_LIST_DIR}/SocialAccountInstagram.cpp
 )

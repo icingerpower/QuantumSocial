@@ -17,14 +17,22 @@
 #include "model/accounts/AbstractSocialAccount.h"
 
 PaneAccounts::PaneAccounts(QWidget *parent)
+    : PaneAccounts(nullptr, parent)
+{
+}
+
+PaneAccounts::PaneAccounts(TableAccounts *accounts, QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::PaneAccounts)
-    , m_model(nullptr)
+    , m_model(accounts)
 {
     ui->setupUi(this);
 
-    m_model = new TableAccounts(
-        WorkingDirectoryManager::instance()->workingDir().absolutePath(), this);
+    if (!m_model)
+    {
+        m_model = new TableAccounts(
+            WorkingDirectoryManager::instance()->workingDir().absolutePath(), this);
+    }
     ui->tableViewSocialAccount->setModel(m_model);
     ui->tableViewSocialAccount->horizontalHeader()->setStretchLastSection(true);
     ui->tableViewSocialAccount->horizontalHeader()->resizeSection(TableAccounts::IND_URL, 300);
