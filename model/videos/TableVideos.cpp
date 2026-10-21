@@ -709,6 +709,66 @@ QList<TableVideos::DuePublication> TableVideos::duePublications(const QDateTime 
     return due;
 }
 
+namespace {
+
+void accumulateRecordPublications(const TableVideos::VideoRecord &record,
+                                  TableVideos::AggregateStats &aggregate,
+                                  QList<QPair<double, double>> &normViewsSamples,
+                                  QList<QPair<double, double>> &engagementSamples)
+{
+    ++aggregate.videoCount;
+    if (!aggregate.lastUsed.isValid() || record.generatedDate > aggregate.lastUsed)
+    {
+        aggregate.lastUsed = record.generatedDate;
+    }
+
+    const double weight
+        = record.derivation == QLatin1String("original") || record.derivation.isEmpty()
+        ? 1.0 : 0.5;
+    for (const TableVideos::Publication &publication : record.publications)
+    {
+        if (publication.snapshots.isEmpty())
+        {
+            continue;
+        }
+        const AbstractSocialAccount::VideoStatistics latest = latestEffectiveStats(publication);
+        if (latest.views >= 0)
+        {
+            aggregate.totalViews = std::max<qint64>(aggregate.totalViews, 0) + latest.views;
+        }
+        if (latest.likes >= 0)
+        {
+            aggregate.totalLikes = std::max<qint64>(aggregate.totalLikes, 0) + latest.likes;
+        }
+        if (latest.comments >= 0)
+        {
+            aggregate.totalComments
+                = std::max<qint64>(aggregate.totalComments, 0) + latest.comments;
+        }
+        if (latest.shares >= 0)
+        {
+            aggregate.totalShares = std::max<qint64>(aggregate.totalShares, 0) + latest.shares;
+        }
+
+        PublicationMetric metric;
+        if (!metricAtCanonicalAge(publication, metric))
+        {
+            continue;
+        }
+        if (metric.views >= 0.0 && publication.followersAtPublish > 0)
+        {
+            normViewsSamples << qMakePair(
+                metric.views / publication.followersAtPublish, weight);
+        }
+        if (metric.engagement >= 0.0)
+        {
+            engagementSamples << qMakePair(metric.engagement, weight);
+        }
+    }
+}
+
+} // namespace
+
 TableVideos::AggregateStats TableVideos::aggregateForValue(const QUuid &valueId) const
 {
     AggregateStats aggregate;
@@ -721,60 +781,29 @@ TableVideos::AggregateStats TableVideos::aggregateForValue(const QUuid &valueId)
         {
             continue;
         }
-        ++aggregate.videoCount;
-        if (!aggregate.lastUsed.isValid() || record.generatedDate > aggregate.lastUsed)
-        {
-            aggregate.lastUsed = record.generatedDate;
-        }
-
-        const double weight
-            = record.derivation == QLatin1String("original") || record.derivation.isEmpty()
-            ? 1.0 : 0.5;
-        for (const Publication &publication : record.publications)
-        {
-            if (publication.snapshots.isEmpty())
-            {
-                continue;
-            }
-            const AbstractSocialAccount::VideoStatistics latest = latestEffectiveStats(publication);
-            if (latest.views >= 0)
-            {
-                aggregate.totalViews = std::max<qint64>(aggregate.totalViews, 0) + latest.views;
-            }
-            if (latest.likes >= 0)
-            {
-                aggregate.totalLikes = std::max<qint64>(aggregate.totalLikes, 0) + latest.likes;
-            }
-            if (latest.comments >= 0)
-            {
-                aggregate.totalComments
-                    = std::max<qint64>(aggregate.totalComments, 0) + latest.comments;
-            }
-            if (latest.shares >= 0)
-            {
-                aggregate.totalShares = std::max<qint64>(aggregate.totalShares, 0) + latest.shares;
-            }
-
-            PublicationMetric metric;
-            if (!metricAtCanonicalAge(publication, metric))
-            {
-                continue;
-            }
-            if (metric.views >= 0.0 && publication.followersAtPublish > 0)
-            {
-                normViewsSamples << qMakePair(
-                    metric.views / publication.followersAtPublish, weight);
-            }
-            if (metric.engagement >= 0.0)
-            {
-                engagementSamples << qMakePair(metric.engagement, weight);
-            }
-        }
+        accumulateRecordPublications(record, aggregate, normViewsSamples, engagementSamples);
     }
 
     aggregate.medianNormViews = weightedMedian(normViewsSamples);
     aggregate.medianEngagement = weightedMedian(engagementSamples);
     return aggregate;
+}
+
+TableVideos::AggregateStats TableVideos::aggregateForRecord(const VideoRecord &record)
+{
+    AggregateStats aggregate;
+    QList<QPair<double, double>> normViewsSamples;
+    QList<QPair<double, double>> engagementSamples;
+    accumulateRecordPublications(record, aggregate, normViewsSamples, engagementSamples);
+    aggregate.medianNormViews = weightedMedian(normViewsSamples);
+    aggregate.medianEngagement = weightedMedian(engagementSamples);
+    return aggregate;
+}
+
+TableVideos::AggregateStats TableVideos::aggregateForVideo(const QUuid &videoId) const
+{
+    const VideoRecord *record = recordFromId(videoId);
+    return record ? aggregateForRecord(*record) : AggregateStats{};
 }
 
 bool TableVideos::hasRetrievedStatistics(const QUuid &videoId) const

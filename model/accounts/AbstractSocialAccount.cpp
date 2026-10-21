@@ -136,7 +136,7 @@ AbstractSocialAccount::fetchAccountVideoStatistics(
 QString AbstractSocialAccount::extractShortCode(const QString &text)
 {
     static const QRegularExpression pattern(
-        QStringLiteral(R"((?:#\s*qs[-_]?|\bqs-)([0-9a-hjkmnp-tv-z]{4,})\b)"),
+        QStringLiteral(R"((?:#\s*qs[-_]?|\bqs[-_]?)([0-9a-hjkmnp-tv-z]{4,})\b)"),
         QRegularExpression::CaseInsensitiveOption);
     const QRegularExpressionMatch match = pattern.match(text);
     if (!match.hasMatch())

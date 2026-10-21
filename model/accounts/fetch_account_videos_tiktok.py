@@ -50,7 +50,7 @@ LOG_DIR = os.path.expanduser("~/.cache/quantumsocial")
 DEFAULT_LOG_PATH = os.path.join(LOG_DIR, "tiktok_stats.log")
 
 SHORT_CODE_RE = re.compile(
-    r"(?:#\s*qs[-_]?|\bqs-)([0-9a-hjkmnp-tv-z]{4,})\b", re.IGNORECASE
+    r"(?:#\s*qs[-_]?|\bqs[-_]?)([0-9a-hjkmnp-tv-z]{4,})\b", re.IGNORECASE
 )
 
 

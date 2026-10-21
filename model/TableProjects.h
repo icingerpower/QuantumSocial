@@ -6,9 +6,9 @@
 #include <QUuid>
 
 // One row per video project. Visible columns: Name (renameable in place)
-// and Created. The trailing columns are hidden in the view: Keyword and
+// and Type. The trailing columns are hidden in the view: Created, Keyword and
 // Hook idea (edited through the Source form via QDataWidgetMapper), the
-// source image path, and — always LAST — the project id. Rows are matched
+// source image paths, and — always LAST — the project id. Rows are matched
 // by that id on save/reload, so renames and row reordering never matter;
 // new columns must be inserted before it.
 //
@@ -60,12 +60,14 @@ public:
     // optional; the name defaults to the keyword when given, else
     // "Project <n>" — renameable in the table afterwards. Returns the new row.
     int addProject(const QString &imagePath, const QString &imagePath2,
-                   const QString &keyword, const QString &hookIdea);
+                   const QString &keyword, const QString &hookIdea,
+                   const QString &type = QStringLiteral("single"));
 
     // Creates a multi-video project row and folder
     int addMultiVideoProject(const QString &keyword, const QString &firstImagePath = QString{});
     bool isMultiVideoProject(int row) const;
     QString projectType(int row) const;
+    static QString formatTypeLabel(const QString &type);
 
     // Removes the row AND deletes the project's folder on disk — callers
     // must confirm with the user first.

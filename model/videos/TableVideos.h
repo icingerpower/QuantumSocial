@@ -166,6 +166,8 @@ public:
         const QDateTime &now = QDateTime::currentDateTimeUtc()) const;
 
     AggregateStats aggregateForValue(const QUuid &valueId) const;
+    AggregateStats aggregateForVideo(const QUuid &videoId) const;
+    static AggregateStats aggregateForRecord(const VideoRecord &record);
 
     // True once at least one publication of this video has at least one
     // fetched statistics snapshot — the signal that it was actually

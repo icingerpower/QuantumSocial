@@ -20,7 +20,7 @@ QT_END_NAMESPACE
 // The hook and the description are picked INDEPENDENTLY (click a cell in
 // each column — they do not need to be on the same row); the chosen cells
 // are highlighted. Every description carries the video's short code tag
-// (e.g. "#qs0001"), which maps back to the exact property values the video
+// (e.g. "qs0001", legacy "#qs0001"), which maps back to the exact property values the video
 // was generated with (TableVideos::recordFromShortCode).
 //
 // Users can also regenerate more hooks using the selected CLI, or add,
@@ -46,7 +46,7 @@ public:
         AbstractCli *selectedCli = nullptr;
     };
 
-    // codeTag: e.g. "#qs0001"; empty when no video record exists.
+    // codeTag: e.g. "qs0001" (legacy "#qs0001"); empty when no video record exists.
     explicit DialogHooks(const QList<QPair<QString, QString>> &hooks,
                          const QString &codeTag,
                          QWidget *parent = nullptr);

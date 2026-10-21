@@ -5,6 +5,8 @@
 
 #include "TreeProperties.h"
 
+#include "../videos/SocialStatistics.h"
+
 namespace {
 
 QJsonObject nodeToJson(const TreeProperties::PropertyNode *node)
@@ -64,24 +66,28 @@ TreeProperties::PropertyNode *findById(TreeProperties::PropertyNode *node, const
 
 } // namespace
 
-const QStringList TreeProperties::HEADER{
-    "Name", "Prompt", "Origin", "Videos",
-    "Views", "Likes", "Comments", "Shares/Saves",
-    "Views/Follower", "Engagement",
-    "Last used", "Generated", "Stats"};
+const QStringList TreeProperties::HEADER = []() {
+    QStringList h{QStringLiteral("Name"), QStringLiteral("Prompt"),
+                  QStringLiteral("Origin"), QStringLiteral("Videos")};
+    h.append(SocialStatistics::headers());
+    h << QStringLiteral("Last used") << QStringLiteral("Generated")
+      << QStringLiteral("Stats");
+    return h;
+}();
 const int TreeProperties::IND_NAME{0};
 const int TreeProperties::IND_PROMPT{1};
 const int TreeProperties::IND_ORIGIN{2};
 const int TreeProperties::IND_VIDEO_COUNT{3};
-const int TreeProperties::IND_VIEWS{4};
-const int TreeProperties::IND_LIKES{5};
-const int TreeProperties::IND_COMMENTS{6};
-const int TreeProperties::IND_SHARES{7};
-const int TreeProperties::IND_NORM_VIEWS{8};
-const int TreeProperties::IND_ENGAGEMENT{9};
-const int TreeProperties::IND_LAST_USED{10};
-const int TreeProperties::IND_GENERATED{11};
-const int TreeProperties::IND_STATS{12};
+const int TreeProperties::IND_FIRST_STAT{4};
+const int TreeProperties::IND_VIEWS{IND_FIRST_STAT + static_cast<int>(SocialStatistics::StatColumn::Views)};
+const int TreeProperties::IND_LIKES{IND_FIRST_STAT + static_cast<int>(SocialStatistics::StatColumn::Likes)};
+const int TreeProperties::IND_COMMENTS{IND_FIRST_STAT + static_cast<int>(SocialStatistics::StatColumn::Comments)};
+const int TreeProperties::IND_SHARES{IND_FIRST_STAT + static_cast<int>(SocialStatistics::StatColumn::Shares)};
+const int TreeProperties::IND_NORM_VIEWS{IND_FIRST_STAT + static_cast<int>(SocialStatistics::StatColumn::NormViews)};
+const int TreeProperties::IND_ENGAGEMENT{IND_FIRST_STAT + static_cast<int>(SocialStatistics::StatColumn::Engagement)};
+const int TreeProperties::IND_LAST_USED{IND_FIRST_STAT + SocialStatistics::columnCount()};
+const int TreeProperties::IND_GENERATED{IND_LAST_USED + 1};
+const int TreeProperties::IND_STATS{IND_LAST_USED + 2};
 
 TreeProperties::PropertyNode::~PropertyNode()
 {
@@ -203,34 +209,10 @@ QVariant TreeProperties::data(const QModelIndex &index, int role) const
     {
         return aggregate->videoCount > 0 ? QVariant{aggregate->videoCount} : QVariant{};
     }
-    if (index.column() == IND_VIEWS)
+    if (index.column() >= IND_FIRST_STAT
+        && index.column() < IND_FIRST_STAT + SocialStatistics::columnCount())
     {
-        return aggregate->totalViews >= 0 ? QVariant{aggregate->totalViews} : QVariant{};
-    }
-    if (index.column() == IND_LIKES)
-    {
-        return aggregate->totalLikes >= 0 ? QVariant{aggregate->totalLikes} : QVariant{};
-    }
-    if (index.column() == IND_COMMENTS)
-    {
-        return aggregate->totalComments >= 0 ? QVariant{aggregate->totalComments} : QVariant{};
-    }
-    if (index.column() == IND_SHARES)
-    {
-        return aggregate->totalShares >= 0 ? QVariant{aggregate->totalShares} : QVariant{};
-    }
-    if (index.column() == IND_NORM_VIEWS)
-    {
-        return aggregate->medianNormViews >= 0.0
-            ? QVariant{QString::number(aggregate->medianNormViews, 'f', 2)}
-            : QVariant{};
-    }
-    if (index.column() == IND_ENGAGEMENT)
-    {
-        return aggregate->medianEngagement >= 0.0
-            ? QVariant{QStringLiteral("%1 %")
-                  .arg(QString::number(aggregate->medianEngagement * 100.0, 'f', 1))}
-            : QVariant{};
+        return SocialStatistics::displayValue(*aggregate, index.column() - IND_FIRST_STAT);
     }
     if (index.column() == IND_LAST_USED)
     {

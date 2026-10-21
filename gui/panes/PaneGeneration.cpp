@@ -62,6 +62,7 @@
 #include "model/FavoriteHooks.h"
 #include "model/FavoriteVideoPrompts.h"
 #include "model/PreferredHashtags.h"
+#include "model/accounts/AbstractSocialAccount.h"
 #include "model/PromptLessons.h"
 #include "model/videogen/ProductShowcaseMultiVideoWorkflow.h"
 #include "model/SavedPrompts.h"
@@ -102,7 +103,8 @@ const QString SUGGESTIONS_FILE_NAME = QStringLiteral("suggestions.json");
 const QString HOOKS_FILE_NAME = QStringLiteral("hooks.json");
 const QString HOOK_DESCRIPTION_FILE_NAME = QStringLiteral("hook-description.txt");
 
-// "QS-0001" -> "#qs0001": the tag appended to descriptions; tolerant lookup
+// "QS-0001" -> "qs0001": the tag appended to descriptions (without '#' so platforms
+// like TikTok with a 5-hashtag limit don't count it as a hashtag); tolerant lookup
 // (TableVideos::recordFromShortCode) maps it back to the property recipe.
 QString codeTagFromShortCode(const QString &shortCode)
 {
@@ -112,7 +114,7 @@ QString codeTagFromShortCode(const QString &shortCode)
     }
     QString digits = shortCode;
     digits.remove(QStringLiteral("QS-"));
-    return QStringLiteral("#qs") + digits.toLower();
+    return QStringLiteral("qs") + digits.toLower();
 }
 
 void saveHooksFile(const QDir &dir, const QList<QPair<QString, QString>> &hooks,
@@ -325,18 +327,21 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
         WorkingDirectoryManager::instance()->workingDir().absolutePath(), this);
     ui->tableViewProjects->setModel(m_projects);
     ui->tableViewProjects->setSelectionBehavior(QAbstractItemView::SelectRows);
-    for (int column : {TableProjects::IND_KEYWORD, TableProjects::IND_HOOK,
-                       TableProjects::IND_IMAGE, TableProjects::IND_GEN_PROMPT,
-                       TableProjects::IND_GEN_HOOK, TableProjects::IND_GEN_DESC,
-                       TableProjects::IND_IMAGE2, TableProjects::IND_TYPE, TableProjects::IND_ID})
+    for (int column : {TableProjects::IND_CREATED, TableProjects::IND_KEYWORD,
+                       TableProjects::IND_HOOK, TableProjects::IND_IMAGE,
+                       TableProjects::IND_GEN_PROMPT, TableProjects::IND_GEN_HOOK,
+                       TableProjects::IND_GEN_DESC, TableProjects::IND_IMAGE2,
+                       TableProjects::IND_ID})
     {
         ui->tableViewProjects->setColumnHidden(column, true);
     }
-    // Name keeps a generous default width but stays user-resizable
-    // (Stretch mode would lock it); the last visible column (Created)
-    // fills the remaining space so the full date/time is readable.
-    ui->tableViewProjects->horizontalHeader()->resizeSection(TableProjects::IND_NAME, 300);
-    ui->tableViewProjects->horizontalHeader()->setStretchLastSection(true);
+    ui->tableViewProjects->verticalHeader()->setVisible(false);
+    ui->tableViewProjects->horizontalHeader()->setStretchLastSection(false);
+    ui->tableViewProjects->horizontalHeader()->setSectionResizeMode(
+        TableProjects::IND_NAME, QHeaderView::Stretch);
+    ui->tableViewProjects->horizontalHeader()->setSectionResizeMode(
+        TableProjects::IND_TYPE, QHeaderView::Interactive);
+    ui->tableViewProjects->horizontalHeader()->resizeSection(TableProjects::IND_TYPE, 100);
 
     // The Source page edits the selected row directly: focus-out submits.
     m_projectMapper = new QDataWidgetMapper(this);
@@ -1760,7 +1765,7 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
         "markdown fences, no commentary — exactly this shape:\n"
         "{\"hooks\": [{\"hook\": \"...\", \"description\": \"...\"}]}\n"
         "\"hooks\": 10 short catchy hooks; each \"description\" is the "
-        "matching post description, ending with relevant hashtags.\n"
+        "matching post description, ending with relevant hashtags (at most 5 hashtags).\n"
         "After writing the file, reply with the single word: done. If you "
         "cannot write files, reply with the JSON object itself instead.")
         .arg(SUGGESTIONS_FILE_NAME);
@@ -1773,7 +1778,7 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
         metaPrompt += QStringLiteral(
             "Preferred hashtags (chosen by the user — use ONLY these unless "
             "truly none fit a given description, in which case add at most "
-            "one relevant new one): %1\n").arg(preferredHashtags.join(QStringLiteral(" ")));
+            "one relevant new one; at most 5 hashtags in total): %1\n").arg(preferredHashtags.join(QStringLiteral(" ")));
     }
     // Curated examples of hooks that actually performed well (harvested
     // from top-ranked videos) — style/tone/pattern reference for the 10
@@ -1797,7 +1802,7 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
             "SEO — non-negotiable: the target keyword is \"%1\". EVERY one of "
             "the 10 descriptions (no exceptions, not just some of them) must "
             "include \"%1\" as plain readable text somewhere in the caption "
-            "AND include %2 as one of its hashtags.\n").arg(keyword, keywordHashtag);
+            "AND include %2 as one of its hashtags (total hashtags must not exceed 5).\n").arg(keyword, keywordHashtag);
     }
     // Every strategy slot got its OWN independently-sampled recipe (see
     // _generate()) — only variant 0 is shown to the CLI as a REPRESENTATIVE
@@ -2780,7 +2785,10 @@ void PaneGeneration::_saveChosenHookDescription(
     {
         QString taggedDescription = description;
         const QString tag = codeTagFromShortCode(generation.second);
-        if (!tag.isEmpty() && !taggedDescription.contains(tag))
+        const QString existingCode = AbstractSocialAccount::extractShortCode(taggedDescription);
+        if (!tag.isEmpty()
+            && existingCode.compare(generation.second, Qt::CaseInsensitive) != 0
+            && !taggedDescription.contains(tag, Qt::CaseInsensitive))
         {
             taggedDescription += QLatin1Char(' ') + tag;
         }
@@ -2818,7 +2826,10 @@ void PaneGeneration::_refreshHooksView(const QDir &hooksDir)
     for (const auto &hook : hooks)
     {
         QString description = hook.second.trimmed();
-        if (!tag.isEmpty() && !description.contains(tag))
+        const QString existingCode = AbstractSocialAccount::extractShortCode(description);
+        if (!tag.isEmpty()
+            && existingCode.compare(shortCode, Qt::CaseInsensitive) != 0
+            && !description.contains(tag, Qt::CaseInsensitive))
         {
             description += QLatin1Char(' ') + tag;
         }

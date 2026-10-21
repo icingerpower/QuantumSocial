@@ -115,16 +115,16 @@ public:
     // registered platforms display a "not supported yet" dialog.
     virtual bool supportsAccountVideoStatistics() const;
 
-    // Scans a profile URL for published posts/videos (matching #qsXXXX
+    // Scans a profile URL for published posts/videos (matching #qsXXXX or qsXXXX
     // short-code tags in captions/descriptions) and returns their per-post
     // statistics along with any profile-level follower/view/like counts.
     virtual QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(
         const QString &profileUrl,
         const QStringList &knownShortCodes = {}) const;
 
-    // Extracts the first short-code tag (e.g. "#qs0001" or "QS-0001") from
+    // Extracts the first short-code tag (e.g. "qs0001", "#qs0001" or "QS-0001") from
     // a post caption/description, returning the normalized code ("QS-0001")
-    // or an empty string if none is present.
+    // or an empty string if none is present. Tolerant to with/without '#'.
     static QString extractShortCode(const QString &text);
 
     // Stable string form of a StatSource, used both in persisted snapshots

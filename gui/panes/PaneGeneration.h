@@ -87,6 +87,8 @@ public:
     // The image-step CLI is chosen separately in DialogGenerationOptions.
     void setAvailableClis(const QList<AbstractCli *> &clis);
 
+    TableProjects *projectsModel() const { return m_projects; }
+
     struct GenerationPromptEntry
     {
         QString label;

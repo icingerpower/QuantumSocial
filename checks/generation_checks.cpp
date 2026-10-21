@@ -36,6 +36,7 @@
 #include "gui/panes/PaneGeneration.h"
 #include "gui/panes/PaneInspiration.h"
 #include "gui/panes/PaneProperties.h"
+#include "gui/panes/PaneStatistics.h"
 #include "AvailableCliTable.h"
 #include "model/FavoriteHooks.h"
 #include "model/FavoriteVideoPrompts.h"
@@ -46,6 +47,8 @@
 #include "model/TableAccounts.h"
 #include "model/accounts/AbstractSocialAccount.h"
 #include "model/properties/TreeProperties.h"
+#include "model/videos/SocialStatistics.h"
+#include "model/videos/TableVideoStatistics.h"
 #include "model/videogen/AbstractVideoGenerator.h"
 #include "model/videogen/TableGenerationSettings.h"
 #include "model/videogen/VideoGenerationRecipe.h"
@@ -453,6 +456,48 @@ static void checkDialogHooksPickQuote(const QDir &root)
     require(dlgFilter.allHooks().size() == 1, "hook row added after filter");
     require(dlgFilter.allHooks()[0].first == QStringLiteral("Step into power."),
             "filtered quote was picked");
+
+    // 4. Test new code tag format without '#' (e.g. "qs0001") and max 5 hashtags
+    {
+        DialogHooks::Context contextNoHash = context;
+        contextNoHash.codeTag = QStringLiteral("qs0001");
+
+        QList<QPair<QString, QString>> legacyHooks;
+        // First description has 6 hashtags + legacy #qs0001
+        legacyHooks.append(qMakePair(
+            QStringLiteral("First Hook"),
+            QStringLiteral("Awesome outfit! #tag1 #tag2 #tag3 #tag4 #tag5 #tag6 #qs0001")));
+
+        DialogHooks dlgNoHash(legacyHooks, contextNoHash);
+        auto *btnPickNoHash = dlgNoHash.findChild<QPushButton *>("buttonPickQuote");
+        require(btnPickNoHash != nullptr, "buttonPickQuote exists");
+
+        QTimer::singleShot(50, []() {
+            for (QWidget *widget : QApplication::topLevelWidgets())
+            {
+                if (auto *picker = qobject_cast<QDialog *>(widget))
+                {
+                    if (picker->windowTitle() == QStringLiteral("Pick Quote"))
+                    {
+                        auto *list = picker->findChild<QListWidget *>();
+                        if (list && list->count() > 0)
+                        {
+                            list->setCurrentRow(0); // "The heel that owns the room."
+                            picker->accept();
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        btnPickNoHash->click();
+
+        require(dlgNoHash.allHooks().size() == 2, "hook row added");
+        // Verify: capped to 5 hashtags (#tag1..#tag5), #qs0001 stripped as code tag, qs0001 appended without '#'
+        require(dlgNoHash.allHooks()[1].second == QStringLiteral("The heel that owns the room. #tag1 #tag2 #tag3 #tag4 #tag5 qs0001"),
+                "new row description capped to 5 hashtags and uses qs0001 without '#'");
+    }
 }
 
 static void checkMultiVideo(const QDir &root)
@@ -545,6 +590,12 @@ static void checkMultiVideo(const QDir &root)
     const int multiRow = projects.addMultiVideoProject("Multi Bag Showcase", root.filePath("source.png"));
     require(projects.isMultiVideoProject(multiRow), "multi-video project detected");
     require(projects.projectType(multiRow) == QStringLiteral("multi_video"), "multi-video project type");
+    require(projects.data(projects.index(singleRow, TableProjects::IND_TYPE), Qt::DisplayRole).toString()
+            == QStringLiteral("Single"), "standard project displays 'Single'");
+    require(projects.data(projects.index(multiRow, TableProjects::IND_TYPE), Qt::DisplayRole).toString()
+            == QStringLiteral("Multi-video"), "multi-video project displays 'Multi-video'");
+    require(TableProjects::formatTypeLabel(QStringLiteral("custom_kind")) == QStringLiteral("Custom-kind"),
+            "future project kind formatted properly");
 
     // 6. Settings for CLI validation frame count (5 to 10)
     TableGenerationSettings genSettings{root.path()};
@@ -856,6 +907,9 @@ static void checkMultiVideoIdentity(PaneGeneration &pane, TableVideos &videos, c
     auto *table = pane.findChild<QTableView *>("tableViewProjects");
     auto *projects = qobject_cast<TableProjects *>(table->model());
     require(projects != nullptr, "project model available");
+    require(!table->isColumnHidden(TableProjects::IND_NAME), "project name column is visible");
+    require(!table->isColumnHidden(TableProjects::IND_TYPE), "project type column is visible");
+    require(table->isColumnHidden(TableProjects::IND_CREATED), "project created column is hidden");
     const int row = projects->addMultiVideoProject("Completed multi-video", {});
     const QUuid projectId = projects->projectId(row);
     QStringList codes;
@@ -1226,6 +1280,14 @@ static void checkPropertyRetrieveStatistics(const QDir &root)
             == QStringLiteral("QS-0042"), "extract #QS0042");
     require(AbstractSocialAccount::extractShortCode(QStringLiteral("Direct QS-0007 code"))
             == QStringLiteral("QS-0007"), "extract QS-0007");
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("Check out these heels! #tag1 #tag2 #tag3 #tag4 #tag5 qs0001"))
+            == QStringLiteral("QS-0001"), "extract qs0001 without #");
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("Caption with qs0042 lowercase"))
+            == QStringLiteral("QS-0042"), "extract qs0042 without #");
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("Caption with QS0042 uppercase"))
+            == QStringLiteral("QS-0042"), "extract QS0042 without #");
+    require(AbstractSocialAccount::extractShortCode(QStringLiteral("Caption with qs-0007 lowercase hyphen"))
+            == QStringLiteral("QS-0007"), "extract qs-0007");
     require(AbstractSocialAccount::extractShortCode(QStringLiteral("No short code here #fashion")).isEmpty(),
             "empty when no short code");
 
@@ -1267,6 +1329,11 @@ static void checkPropertyRetrieveStatistics(const QDir &root)
     const QUuid videoId = videos.addVideo({valUuid}, {}, QStringLiteral("original"));
     const QString shortCode = videos.recordFromId(videoId)->shortCode; // e.g. "QS-0001"
     const QString codeHashtag = QStringLiteral("#qs") + shortCode.mid(3); // e.g. "#qs0001"
+    const QString codeWithoutHash = QStringLiteral("qs") + shortCode.mid(3).toLower(); // e.g. "qs0001"
+
+    require(videos.recordFromShortCode(codeHashtag) != nullptr, "recordFromShortCode matches legacy #qs0001");
+    require(videos.recordFromShortCode(codeWithoutHash) != nullptr, "recordFromShortCode matches new qs0001 without #");
+    require(videos.recordFromShortCode(shortCode) != nullptr, "recordFromShortCode matches QS-0001");
 
     // Register a supported account and an unsupported account (Instagram) in TableAccounts
     accounts.addAccount();
@@ -1340,6 +1407,14 @@ static void checkPropertyRetrieveStatistics(const QDir &root)
     require(videoRec->publications[0].postUrl == post.postUrl, "publication URL matches");
     require(!videoRec->publications[0].snapshots.isEmpty(), "snapshot recorded on publication");
 
+    // Verify post with code without '#' matches via extractShortCode and recordFromShortCode
+    AbstractSocialAccount::AccountPostStatistics postNoHash;
+    postNoHash.caption = QStringLiteral("Confidence without hash ") + codeWithoutHash + QStringLiteral(" #heels");
+    require(AbstractSocialAccount::extractShortCode(postNoHash.caption) == shortCode,
+            "extractShortCode matches caption with code without #");
+    require(videos.recordFromShortCode(AbstractSocialAccount::extractShortCode(postNoHash.caption)) == videoRec,
+            "recordFromShortCode maps extracted code without # to VideoRecord");
+
     // Verify TreeProperties columns
     const QModelIndex rowParent = propIdx;
     const int valRow = valIdx.row();
@@ -1363,6 +1438,154 @@ static void checkPropertyRetrieveStatistics(const QDir &root)
             "retrieve_statistics.log written in working directory logs/");
     require(!readFile(root.filePath(QStringLiteral("logs/retrieve_statistics.log"))).isEmpty(),
             "retrieve_statistics.log is non-empty");
+
+    // 4. Test PaneStatistics ("Retrieve" button, TableVideoStatistics sorting by views,
+    //    regenerated vs source image preview, 2-image horizontal merge, and shared stats columns)
+    QTemporaryDir statsPaneDir;
+    require(statsPaneDir.isValid(), "statsPaneDir valid");
+    const QDir spDir(statsPaneDir.path());
+
+    // Create solid-color test images
+    auto saveSolidImage = [](const QString &path, const QColor &color, int w = 64, int h = 64) {
+        QImage img(w, h, QImage::Format_ARGB32);
+        img.fill(color);
+        require(img.save(path), "save test image");
+    };
+    const QString srcImg1 = spDir.filePath(QStringLiteral("src1_red.png"));
+    const QString regenImg1 = spDir.filePath(QStringLiteral("regen1_green.png"));
+    const QString src2Left = spDir.filePath(QStringLiteral("src2_blue.png"));
+    const QString src2Right = spDir.filePath(QStringLiteral("src2_yellow.png"));
+    saveSolidImage(srcImg1, QColor(220, 20, 20));
+    saveSolidImage(regenImg1, QColor(20, 200, 40));
+    saveSolidImage(src2Left, QColor(20, 40, 220));
+    saveSolidImage(src2Right, QColor(240, 220, 20));
+
+    TableAccounts spAccounts(spDir.path());
+    TableVideos spVideos(spDir.path());
+    TableProjects spProjects(spDir.path());
+
+    // Project 1: 1 source image + regenerated image in generation temp folder
+    const int projRow1 = spProjects.addProject(srcImg1, QString{}, QStringLiteral("Single Source Project"), QString{});
+    const QUuid projId1 = spProjects.projectId(projRow1);
+    const QUuid vidId1 = spVideos.addVideo({}, {}, QStringLiteral("original"), projId1);
+    const QString code1 = spVideos.recordFromId(vidId1)->shortCode;
+    const QDir tempDir1 = spProjects.generationTempDir(projRow1, code1);
+    QFile::copy(regenImg1, tempDir1.filePath(QStringLiteral("generation_source.png")));
+
+    // Project 2: 2 source images (merged horizontally in preview)
+    const int projRow2 = spProjects.addProject(src2Left, src2Right, QStringLiteral("Two Sources Project"), QString{});
+    const QUuid projId2 = spProjects.projectId(projRow2);
+    const QUuid vidId2 = spVideos.addVideo({}, {}, QStringLiteral("original"), projId2);
+    const QString code2 = spVideos.recordFromId(vidId2)->shortCode;
+
+    // Project 3: unpublished / unlocated video (must not appear in TableVideoStatistics)
+    const int projRow3 = spProjects.addMultiVideoProject(QStringLiteral("Unlocated Multi Project"));
+    const QUuid projId3 = spProjects.projectId(projRow3);
+    spVideos.addVideo({}, {}, QStringLiteral("original"), projId3);
+
+    spAccounts.addAccount();
+    spAccounts.setData(spAccounts.index(0, TableAccounts::IND_TYPE), QStringLiteral("TestSocial"));
+    spAccounts.setData(spAccounts.index(0, TableAccounts::IND_URL), QStringLiteral("https://example.com/@brand"));
+
+    AbstractSocialAccount::AccountPostStatistics post1;
+    post1.postUrl = QStringLiteral("https://example.com/@brand/video/v1");
+    post1.shortCode = code1;
+    post1.stats.views = 300;
+    post1.stats.likes = 30;
+    post1.stats.comments = 5;
+    post1.stats.shares = 15;
+    post1.publishDate = QDateTime::currentDateTimeUtc().addDays(-3);
+
+    AbstractSocialAccount::AccountPostStatistics post2;
+    post2.postUrl = QStringLiteral("https://example.com/@brand/video/v2");
+    post2.shortCode = code2;
+    post2.stats.views = 1200;
+    post2.stats.likes = 180;
+    post2.stats.comments = 20;
+    post2.stats.shares = 40;
+    post2.publishDate = QDateTime::currentDateTimeUtc().addDays(-1);
+
+    fakeSocial.nextAccountVideosResult.followers = 1000;
+    fakeSocial.nextAccountVideosResult.views = 1500;
+    fakeSocial.nextAccountVideosResult.likes = 210;
+    fakeSocial.nextAccountVideosResult.posts = {post1, post2};
+
+    PaneStatistics paneStats(&spVideos, nullptr, &spAccounts, &spProjects);
+    auto *btnStatsRetrieve = paneStats.findChild<QPushButton *>(QStringLiteral("buttonRetrieve"));
+    auto *tableViewStats = paneStats.findChild<QTableView *>(QStringLiteral("tableViewStatistics"));
+    require(btnStatsRetrieve != nullptr, "buttonRetrieve exists in PaneStatistics");
+    require(btnStatsRetrieve->text() == QStringLiteral("Retrieve"), "top-left button text is Retrieve");
+    require(tableViewStats != nullptr, "tableViewStatistics exists in PaneStatistics");
+    TableVideoStatistics *statsModel = paneStats.statisticsModel();
+    require(statsModel != nullptr && tableViewStats->model() == statsModel,
+            "tableViewStatistics uses TableVideoStatistics model");
+    require(statsModel->rowCount() == 0, "no rows before statistics are retrieved");
+
+    // Verify shared statistics headers match between TreeProperties and TableVideoStatistics
+    for (int sc = 0; sc < SocialStatistics::columnCount(); ++sc)
+    {
+        require(statsModel->headerData(TableVideoStatistics::IND_FIRST_STAT + sc, Qt::Horizontal).toString()
+                == props.headerData(TreeProperties::IND_FIRST_STAT + sc, Qt::Horizontal).toString(),
+                "statistics column headers match between PaneStatistics and PaneProperties");
+    }
+
+    btnStatsRetrieve->click();
+    timer.restart();
+    while ((statsModel->rowCount() < 2 || !paneStats.isEnabled()) && timer.elapsed() < 5000)
+    {
+        QApplication::processEvents();
+        QThread::msleep(5);
+    }
+    require(paneStats.isEnabled(), "PaneStatistics Retrieve finished");
+    require(statsModel->rowCount() == 2, "only the 2 published & located videos are listed");
+
+    // Sorted by views descending: row 0 is vidId2 (1200 views), row 1 is vidId1 (300 views)
+    require(statsModel->videoIdAt(0) == vidId2, "row 0 is highest-views video (1200 views)");
+    require(statsModel->videoIdAt(1) == vidId1, "row 1 is second video (300 views)");
+
+    // Check row 0 (2 source images merged horizontally)
+    require(statsModel->data(statsModel->index(0, 0), TableVideoStatistics::RolePreviewImageCount).toInt() == 2,
+            "row 0 uses 2 source images");
+    const QPixmap preview0 = statsModel->previewPixmapAt(0);
+    require(!preview0.isNull(), "row 0 preview pixmap is valid");
+    require(preview0.width() == 64 + TableVideoStatistics::PREVIEW_MERGE_GAP + 64,
+            "row 0 preview merges 2 images horizontally");
+    require(preview0.height() == 64, "row 0 preview height is 64");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_NAME)).toString()
+            == QStringLiteral("Two Sources Project (%1)").arg(code2),
+            "row 0 Name column");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_TYPE)).toString()
+            == QStringLiteral("Single"),
+            "row 0 Video type column");
+    require(!statsModel->data(statsModel->index(0, TableVideoStatistics::IND_CREATED)).toString().isEmpty(),
+            "row 0 Created column");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_VIEWS)).toLongLong() == 1200,
+            "row 0 Views == 1200");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_LIKES)).toLongLong() == 180,
+            "row 0 Likes == 180");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_COMMENTS)).toLongLong() == 20,
+            "row 0 Comments == 20");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_SHARES)).toLongLong() == 40,
+            "row 0 Shares == 40");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_NORM_VIEWS)).toString()
+            == QStringLiteral("1.20"),
+            "row 0 Views/Follower == 1.20");
+    require(statsModel->data(statsModel->index(0, TableVideoStatistics::IND_ENGAGEMENT)).toString()
+            == QStringLiteral("20.0 %"),
+            "row 0 Engagement == 20.0 %");
+
+    // Check row 1 (regenerated image preferred over source image)
+    require(statsModel->data(statsModel->index(1, 0), TableVideoStatistics::RolePreviewImageCount).toInt() == 1,
+            "row 1 uses 1 image");
+    const QStringList paths1 = statsModel->previewImagePathsAt(1);
+    require(paths1.size() == 1 && paths1.first().endsWith(QStringLiteral("generation_source.png")),
+            "row 1 prefers regenerated image over source image");
+    const QPixmap preview1 = statsModel->previewPixmapAt(1);
+    require(!preview1.isNull() && preview1.width() == 64 && preview1.height() == 64,
+            "row 1 preview is single 64x64 image");
+    const QColor centerColor = preview1.toImage().pixelColor(32, 32);
+    require(centerColor.green() > 150 && centerColor.red() < 60,
+            "row 1 preview pixel color comes from green regenerated image, not red source image");
 }
 
 int main(int argc, char **argv)

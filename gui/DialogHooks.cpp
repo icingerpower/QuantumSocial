@@ -3,6 +3,7 @@
 
 #include "AbstractCli.h"
 #include "model/FavoriteHooks.h"
+#include "model/accounts/AbstractSocialAccount.h"
 
 #include <QClipboard>
 #include <QDialogButtonBox>
@@ -157,7 +158,7 @@ public:
 
         auto *labelDesc = new QLabel(tr("Description (post caption & hashtags):"), this);
         m_editDescription = new QPlainTextEdit(description, this);
-        m_editDescription->setPlaceholderText(tr("Write the post caption with hashtags and #qs shortcode..."));
+        m_editDescription->setPlaceholderText(tr("Write the post caption with hashtags and qs shortcode..."));
 
         auto *buttonBox = new QDialogButtonBox(
             QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -299,7 +300,11 @@ void DialogHooks::_initUi(const QList<QPair<QString, QString>> &hooks)
     for (int row = 0; row < hooks.size(); ++row)
     {
         QString description = hooks[row].second.trimmed();
-        if (!codeTag.isEmpty() && !description.contains(codeTag))
+        const QString existingCode = AbstractSocialAccount::extractShortCode(description);
+        const QString tagCode = AbstractSocialAccount::extractShortCode(codeTag);
+        if (!codeTag.isEmpty()
+            && (tagCode.isEmpty() || existingCode.compare(tagCode, Qt::CaseInsensitive) != 0)
+            && !description.contains(codeTag, Qt::CaseInsensitive))
         {
             description += QLatin1Char(' ') + codeTag;
         }
@@ -466,7 +471,11 @@ void DialogHooks::_addHook()
             return;
         }
         QString desc = dialog.description();
-        if (!m_context.codeTag.isEmpty() && !desc.contains(m_context.codeTag))
+        const QString existingCode = AbstractSocialAccount::extractShortCode(desc);
+        const QString tagCode = AbstractSocialAccount::extractShortCode(m_context.codeTag);
+        if (!m_context.codeTag.isEmpty()
+            && (tagCode.isEmpty() || existingCode.compare(tagCode, Qt::CaseInsensitive) != 0)
+            && !desc.contains(m_context.codeTag, Qt::CaseInsensitive))
         {
             desc += QLatin1Char(' ') + m_context.codeTag;
         }
@@ -585,6 +594,10 @@ void DialogHooks::_pickQuote()
         while (it.hasNext())
         {
             const QString tag = it.next().captured(0);
+            if (!AbstractSocialAccount::extractShortCode(tag).isEmpty())
+            {
+                continue;
+            }
             if (!hashtags.contains(tag, Qt::CaseInsensitive))
             {
                 hashtags << tag;
@@ -603,6 +616,10 @@ void DialogHooks::_pickQuote()
                 {
                     clean.prepend(QLatin1Char('#'));
                 }
+                if (!AbstractSocialAccount::extractShortCode(clean).isEmpty())
+                {
+                    continue;
+                }
                 if (!hashtags.contains(clean, Qt::CaseInsensitive))
                 {
                     hashtags << clean;
@@ -611,27 +628,26 @@ void DialogHooks::_pickQuote()
         }
     }
 
-    if (!m_context.codeTag.isEmpty())
+    while (hashtags.size() > 5)
     {
-        bool hasCodeTag = false;
-        for (const QString &tag : hashtags)
-        {
-            if (tag.compare(m_context.codeTag, Qt::CaseInsensitive) == 0)
-            {
-                hasCodeTag = true;
-                break;
-            }
-        }
-        if (!hasCodeTag)
-        {
-            hashtags << m_context.codeTag;
-        }
+        hashtags.removeLast();
     }
 
     QString description = quote;
     if (!hashtags.isEmpty())
     {
         description += QLatin1Char(' ') + hashtags.join(QLatin1Char(' '));
+    }
+
+    if (!m_context.codeTag.isEmpty())
+    {
+        const QString existingCode = AbstractSocialAccount::extractShortCode(description);
+        const QString tagCode = AbstractSocialAccount::extractShortCode(m_context.codeTag);
+        if ((tagCode.isEmpty() || existingCode.compare(tagCode, Qt::CaseInsensitive) != 0)
+            && !description.contains(m_context.codeTag, Qt::CaseInsensitive))
+        {
+            description += QLatin1Char(' ') + m_context.codeTag;
+        }
     }
 
     const int newRow = ui->tableHooks->rowCount();
@@ -742,7 +758,11 @@ void DialogHooks::_regenerateHooks()
                 continue;
             }
             seenHooks.insert(hook.toLower());
-            if (!m_context.codeTag.isEmpty() && !desc.contains(m_context.codeTag))
+            const QString existingCode = AbstractSocialAccount::extractShortCode(desc);
+            const QString tagCode = AbstractSocialAccount::extractShortCode(m_context.codeTag);
+            if (!m_context.codeTag.isEmpty()
+                && (tagCode.isEmpty() || existingCode.compare(tagCode, Qt::CaseInsensitive) != 0)
+                && !desc.contains(m_context.codeTag, Qt::CaseInsensitive))
             {
                 desc += QLatin1Char(' ') + m_context.codeTag;
             }
@@ -923,12 +943,12 @@ QString DialogHooks::_buildRegenerationPrompt() const
         prompt += QStringLiteral(
             "SEO — non-negotiable: the target keyword is \"%1\". EVERY one of "
             "the 10 descriptions must include \"%1\" as plain readable text somewhere in the caption "
-            "AND include %2 as one of its hashtags.\n").arg(m_context.keyword, keywordHashtag);
+            "AND include %2 as one of its hashtags (total hashtags must not exceed 5).\n").arg(m_context.keyword, keywordHashtag);
     }
     if (!m_context.preferredHashtags.isEmpty())
     {
         prompt += QStringLiteral(
-            "Preferred hashtags (chosen by the user — use ONLY these unless truly none fit, in which case add at most one relevant new one): %1\n")
+            "Preferred hashtags (chosen by the user — use ONLY these unless truly none fit, in which case add at most one relevant new one; at most 5 hashtags in total): %1\n")
             .arg(m_context.preferredHashtags.join(QStringLiteral(" ")));
     }
     if (!m_context.favoriteHooksPrompt.isEmpty())
@@ -950,7 +970,7 @@ QString DialogHooks::_buildRegenerationPrompt() const
     prompt += QStringLiteral(
         "\nOutput format: reply ONLY with a single valid JSON object as plain text (no markdown fences, no commentary). Exactly this shape:\n"
         "{\"hooks\": [{\"hook\": \"...\", \"description\": \"...\"}]}\n"
-        "\"hooks\": 10 NEW short catchy hooks; each \"description\" is the matching post description, ending with relevant hashtags.\n");
+        "\"hooks\": 10 NEW short catchy hooks; each \"description\" is the matching post description, ending with relevant hashtags (at most 5 hashtags).\n");
 
     return prompt;
 }

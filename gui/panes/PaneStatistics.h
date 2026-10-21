@@ -3,17 +3,18 @@
 
 #include <QWidget>
 
+#include <QCoro/QCoroTask>
+
 QT_BEGIN_NAMESPACE
 namespace Ui { class PaneStatistics; }
 QT_END_NAMESPACE
 
-class TableVideos;
 class StatisticsScheduler;
+class TableAccounts;
+class TableProjects;
+class TableVideos;
+class TableVideoStatistics;
 
-// Receives the shared models; the widgets and their wiring are defined in
-// the .ui file / by hand depending on the wanted workflow. The scheduler
-// exposes checkNow() / fetchVideoNow() and the runStarted()/runFinished()
-// signals for whatever controls end up here.
 class PaneStatistics : public QWidget
 {
     Q_OBJECT
@@ -21,12 +22,23 @@ class PaneStatistics : public QWidget
 public:
     explicit PaneStatistics(TableVideos *videos, StatisticsScheduler *scheduler,
                             QWidget *parent = nullptr);
+    explicit PaneStatistics(TableVideos *videos, StatisticsScheduler *scheduler,
+                            TableAccounts *accounts, TableProjects *projects = nullptr,
+                            QWidget *parent = nullptr);
     ~PaneStatistics();
+
+    TableVideoStatistics *statisticsModel() const;
 
 private:
     Ui::PaneStatistics *ui;
     TableVideos *m_videos;
     StatisticsScheduler *m_scheduler;
+    TableAccounts *m_accounts;
+    TableProjects *m_projects;
+    TableVideoStatistics *m_model;
+    QCoro::Task<void> m_retrieveStatisticsTask;
+
+    QCoro::Task<void> _retrieveStatistics();
 };
 
 #endif // PANESTATISTICS_H

@@ -101,7 +101,9 @@ MainWindow::MainWindow(QWidget *parent)
     ui->tabWidget->addTab(paneGeneration, tr("Generation"));
     ui->tabWidget->addTab(new PaneProperties(m_properties, m_archive, m_videos, m_accounts, this),
                           tr("Properties"));
-    ui->tabWidget->addTab(new PaneStatistics(m_videos, m_scheduler, this), tr("Statistics"));
+    ui->tabWidget->addTab(new PaneStatistics(m_videos, m_scheduler, m_accounts,
+                                             paneGeneration->projectsModel(), this),
+                          tr("Statistics"));
     ui->tabWidget->addTab(new PaneSettings(m_generationSettings, m_availableCliTable,
                                           this),
                           tr("Settings"));

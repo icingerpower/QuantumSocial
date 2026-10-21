@@ -133,7 +133,22 @@ QVariant TableProjects::headerData(int section, Qt::Orientation orientation, int
 {
     if (role == Qt::DisplayRole && orientation == Qt::Horizontal)
     {
-        return HEADER[section];
+        if (section >= 0 && section < HEADER.size())
+        {
+            if (section == IND_NAME)
+            {
+                return tr("Name");
+            }
+            if (section == IND_TYPE)
+            {
+                return tr("Type");
+            }
+            if (section == IND_CREATED)
+            {
+                return tr("Created");
+            }
+            return HEADER[section];
+        }
     }
     return QVariant{};
 }
@@ -165,6 +180,14 @@ QVariant TableProjects::data(const QModelIndex &index, int role) const
         {
             return created.toLocalTime().toString(QStringLiteral("yyyy-MM-dd hh:mm"));
         }
+    }
+    if (index.column() == IND_TYPE)
+    {
+        if (role == Qt::DisplayRole)
+        {
+            return formatTypeLabel(projectType(index.row()));
+        }
+        return projectType(index.row());
     }
     return value;
 }
@@ -238,7 +261,8 @@ QString storeProjectImage(const QDir &workingDir, const QString &idString,
 } // namespace
 
 int TableProjects::addProject(const QString &imagePath, const QString &imagePath2,
-                              const QString &keyword, const QString &hookIdea)
+                              const QString &keyword, const QString &hookIdea,
+                              const QString &type)
 {
     const QUuid id = QUuid::createUuid();
     const QString idString = id.toString(QUuid::WithoutBraces);
@@ -253,6 +277,8 @@ int TableProjects::addProject(const QString &imagePath, const QString &imagePath
         ? tr("Project %1").arg(m_listOfVariantList.size() + 1)
         : keyword.trimmed();
 
+    const QString storedType = type.trimmed().isEmpty() ? QStringLiteral("single") : type.trimmed();
+
     const int row = m_listOfVariantList.size();
     beginInsertRows(QModelIndex{}, row, row);
     m_listOfVariantList << QVariantList{
@@ -265,7 +291,7 @@ int TableProjects::addProject(const QString &imagePath, const QString &imagePath
         , QString{} // picked hook
         , QString{} // picked description (with hashtags)
         , storedImagePath2
-        , QStringLiteral("single")
+        , storedType
         , idString
     };
     endInsertRows();
@@ -329,7 +355,32 @@ QString TableProjects::projectType(int row) const
         return QString{};
     }
     const QString type = m_listOfVariantList[row][IND_TYPE].toString();
-    return type.isEmpty() ? QStringLiteral("single") : type;
+    if (!type.isEmpty())
+    {
+        return type;
+    }
+    return isMultiVideoProject(row) ? QStringLiteral("multi_video") : QStringLiteral("single");
+}
+
+QString TableProjects::formatTypeLabel(const QString &type)
+{
+    const QString trimmed = type.trimmed().toLower();
+    if (trimmed.isEmpty() || trimmed == QLatin1String("single"))
+    {
+        return tr("Single");
+    }
+    if (trimmed == QLatin1String("multi_video") || trimmed == QLatin1String("multi-video"))
+    {
+        return tr("Multi-video");
+    }
+    // Future kinds: capitalize words and convert underscores to hyphens
+    QString formatted = trimmed;
+    formatted.replace(QLatin1Char('_'), QLatin1Char('-'));
+    if (!formatted.isEmpty())
+    {
+        formatted[0] = formatted[0].toUpper();
+    }
+    return formatted;
 }
 
 void TableProjects::removeProject(int row)
@@ -537,6 +588,26 @@ void TableProjects::_loadFromFile()
         {
             elements << QString{};
         }
+        QString type = elements[IND_TYPE];
+        if (type.isEmpty())
+        {
+            const QDir projDir{m_workingDir.absoluteFilePath(PROJECTS_SUBDIR + QLatin1Char('/') + id)};
+            const QString manifestName = QStringLiteral("multi_video_workflow.json");
+            bool isMulti = projDir.exists(manifestName);
+            if (!isMulti)
+            {
+                const QString slug = QStringLiteral("%1-%2")
+                    .arg(m_listOfVariantList.size() + 1, 3, 10, QLatin1Char('0'))
+                    .arg(slugify(elements[IND_NAME]));
+                const QDir genDir{m_workingDir.absoluteFilePath(
+                    QStringLiteral("projects/generations/") + slug)};
+                if (genDir.exists(manifestName))
+                {
+                    isMulti = true;
+                }
+            }
+            type = isMulti ? QStringLiteral("multi_video") : QStringLiteral("single");
+        }
         m_listOfVariantList << QVariantList{
             elements[IND_NAME]
             , elements[IND_CREATED]
@@ -547,7 +618,7 @@ void TableProjects::_loadFromFile()
             , elements[IND_GEN_HOOK]
             , elements[IND_GEN_DESC]
             , elements[IND_IMAGE2]
-            , elements[IND_TYPE]
+            , type
             , id
         };
     }
