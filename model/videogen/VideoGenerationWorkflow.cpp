@@ -20,6 +20,9 @@
 #include "AbstractCli.h"
 
 #include "AbstractVideoGenerator.h"
+#include "model/PromptLessons.h"
+
+#include <QRegularExpression>
 
 namespace {
 
@@ -96,6 +99,23 @@ QString ensureFormatStated(const QString &prompt, const QString &videoFormatLabe
     return prompt.trimmed() + QStringLiteral(" Video format: %1.").arg(videoFormatLabel);
 }
 
+QString perturbPreservingFormat(const QString &prompt, int attempt, const QString &videoFormatLabel)
+{
+    if (attempt == 0)
+    {
+        return ensureFormatStated(prompt, videoFormatLabel);
+    }
+    static const QRegularExpression formatRe{QStringLiteral("\\s*(Video format:\\s*[^\\n]+)$")};
+    const auto match = formatRe.match(prompt);
+    if (match.hasMatch())
+    {
+        const QString body = prompt.left(match.capturedStart(0)).trimmed();
+        const QString formatSuffix = match.captured(1).trimmed();
+        return perturbPrompt(body, attempt).trimmed() + QLatin1Char(' ') + formatSuffix;
+    }
+    return ensureFormatStated(perturbPrompt(prompt, attempt), videoFormatLabel);
+}
+
 // result.errorMessage/_emit() (see generate_video_gemini.py) appends
 // " [debug log: /tmp/.../gemini_<timestamp>.log]" to every error — a NEW
 // path every single process launch. Comparing raw errorMessage strings to
@@ -157,6 +177,7 @@ void VideoGenerationWorkflow::_finish(const QString &videoPath, const QString &e
 
 QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
 {
+    request.prompt = PromptLessons::stripPromptSection(request.prompt);
     AbstractVideoGenerator *generator
         = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(request.generatorId);
     if (!generator)
@@ -188,27 +209,44 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
         emit progress(tr("Generating another video with the saved prompt and configuration..."));
         AbstractVideoGenerator::Result result;
         constexpr int maxBrowserRecoveries = 2;
-        for (int recovery = 0; recovery <= maxBrowserRecoveries; ++recovery)
+        constexpr int maxRejectionRetries = 2;
+        int browserRecoveries = 0;
+        int rejectionRetries = 0;
+        while (true)
         {
             if (m_cancelled)
             {
                 _finish({}, tr("Cancelled."));
                 co_return;
             }
-            result = co_await generator->generate(request.prompt, images, request.outputDir, settings);
+            const QString attemptPrompt = perturbPreservingFormat(
+                request.prompt, rejectionRetries, request.videoFormatLabel);
+            result = co_await generator->generate(attemptPrompt, images, request.outputDir, settings);
             if (!result.conversationUrl.isEmpty())
             {
                 m_lastConversationUrl = result.conversationUrl;
             }
-            if (!result.videoPath.isEmpty() || !result.browserLost || !result.retryable
-                || result.rejected || result.quotaExceeded || recovery == maxBrowserRecoveries || m_cancelled)
+            if (!result.videoPath.isEmpty() || !result.retryable || result.quotaExceeded || m_cancelled)
             {
                 break;
             }
-            emit progress(tr("Browser connection lost. Relaunching and retrying the same "
-                             "prompt and images (%1/%2)...")
-                .arg(recovery + 1).arg(maxBrowserRecoveries));
-            co_await QCoro::sleepFor(std::chrono::milliseconds(500));
+            if (result.browserLost && browserRecoveries < maxBrowserRecoveries)
+            {
+                ++browserRecoveries;
+                emit progress(tr("Browser connection lost. Relaunching and retrying the same "
+                                 "prompt and images (%1/%2)...")
+                    .arg(browserRecoveries).arg(maxBrowserRecoveries));
+                co_await QCoro::sleepFor(std::chrono::milliseconds(500));
+                continue;
+            }
+            if (result.rejected && rejectionRetries < maxRejectionRetries)
+            {
+                ++rejectionRetries;
+                emit progress(tr("Rejected by %1 — retrying with a lightly softened prompt variant (%2/%3)...")
+                    .arg(generator->getName()).arg(rejectionRetries).arg(maxRejectionRetries));
+                continue;
+            }
+            break;
         }
         // Preserve a completed take even if Cancel was clicked while it ran;
         // the pane stops the remaining jobs in the batch.
@@ -257,8 +295,8 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             // "Video format: vertical (9:16)." gone). Keeping it out of
             // currentPrompt also means the perturbation varies real content
             // instead of chewing on boilerplate.
-            const QString variantPrompt = pitfallsPrefix
-                + ensureFormatStated(perturbed, request.videoFormatLabel);
+            const QString variantPrompt
+                = ensureFormatStated(perturbed, request.videoFormatLabel);
             emit progress(tr("Round %1 — try %2/%3 with %4...")
                 .arg(round).arg(attempt + 1).arg(maxTries).arg(generator->getName()));
 
@@ -399,6 +437,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                 "The video generator (%1) rejected or failed our prompt %2 times "
                 "in a row (last error: %3).\n"
                 "Video brief: %4\n"
+                "%6"
                 "Current prompt:\n%5\n\n"
                 "First, if the error indicates that the account reached a daily limit, "
                 "rate limit, or video creation quota (e.g. daily limit reached, come back tomorrow, etc.), "
@@ -406,9 +445,9 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                 "{\"action\": \"quota\", \"reason\": \"<explanation>\"}\n\n"
                 "Otherwise, decide how to unblock generation. Reply with STRICT JSON only:\n"
                 "{\"action\": \"prompt\", \"prompt\": \"<a rewritten prompt that "
-                "keeps the intent but avoids the rejection>\"}")
+                "keeps the intent, avoids the rejection and known pitfalls, and contains only the video scene description>\"}")
                 .arg(generator->getName()).arg(maxTries)
-                .arg(lastError, request.contextSummary, currentPrompt);
+                .arg(lastError, request.contextSummary, currentPrompt, pitfallsPrefix);
             const bool imagePossible = request.imageCli
                 && !currentImage.isEmpty() && QFileInfo::exists(currentImage);
             if (imagePossible)
@@ -464,8 +503,8 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             }
             else
             {
-                const QString newPrompt
-                    = reply.value(QStringLiteral("prompt")).toString().trimmed();
+                const QString newPrompt = PromptLessons::stripPromptSection(
+                    reply.value(QStringLiteral("prompt")).toString().trimmed());
                 if (!newPrompt.isEmpty())
                 {
                     // No format line folded in here: it is re-ensured on the
@@ -679,8 +718,8 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
         }
         else
         {
-            const QString improved
-                = verdict.value(QStringLiteral("improvedPrompt")).toString().trimmed();
+            const QString improved = PromptLessons::stripPromptSection(
+                verdict.value(QStringLiteral("improvedPrompt")).toString().trimmed());
             if (!improved.isEmpty())
             {
                 // Same as the rewrite path above: the format line is added

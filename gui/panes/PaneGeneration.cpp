@@ -3243,7 +3243,7 @@ void PaneGeneration::_generateAgain()
         }
         recipe.generatorId = generators.constBegin().key();
         recipe.settings = m_generationSettings->settingsFor(recipe.generatorId);
-        recipe.prompt = m_currentPreviewVideoPrompt;
+        recipe.prompt = PromptLessons::stripPromptSection(m_currentPreviewVideoPrompt);
         if (sourceDir.exists(QStringLiteral("generation_source.png")))
         {
             recipe.imagePaths << sourceDir.absoluteFilePath(QStringLiteral("generation_source.png"));
@@ -4072,6 +4072,7 @@ QList<PaneGeneration::GenerationPromptEntry> PaneGeneration::generationPromptEnt
     }
 
     auto cleanFormatSuffix = [](QString p) {
+        p = PromptLessons::stripPromptSection(p);
         static const QRegularExpression formatRe{QStringLiteral("\\s*Video format:.*$")};
         const QString cleaned = p.remove(formatRe).trimmed();
         return cleaned.isEmpty() ? p.trimmed() : cleaned;

@@ -207,16 +207,62 @@ class GeminiSubmissionTests(unittest.TestCase):
         dump.assert_called_once_with(self.page, "submission_failed")
         sleep.assert_not_called()
 
-    def test_repeat_does_not_rewrite_or_resubmit_rejected_prompt(self):
+    def test_repeat_retries_exact_prompt_first_then_variants_on_rejection(self):
         page = Mock()
         with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_wait_ready_or_login", return_value="ready"), \
                 patch.object(worker, "_run_attempt", return_value=("rejected", "refused")) as run:
             result, _ = worker._generate_once(None, page, "Exact prompt.", [], directory,
                                               {"preservePrompt": True})
         self.assertTrue(result["rejected"])
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[1], "Exact prompt.")
-        page.goto.assert_not_called()
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual([call.args[1] for call in run.call_args_list[:2]],
+                         ["Exact prompt.", "Exact prompt."])
+        self.assertEqual(run.call_args_list[2].args[1], worker._prompt_variant("Exact prompt.", 1))
+        self.assertEqual(page.goto.call_count, 3)
+
+    def test_switch_model_ignores_sidebar_faillites_button(self):
+        self.page.set_content("""
+            <nav id="sidebar">
+                <button id="chat_btn">Faillites et créations d'entreprises 2025</button>
+            </nav>
+            <div id="composer">
+                <button id="model_btn">2.5 Pro</button>
+            </div>
+            <script>
+                window.chatClicked = false;
+                chat_btn.onclick = () => { window.chatClicked = true; };
+            </script>
+        """)
+        self.assertFalse(worker._switch_to_video_capable_model(self.page))
+        self.assertFalse(self.page.evaluate("window.chatClicked"))
+
+    def test_switch_model_switches_flash_lite_to_pro_in_menu(self):
+        self.page.set_content("""
+            <nav id="sidebar">
+                <button id="chat_btn">Faillites et créations d'entreprises 2025</button>
+            </nav>
+            <div id="composer">
+                <button id="picker_btn">2.5 Flash-Lite</button>
+            </div>
+            <div role="menu" id="menu" hidden>
+                <div role="menuitem" id="pro_opt">2.5 Pro</div>
+            </div>
+            <script>
+                window.chatClicked = false;
+                window.proSelected = false;
+                chat_btn.onclick = () => { window.chatClicked = true; };
+                picker_btn.onclick = () => { menu.hidden = false; };
+                pro_opt.onclick = () => { window.proSelected = true; };
+            </script>
+        """)
+        self.assertTrue(worker._switch_to_video_capable_model(self.page))
+        self.assertFalse(self.page.evaluate("window.chatClicked"))
+        self.assertTrue(self.page.evaluate("window.proSelected"))
+
+    def test_rejection_in_detects_hard_time_fulfilling_request(self):
+        msg = "Gemini a dit\n\nI'm having a hard time fulfilling your request. Can I help you with something else instead?"
+        self.assertIsNotNone(worker._rejection_in(msg))
 
     def test_saves_actual_successful_prompt_for_future_repeats(self):
         page = Mock()

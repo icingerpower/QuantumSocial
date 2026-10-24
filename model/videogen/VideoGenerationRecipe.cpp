@@ -1,4 +1,5 @@
 #include "VideoGenerationRecipe.h"
+#include "model/PromptLessons.h"
 
 #include <QFile>
 #include <QFileInfo>
@@ -82,6 +83,7 @@ bool VideoGenerationRecipe::load(const QDir &directory, VideoGenerationRecipe *r
     {
         loaded.prompt = QString::fromUtf8(promptFile.readAll()).trimmed();
     }
+    loaded.prompt = PromptLessons::stripPromptSection(loaded.prompt);
     if (loaded.prompt.isEmpty())
     {
         *error = QStringLiteral("The saved video prompt is empty.");

@@ -109,6 +109,7 @@ UPLOAD_TEXTS = ("Importer des fichiers", "Upload files", "Upload file",
 # Veo. Matched by accessible name — best effort, exact model names/labels
 # change over time (same caveat as the rest of this script).
 LITE_MODEL_MARKERS = ("Flash-Lite", "Lite")
+LITE_MODEL_RE = re.compile(r"\b(?:Flash-Lite|Lite)\b", re.IGNORECASE)
 PREFERRED_MODEL_MARKERS = ("Pro", "Advanced", "Plus")
 
 REJECTION_MARKERS = (
@@ -118,6 +119,8 @@ REJECTION_MARKERS = (
     "can't generate videos", "cannot generate videos",
     "can't generate video", "cannot generate video",
     "try another prompt",
+    "having a hard time fulfilling your request",
+    "help you with something else instead",
     "videos of real people", "videos of people", "real people in situations",
     "situations like that", "in situations like", "situations like",
     "I can't depict", "cannot depict", "some public figures", "public figures",
@@ -127,6 +130,7 @@ REJECTION_MARKERS = (
     "Je ne peux pas créer", "Je ne peux pas générer", "je ne peux pas vous aider",
     "Je ne peux pas faire", "ne peux pas créer de vidéos", "ne peux pas générer de vidéos",
     "impossible de générer votre vidéo", "essayez une autre invite",
+    "du mal à répondre à votre demande", "aider avec autre chose",
     "personnes réelles", "de personnes réelles", "vidéos de personnes",
     "dans ce genre de situation", "dans de telles situations", "ce genre de situation",
     "contraire à", "nos règles", "règles de sécurité", "conditions d'utilisation",
@@ -420,6 +424,21 @@ def _open_plus_menu(page):
     return False
 
 
+def _is_model_picker_candidate(locator):
+    """True when locator is a compact UI control outside the chat history and sidebar."""
+    try:
+        if not locator.is_visible():
+            return False
+        return bool(locator.evaluate("""el => {
+            if (el.closest('nav, aside, [role="navigation"], [class*="sidenav"], [class*="sidebar"], conversations-list, .conversations-container, user-query, model-response'))
+                return false;
+            const label = (el.getAttribute('aria-label') || el.innerText || '').trim();
+            return label.length > 0 && label.length <= 45;
+        }"""))
+    except Exception:
+        return False
+
+
 def _switch_to_video_capable_model(page):
     """Best effort: if the current model looks like a lightweight variant
     that disables Veo (observed live: "Créer une vidéo" present but greyed
@@ -428,23 +447,21 @@ def _switch_to_video_capable_model(page):
     (does not guarantee it landed on a video-capable model — the caller
     still has to retry the tool click and can fail again)."""
     button = None
-    for marker in LITE_MODEL_MARKERS:
+    for locator_group in (
+        page.get_by_role("button", name=LITE_MODEL_RE),
+        page.get_by_text(LITE_MODEL_RE),
+    ):
         try:
-            candidate = page.get_by_role("button", name=marker, exact=False).first
-            if candidate.is_visible():
-                button = candidate
+            count = locator_group.count()
+            for idx in range(count):
+                candidate = locator_group.nth(idx)
+                if _is_model_picker_candidate(candidate):
+                    button = candidate
+                    break
+            if button is not None:
                 break
         except Exception:
             continue
-    if button is None:
-        for marker in LITE_MODEL_MARKERS:
-            try:
-                candidate = page.get_by_text(marker, exact=False).first
-                if candidate.is_visible():
-                    button = candidate
-                    break
-            except Exception:
-                continue
     if button is None:
         return False
     try:
@@ -454,14 +471,16 @@ def _switch_to_video_capable_model(page):
     except Exception:
         return False
     for marker in PREFERRED_MODEL_MARKERS:
-        # Role-scoped locators first — a long conversation history can
-        # contain unrelated "Pro"/"Advanced" text elsewhere on the page, and
-        # a plain get_by_text(...).first could click one of those instead of
-        # the just-opened dropdown's actual option.
+        marker_re = re.compile(rf"\b{re.escape(marker)}\b", re.IGNORECASE)
+        # Role-scoped and overlay-scoped locators only — a conversation or
+        # sidebar can contain unrelated "Pro"/"Advanced" text elsewhere on the
+        # page, and a page-wide get_by_text(...) could click one of those
+        # instead of the just-opened dropdown's actual option.
         for locator in (
-            page.get_by_role("menuitem", name=marker, exact=False),
-            page.get_by_role("option", name=marker, exact=False),
-            page.get_by_text(marker, exact=False),
+            page.get_by_role("menuitem", name=marker_re),
+            page.get_by_role("menuitemradio", name=marker_re),
+            page.get_by_role("option", name=marker_re),
+            page.locator("[role='menu'], [role='listbox'], .cdk-overlay-pane, mat-menu").get_by_text(marker_re),
         ):
             try:
                 locator.first.click(timeout=1200)
@@ -1631,8 +1650,7 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
     JSON contract: {"video", "error", "rejected", "conversationUrl"}."""
     generation_timeout_s = int(settings.get("generationTimeoutSec", 900))
     in_page_retries = int(settings.get("inPageRejectionRetries", 3))
-    if settings.get("preservePrompt", False):
-        in_page_retries = 0
+    preserve_prompt = bool(settings.get("preservePrompt", False))
     stall_timeout_s = int(settings.get("attemptStallTimeoutSec", 300))
 
     deadline = time.time() + generation_timeout_s
@@ -1640,7 +1658,13 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
     last_rejection = None
     video_path = None
     for attempt in range(in_page_retries + 1):
-        variant = _prompt_variant(prompt, attempt)
+        if preserve_prompt:
+            # First retry in a fresh chat keeps the exact saved prompt (unblocks
+            # stochastic post-generation refusals on an already-proven prompt);
+            # subsequent retries apply light variants if Gemini keeps refusing.
+            variant = prompt.strip() if attempt <= 1 else _prompt_variant(prompt, attempt - 1)
+        else:
+            variant = _prompt_variant(prompt, attempt)
         current_action = ("edit_last" if attempt > 0 and chat_mode == "conversation"
                           and submission_state.get("promptSubmitted")
                           else message_action)
@@ -1653,8 +1677,9 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
                 _log(f"in-page retry {attempt}/{in_page_retries} in conversation — "
                      "posting new variant prompt")
             else:
+                note = "unchanged prompt" if variant == prompt.strip() else "edited prompt"
                 _log(f"in-page retry {attempt}/{in_page_retries} after "
-                     f"rejection — fresh chat, edited prompt")
+                     f"rejection — fresh chat, {note}")
                 try:
                     page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=60000)
                     ready = _wait_ready_or_login(page) == "ready"
@@ -1726,10 +1751,11 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
 
     conv_url = page.url if page and not page.is_closed() else None
     if video_path is None:
+        retry_note = (", including the lightly edited retry variants."
+                      if in_page_retries > 0 else ".")
         return ({"video": None,
                  "error": f"Gemini did not produce a video (last outcome: "
-                          f"{last_rejection}), including the lightly edited "
-                          "retry variants.",
+                          f"{last_rejection}){retry_note}",
                  "rejected": True,
                  "conversationUrl": conv_url}, page)
     return ({"video": video_path, "error": None, "rejected": False,

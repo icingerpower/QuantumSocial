@@ -116,6 +116,15 @@ QString PromptLessons::asPromptSection() const
         .arg(bullets.join(QStringLiteral("\n")));
 }
 
+QString PromptLessons::stripPromptSection(const QString &prompt)
+{
+    static const QRegularExpression pitfallsRe{
+        QStringLiteral("^\\s*Known pitfalls from past generations[^\n]*\n(?:\\s*- [^\n]*(?:\n|$))+\\s*")};
+    QString cleaned = prompt;
+    cleaned.remove(pitfallsRe);
+    return cleaned.trimmed().isEmpty() ? prompt.trimmed() : cleaned.trimmed();
+}
+
 void PromptLessons::_loadFromFile()
 {
     QFile file{m_filePath};

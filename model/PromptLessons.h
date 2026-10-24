@@ -29,6 +29,9 @@ public:
     // All lessons as a ready-to-paste bullet-list prompt section; empty
     // string when there are none yet.
     QString asPromptSection() const;
+    // Strips a leading "Known pitfalls from past generations..." bullet list
+    // that older runs baked directly into saved video prompts.
+    static QString stripPromptSection(const QString &prompt);
 
 private:
     QString m_filePath;

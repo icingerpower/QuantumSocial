@@ -86,6 +86,7 @@ public:
     mutable QStringList outputs;
     mutable bool fail = false;
     mutable int browserFailures = 0;
+    mutable int rejectionFailures = 0;
     mutable std::function<void()> onCall;
     QString getId() const override { return QStringLiteral("test-backend"); }
     QString getName() const override { return QStringLiteral("Test backend"); }
@@ -103,6 +104,13 @@ public:
             --browserFailures;
             result.errorMessage = QStringLiteral("Browser connection lost");
             result.browserLost = true;
+            co_return result;
+        }
+        if (rejectionFailures > 0)
+        {
+            --rejectionFailures;
+            result.errorMessage = QStringLiteral("Gemini returned text without a video");
+            result.rejected = true;
             co_return result;
         }
         if (fail)
@@ -126,11 +134,14 @@ static void checkRecipes(const QDir &root)
     VideoGenerationRecipe recipe{"test-backend", "Initial prompt", {source}, {{"quality", 7}}};
     QString error;
     require(recipe.save(QDir(root.filePath("saved")), &error), "save recipe");
-    writeFile(root.filePath("saved/generation_prompt.txt"), "Actual successful prompt");
+    writeFile(root.filePath("saved/generation_prompt.txt"),
+              "Known pitfalls from past generations — do NOT repeat these:\n"
+              "- Keep shoe straps consistent across frames.\n\n"
+              "Actual successful prompt");
     require(QDir().rename(root.filePath("saved"), root.filePath("moved")), "move generation");
     VideoGenerationRecipe loaded;
     require(VideoGenerationRecipe::load(QDir(root.filePath("moved")), &loaded, &error), "load moved recipe");
-    require(loaded.prompt == "Actual successful prompt", "prefer actual successful prompt");
+    require(loaded.prompt == "Actual successful prompt", "prefer actual successful prompt and strip legacy pitfalls");
     require(loaded.settings == recipe.settings, "preserve settings");
     require(readFile(loaded.imagePaths.first()) == "original source", "portable source copy");
     QFile::remove(loaded.imagePaths.first());
@@ -1727,6 +1738,19 @@ int main(int argc, char **argv)
         waitForBatch(pane);
         require(generator.calls.size() == 3, "browser recovery is bounded to two retries");
         require(videos.recordsForProject(projectId).size() == 7, "exhausted recovery creates no record");
+
+        generator.calls.clear();
+        generator.browserFailures = 0;
+        generator.rejectionFailures = 1;
+        answerRepeatDialog(1);
+        again->click();
+        waitForBatch(pane);
+        require(generator.calls.size() == 2, "rejection in repeat mode retries with softened variant");
+        require(generator.calls[0].prompt == seed.prompt, "first repeat attempt uses exact prompt");
+        require(generator.calls[1].prompt != seed.prompt
+                && generator.calls[1].prompt.endsWith(QStringLiteral("Video format: vertical (9:16).")),
+                "second repeat attempt softens prompt while preserving format suffix");
+        require(videos.recordsForProject(projectId).size() == 8, "rejection recovery saves completed take");
 
         generator.calls.clear();
         generator.browserFailures = 1;
