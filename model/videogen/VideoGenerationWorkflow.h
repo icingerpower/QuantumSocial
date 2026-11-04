@@ -11,6 +11,17 @@
 
 class AbstractCli;
 
+// Ensures the prompt begins with an explicit imperative command like
+// "Generate a video: " so video models (like Gemini / Veo) do not treat
+// descriptive prompts as prompt-critique requests.
+QString ensureImperativeVideoPrefix(const QString &prompt);
+
+// Ensures the requested aspect ratio is explicitly stated in the prompt text.
+QString ensureFormatStated(const QString &prompt, const QString &videoFormatLabel);
+
+// Ensures both imperative prefix and aspect ratio format.
+QString ensureVideoPrompt(const QString &prompt, const QString &videoFormatLabel);
+
 // Runs one video generation to completion, however long it takes:
 //
 //   round:  try the prompt up to maxTriesPerPrompt times, each try with a

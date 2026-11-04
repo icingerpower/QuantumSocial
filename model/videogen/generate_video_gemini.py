@@ -908,6 +908,41 @@ def _video_quota_message(page):
     return _video_quota_in(banner_text)
 
 
+def _ensure_imperative_video_prompt(prompt):
+    """Ensures the prompt starts with an imperative command like 'Generate a video: '.
+
+    Without an imperative action verb, Gemini's web interface frequently treats
+    declarative scene descriptions as prompt-consultation requests (returning
+    textual advice like 'This prompt is exceptionally well-structured...') instead
+    of triggering the Veo video generation tool.
+    """
+    if not prompt or not prompt.strip():
+        return prompt
+
+    cleaned = prompt.strip()
+
+    # Matches if the prompt already begins with an imperative video instruction:
+    # e.g. "Generate a video:", "Generate video of", "Create a video",
+    # "Make a video", "Produce a video", "Génère une vidéo", "Générer une vidéo",
+    # "Generate a 9:16 vertical video of...", etc.
+    imperative_pattern = re.compile(
+        r"^\s*(?:generate|create|make|produce|génère|générer)\s+(?:an?\s+|une?\s+)?(?:[\w:()-]+\s+){0,3}vid[eé]o\b",
+        re.IGNORECASE,
+    )
+    if imperative_pattern.match(cleaned):
+        return cleaned
+
+    video_of_pattern = re.compile(r"^\s*vid[eé]o\s+of\b\s*", re.IGNORECASE)
+    if video_of_pattern.match(cleaned):
+        return video_of_pattern.sub("Generate a video of ", cleaned)
+
+    video_colon_pattern = re.compile(r"^\s*vid[eé]o\s*:\s*", re.IGNORECASE)
+    if video_colon_pattern.match(cleaned):
+        return video_colon_pattern.sub("Generate a video: ", cleaned)
+
+    return f"Generate a video: {cleaned}"
+
+
 def _prompt_variant(prompt, attempt):
     """The human technique that unblocks most refusals: tiny meaningless
     edits — add/remove the final dot, then small tasteful suffixes."""
@@ -1781,6 +1816,7 @@ def _read_request(request):
         raise ValueError(f"could not read the prompt file: {exc}") from exc
     if not prompt:
         raise ValueError("the prompt file is empty")
+    prompt = _ensure_imperative_video_prompt(prompt)
     os.makedirs(output_dir, exist_ok=True)
     return prompt, output_dir, images, settings
 

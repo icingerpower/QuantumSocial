@@ -74,6 +74,57 @@ QString fileReference(const QString &path, const QString &workingDir)
     return path.startsWith(workingDir) ? QFileInfo{path}.fileName() : path;
 }
 
+} // namespace
+
+// Ensures the prompt begins with an explicit imperative command like
+// "Generate a video: " so video models (like Gemini / Veo) do not treat
+// descriptive prompts as prompt-critique requests.
+QString ensureImperativeVideoPrefix(const QString &prompt)
+{
+    const QString trimmed = prompt.trimmed();
+    if (trimmed.isEmpty())
+    {
+        return trimmed;
+    }
+
+    // Matches if the prompt already begins with an imperative video instruction:
+    // e.g. "Generate a video:", "Generate video of", "Create a video",
+    // "Make a video", "Produce a video", "Génère une vidéo", "Générer une vidéo",
+    // "Generate a 9:16 vertical video of...", etc.
+    static const QRegularExpression imperativeRe(
+        QStringLiteral(R"(^\s*(?:generate|create|make|produce|génère|générer)\s+(?:an?\s+|une?\s+)?(?:[\w:()-]+\s+){0,3}vid[eé]o\b)"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (imperativeRe.match(trimmed).hasMatch())
+    {
+        return trimmed;
+    }
+
+    // Convert "Video of ..." to "Generate a video of ..."
+    static const QRegularExpression videoOfRe(
+        QStringLiteral(R"(^\s*vid[eé]o\s+of\b\s*)"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (videoOfRe.match(trimmed).hasMatch())
+    {
+        QString copy = trimmed;
+        copy.replace(videoOfRe, QStringLiteral("Generate a video of "));
+        return copy;
+    }
+
+    // Convert "Video: ..." to "Generate a video: ..."
+    static const QRegularExpression videoColonRe(
+        QStringLiteral(R"(^\s*vid[eé]o\s*:\s*)"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (videoColonRe.match(trimmed).hasMatch())
+    {
+        QString copy = trimmed;
+        copy.replace(videoColonRe, QStringLiteral("Generate a video: "));
+        return copy;
+    }
+
+    // Default: prepend "Generate a video: "
+    return QStringLiteral("Generate a video: %1").arg(trimmed);
+}
+
 // Gemini's aspect-ratio UI selector only reacts to the literal ratio digits
 // (e.g. "9:16") appearing in the prompt (see generate_video_gemini.py's
 // _select_aspect()). The INITIAL prompt already has this ensured by the
@@ -98,6 +149,13 @@ QString ensureFormatStated(const QString &prompt, const QString &videoFormatLabe
     }
     return prompt.trimmed() + QStringLiteral(" Video format: %1.").arg(videoFormatLabel);
 }
+
+QString ensureVideoPrompt(const QString &prompt, const QString &videoFormatLabel)
+{
+    return ensureFormatStated(ensureImperativeVideoPrefix(prompt), videoFormatLabel);
+}
+
+namespace {
 
 QString perturbPreservingFormat(const QString &prompt, int attempt, const QString &videoFormatLabel)
 {
@@ -264,7 +322,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
         maxTries = 10;
     }
 
-    QString currentPrompt = request.prompt;
+    QString currentPrompt = ensureImperativeVideoPrefix(request.prompt);
     QString currentImage = request.imagePath;
     int round = 0;
     int contentCheckFailures = 0;
@@ -295,8 +353,11 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             // "Video format: vertical (9:16)." gone). Keeping it out of
             // currentPrompt also means the perturbation varies real content
             // instead of chewing on boilerplate.
+            // ensureVideoPrompt also enforces that an imperative command
+            // ("Generate a video: ") is present so backends do not mistake
+            // prompts for discussion.
             const QString variantPrompt
-                = ensureFormatStated(perturbed, request.videoFormatLabel);
+                = ensureVideoPrompt(perturbed, request.videoFormatLabel);
             emit progress(tr("Round %1 — try %2/%3 with %4...")
                 .arg(round).arg(attempt + 1).arg(maxTries).arg(generator->getName()));
 
@@ -510,7 +571,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                     // No format line folded in here: it is re-ensured on the
                     // final text at every use (see variantPrompt above), so
                     // a rewrite can never drop it either.
-                    currentPrompt = newPrompt;
+                    currentPrompt = ensureImperativeVideoPrefix(newPrompt);
                     emit progress(tr("Prompt rewritten by the CLI."));
                 }
                 else

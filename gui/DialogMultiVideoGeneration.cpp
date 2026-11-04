@@ -228,7 +228,7 @@ DialogMultiVideoGeneration::DialogMultiVideoGeneration(
 
         m_editIntroPrompt = new QPlainTextEdit(panelLeft);
         m_editIntroPrompt->setPlaceholderText(tr(
-            "Hook & opener video prompt: fast dynamic camera zoom on product collection, bold catchy atmosphere, smooth cinematic lighting..."));
+            "e.g. Generate a video: fast dynamic camera zoom on product collection, bold catchy atmosphere, smooth cinematic lighting..."));
         m_editIntroPrompt->setMaximumHeight(70);
         layoutLeft->addWidget(m_editIntroPrompt);
 
@@ -331,7 +331,7 @@ DialogMultiVideoGeneration::DialogMultiVideoGeneration(
     {
         m_editIntroPrompt = new QPlainTextEdit(groupPrompts);
         m_editIntroPrompt->setPlaceholderText(tr(
-            "Hook & opener video prompt: fast dynamic camera zoom on product collection, bold catchy atmosphere, smooth cinematic lighting..."));
+            "e.g. Generate a video: fast dynamic camera zoom on product collection, bold catchy atmosphere, smooth cinematic lighting..."));
         m_editIntroPrompt->setMaximumHeight(70);
         layoutPrompts->addWidget(m_editIntroPrompt);
     }
@@ -370,7 +370,7 @@ DialogMultiVideoGeneration::DialogMultiVideoGeneration(
 
     m_editAfterIntroPrompt = new QPlainTextEdit(groupPrompts);
     m_editAfterIntroPrompt->setPlaceholderText(tr(
-        "Product showcase prompt: clean 360 rotation highlighting material quality and fine craftsmanship, elegant backdrop..."));
+        "e.g. Generate a video: clean 360 rotation highlighting material quality and fine craftsmanship, elegant backdrop..."));
     m_editAfterIntroPrompt->setMaximumHeight(70);
     layoutPrompts->addWidget(m_editAfterIntroPrompt);
 

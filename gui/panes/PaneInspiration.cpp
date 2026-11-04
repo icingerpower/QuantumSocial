@@ -140,7 +140,8 @@ void PaneInspiration::_setupDefaultPrompts()
     ui->editPromptPrompt->setPlainText(
         QStringLiteral("Suggest punchy, fast-paced video prompts for generating short-form videos "
                        "(visual scene, camera movement, and pacing), matching the style and dynamics "
-                       "of our favorite video prompts. Return each prompt on its own line, without numbering or commentary."));
+                       "of our favorite video prompts. Each prompt must start with 'Generate a video:' or 'Generate a video of'. "
+                       "Return each prompt on its own line, without numbering or commentary."));
 }
 
 void PaneInspiration::_loadSettings()
@@ -180,7 +181,8 @@ void PaneInspiration::_loadSettings()
     const QString defaultPromptPrompt = QStringLiteral(
         "Suggest punchy, fast-paced video prompts for generating short-form videos "
         "(visual scene, camera movement, and pacing), matching the style and dynamics "
-        "of our favorite video prompts. Return each prompt on its own line, without numbering or commentary.");
+        "of our favorite video prompts. Each prompt must start with 'Generate a video:' or 'Generate a video of'. "
+        "Return each prompt on its own line, without numbering or commentary.");
 
     const QString savedHashtagPrompt = settings->value(QStringLiteral("Inspiration/HashtagsPrompt")).toString();
     ui->editPromptHashtag->setPlainText(savedHashtagPrompt.isEmpty() ? defaultHashtagPrompt : savedHashtagPrompt);

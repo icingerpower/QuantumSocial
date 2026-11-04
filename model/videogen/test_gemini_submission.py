@@ -871,6 +871,50 @@ class GeminiSubmissionTests(unittest.TestCase):
                 self.assertEqual(result["video"], "/clip.mp4")
                 recovered.goto.assert_called_once_with(page.url, wait_until="domcontentloaded", timeout=60000)
 
+    def test_ensure_imperative_video_prompt(self):
+        # Empty/whitespace inputs
+        self.assertEqual(worker._ensure_imperative_video_prompt(""), "")
+        self.assertEqual(worker._ensure_imperative_video_prompt(None), None)
+
+        # Bare scene description
+        bare = "A tall model with long legs poses and walks elegantly wearing black high heels."
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt(bare),
+            "Generate a video: A tall model with long legs poses and walks elegantly wearing black high heels."
+        )
+
+        # Already imperative
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt("Generate a video: A tall model poses."),
+            "Generate a video: A tall model poses."
+        )
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt("Generate a video of a girl in the rain"),
+            "Generate a video of a girl in the rain"
+        )
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt("Generate a vertical 9:16 video of a product showcase"),
+            "Generate a vertical 9:16 video of a product showcase"
+        )
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt("Create a video: drone shot over beach"),
+            "Create a video: drone shot over beach"
+        )
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt("Génère une vidéo de mannequin"),
+            "Génère une vidéo de mannequin"
+        )
+
+        # "Video of ..." / "Video: ..." conversions
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt("Video of a sleek sports car driving at sunset."),
+            "Generate a video of a sleek sports car driving at sunset."
+        )
+        self.assertEqual(
+            worker._ensure_imperative_video_prompt("Video: Close-up on the heels."),
+            "Generate a video: Close-up on the heels."
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

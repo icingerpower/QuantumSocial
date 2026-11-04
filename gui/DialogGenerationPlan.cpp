@@ -23,6 +23,7 @@
 
 #include "model/SavedPrompts.h"
 #include "model/videogen/AbstractVideoGenerator.h"
+#include "model/videogen/VideoGenerationWorkflow.h"
 
 namespace {
 const QString SETTING_ONE_IMAGE = QStringLiteral("generation/choiceOneImage");
@@ -133,7 +134,7 @@ DialogGenerationPlan::Plan DialogGenerationPlan::plan() const
     {
         if (video.second.group->isChecked())
         {
-            plan.videos << VideoPick{video.first, _sectionPrompt(video.second),
+            plan.videos << VideoPick{video.first, ensureImperativeVideoPrefix(_sectionPrompt(video.second)),
                                      _sectionCheckedPropertyValues(video.second),
                                      video.second.group->generationCount()};
         }
