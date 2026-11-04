@@ -8,6 +8,8 @@
 #include <QFileSystemModel>
 #include <QImage>
 #include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QMediaPlayer>
 #include <QProcess>
@@ -46,6 +48,7 @@
 #include "model/TableProjects.h"
 #include "model/TableAccounts.h"
 #include "model/accounts/AbstractSocialAccount.h"
+#include "model/videogen/VideoGenerationWorkflow.h"
 #include "model/properties/TreeProperties.h"
 #include "model/videos/SocialStatistics.h"
 #include "model/videos/TableVideoStatistics.h"
@@ -849,6 +852,23 @@ static void checkVideoClips(const QDir &root)
     VideoGeneratorGemini gemini;
     require(gemini.continuationDurationSeconds({}) == 10.0, "Gemini default segment length");
     require(gemini.continuationDurationSeconds({{"continuationDurationSec", 8.0}}) == 8.0, "provider duration configurable");
+    bool hasCloseBrowserSetting = false;
+    for (const auto &spec : gemini.availableSettings())
+    {
+        if (spec.key == QStringLiteral("closeBrowserOnFinish"))
+        {
+            hasCloseBrowserSetting = true;
+            require(spec.defaultValue.toBool() == true, "closeBrowserOnFinish defaults to true");
+            break;
+        }
+    }
+    require(hasCloseBrowserSetting, "Gemini backend has closeBrowserOnFinish setting");
+
+    require(!gemini.isWorkerRunning(), "gemini worker not running initially");
+    gemini.stopWorker();
+    require(!gemini.isWorkerRunning(), "stopWorker is safe when no worker running");
+    AbstractVideoGenerator::stopAllWorkers();
+
     FakeGenerator other;
     require(other.continuationDurationSeconds({}) == 0, "other providers preserve their downloads");
 
@@ -920,6 +940,8 @@ static void checkMultiVideoIdentity(PaneGeneration &pane, TableVideos &videos, c
     require(projects != nullptr, "project model available");
     require(!table->isColumnHidden(TableProjects::IND_NAME), "project name column is visible");
     require(!table->isColumnHidden(TableProjects::IND_TYPE), "project type column is visible");
+    require(!table->isColumnHidden(TableProjects::IND_LAST_UPDATE), "project last update column is visible");
+    require(table->model()->headerData(TableProjects::IND_LAST_UPDATE, Qt::Horizontal).toString() == QStringLiteral("Last update"), "header is Last update");
     require(table->isColumnHidden(TableProjects::IND_CREATED), "project created column is hidden");
     const int row = projects->addMultiVideoProject("Completed multi-video", {});
     const QUuid projectId = projects->projectId(row);
@@ -1083,6 +1105,61 @@ static void checkInspirationModelsAndPane(const QDir &parentRoot)
         // removeRows
         hashtags.removeRow(1);
         require(hashtags.rowCount() == 2, "removed row 1");
+
+        // 1b. Test viral 4+1 hashtag laddering prompt and optimization
+        hashtags.setHashtags({QStringLiteral("#fashion"), QStringLiteral("#ootd"),
+                              QStringLiteral("#style"), QStringLiteral("#heels")});
+
+        // Test viralHashtagPromptSection
+        const QString promptWithKw = hashtags.viralHashtagPromptSection(QStringLiteral("evening dress"));
+        require(promptWithKw.contains("Viral 4+1", Qt::CaseInsensitive), "viral hashtag prompt mentions 4+1");
+        require(promptWithKw.contains("#eveningdress"), "viral hashtag prompt contains SEO keyword tag");
+        require(promptWithKw.contains("#fashion") && promptWithKw.contains("#ootd"), "viral hashtag prompt includes preferred tags");
+
+        const QString emptyPrompt = PreferredHashtags::viralHashtagPromptSection({}, QStringLiteral("shoes"));
+        require(emptyPrompt.contains("#shoes"), "empty preferred prompt includes keyword tag");
+
+        // Test optimizeDescriptionHashtags
+        // Candidate description with >5 hashtags and multiple hallucinated tags:
+        const QString rawDesc = QStringLiteral(
+            "Elevate your evening look with pure confidence. "
+            "#eveningdress #fashion #ootd #hallucinated1 #hallucinated2 #hallucinated3 #style qs0042");
+
+        QStringList newTags;
+        const QString optimized = PreferredHashtags::optimizeDescriptionHashtags(
+            rawDesc, QStringLiteral("evening dress"), hashtags.hashtags(), &newTags);
+
+        // Verification of 4+1:
+        // - Keyword tag: #eveningdress
+        // - Preferred tags from candidates: #fashion, #ootd, #style (3 tags)
+        // - At most 1 new tag: #hallucinated1
+        // - Dropped: #hallucinated2, #hallucinated3
+        // - Preserved shortcode: qs0042
+        require(newTags.size() == 1, "exactly 1 new discovery tag accepted");
+        require(newTags.first() == QStringLiteral("#hallucinated1"), "first new tag was accepted");
+        require(optimized.contains("#eveningdress"), "optimized contains SEO keyword tag");
+        require(optimized.contains("#fashion"), "optimized contains preferred tag #fashion");
+        require(optimized.contains("#ootd"), "optimized contains preferred tag #ootd");
+        require(optimized.contains("#hallucinated1"), "optimized contains accepted new tag");
+        require(!optimized.contains("#hallucinated2"), "optimized dropped second hallucinated tag");
+        require(!optimized.contains("#hallucinated3"), "optimized dropped third hallucinated tag");
+        require(optimized.endsWith(QStringLiteral("qs0042")), "optimized preserved tracking shortcode at end");
+
+        // Verify member optimizeDescriptionHashtags registers new tag into model as SOURCE_AI
+        const int prevCount = hashtags.rowCount();
+        const QString optimized2 = hashtags.optimizeDescriptionHashtags(
+            QStringLiteral("Step out in bold luxury. #fashion #ootd #newDiscoveryTag"),
+            QStringLiteral("luxury"));
+        require(hashtags.rowCount() == prevCount + 1, "model row count incremented by 1 for new tag");
+        require(hashtags.data(hashtags.index(hashtags.rowCount() - 1, PreferredHashtags::IND_TAG)).toString()
+                == QStringLiteral("#newDiscoveryTag"), "new tag is #newDiscoveryTag");
+        require(hashtags.data(hashtags.index(hashtags.rowCount() - 1, PreferredHashtags::IND_SOURCE)).toString()
+                == PreferredHashtags::SOURCE_AI, "new tag source is AI");
+
+        // Verify persistence of newly registered AI tag
+        PreferredHashtags reloadedAi(root.path());
+        require(reloadedAi.hashtags().contains(QStringLiteral("#newDiscoveryTag")),
+                "newly discovered tag persisted to preferred_hashtags.json");
     }
 
     // 2. Test FavoriteHooks table model, persistence, and asPromptSection
@@ -1139,6 +1216,46 @@ static void checkInspirationModelsAndPane(const QDir &parentRoot)
         FavoriteVideoPrompts reloaded(root.path());
         require(reloaded.rowCount() == 2, "reloaded prompts size 2");
         require(reloaded.data(reloaded.index(1, FavoriteVideoPrompts::IND_SOURCE)).toString() == FavoriteVideoPrompts::SOURCE_AI, "reloaded prompt 1 is AI");
+    }
+
+    // 3b. Test ensureImperativeVideoPrefix and ensureVideoPrompt
+    {
+        // Empty / whitespace
+        require(ensureImperativeVideoPrefix(QString{}).isEmpty(), "empty prompt stays empty");
+        require(ensureImperativeVideoPrefix(QStringLiteral("   ")).isEmpty(), "whitespace prompt becomes empty");
+
+        // Bare prompt gets prepended with "Generate a video: "
+        const QString bare = QStringLiteral("A tall model with long legs poses and walks elegantly wearing black high heels.");
+        const QString imperative = ensureImperativeVideoPrefix(bare);
+        require(imperative == QStringLiteral("Generate a video: A tall model with long legs poses and walks elegantly wearing black high heels."),
+                "bare prompt receives Generate a video prefix");
+
+        // Already imperative prompts are preserved
+        require(ensureImperativeVideoPrefix(QStringLiteral("Generate a video: A tall model poses."))
+                == QStringLiteral("Generate a video: A tall model poses."), "already imperative prompt preserved");
+        require(ensureImperativeVideoPrefix(QStringLiteral("Generate a video of a woman walking"))
+                == QStringLiteral("Generate a video of a woman walking"), "generate video of preserved");
+        require(ensureImperativeVideoPrefix(QStringLiteral("Generate a 9:16 vertical video of shoes"))
+                == QStringLiteral("Generate a 9:16 vertical video of shoes"), "generate with format words preserved");
+        require(ensureImperativeVideoPrefix(QStringLiteral("Create a video: drone shot over beach"))
+                == QStringLiteral("Create a video: drone shot over beach"), "create video preserved");
+        require(ensureImperativeVideoPrefix(QStringLiteral("Génère une vidéo de mannequin"))
+                == QStringLiteral("Génère une vidéo de mannequin"), "french genere une video preserved");
+
+        // "Video of ..." and "Video: ..." conversions
+        require(ensureImperativeVideoPrefix(QStringLiteral("Video of a sleek sports car."))
+                == QStringLiteral("Generate a video of a sleek sports car."), "Video of converted to Generate a video of");
+        require(ensureImperativeVideoPrefix(QStringLiteral("Video: Close-up on the heels."))
+                == QStringLiteral("Generate a video: Close-up on the heels."), "Video: converted to Generate a video:");
+
+        // ensureVideoPrompt combines imperative prefix and format suffix
+        const QString fullPrompt = ensureVideoPrompt(bare, QStringLiteral("vertical (9:16)"));
+        require(fullPrompt == QStringLiteral("Generate a video: A tall model with long legs poses and walks elegantly wearing black high heels. Video format: vertical (9:16)."),
+                "ensureVideoPrompt enforces both imperative prefix and format label");
+
+        // Idempotency: re-running ensureVideoPrompt on the output leaves it unchanged
+        require(ensureVideoPrompt(fullPrompt, QStringLiteral("vertical (9:16)")) == fullPrompt,
+                "ensureVideoPrompt is idempotent");
     }
 
     // 4. Test PaneInspiration setup, spin boxes, only-human checkboxes, and settings persistence
@@ -1599,6 +1716,108 @@ static void checkPropertyRetrieveStatistics(const QDir &root)
             "row 1 preview pixel color comes from green regenerated image, not red source image");
 }
 
+static void checkLastUpdateColumn(const QDir &root)
+{
+    // 1. isRecentDate tests
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    require(TableProjects::isRecentDate(now), "now is recent");
+    require(TableProjects::isRecentDate(now.addDays(-1)), "1 day ago is recent");
+    require(TableProjects::isRecentDate(now.addDays(-2)), "2 days ago is recent");
+    require(TableProjects::isRecentDate(now.addSecs(-2 * 86400 - 3600)), "2.5 days ago is recent");
+    require(!TableProjects::isRecentDate(now.addDays(-4)), "4 days ago is not recent");
+    require(!TableProjects::isRecentDate(now.addDays(-30)), "30 days ago is not recent");
+    require(!TableProjects::isRecentDate(QDateTime{}), "invalid date is not recent");
+
+    // 2. TableProjects and TableVideos integration
+    const QDir testDir(root.filePath("test_last_update"));
+    testDir.mkpath(".");
+    TableVideos testVideos(testDir.path());
+    TableProjects testProjects(testDir.path());
+    testProjects.setVideosModel(&testVideos);
+
+    // Empty project without any videos
+    const int projRow1 = testProjects.addProject({}, {}, "Empty Project", {});
+    const QUuid projId1 = testProjects.projectId(projRow1);
+    require(testProjects.lastVideoDate(projRow1).isNull(), "empty project has no video date");
+    require(testProjects.data(testProjects.index(projRow1, TableProjects::IND_LAST_UPDATE), Qt::DisplayRole).toString().isEmpty(),
+            "empty project has empty display date");
+    require(!testProjects.data(testProjects.index(projRow1, TableProjects::IND_LAST_UPDATE), Qt::BackgroundRole).isValid(),
+            "empty project has no background color");
+
+    // Project with recently generated video (< 3 days)
+    const int projRow2 = testProjects.addProject({}, {}, "Recent Video Project", {});
+    const QUuid projId2 = testProjects.projectId(projRow2);
+    const QUuid vidRecent = testVideos.addVideo({}, {}, "original", projId2);
+    const QString recentCode = testVideos.recordFromId(vidRecent)->shortCode;
+    const QDir recentDir = testProjects.generationDir(projRow2, recentCode);
+    writeFile(recentDir.filePath("video.mp4"), "dummy video");
+
+    require(testProjects.lastVideoDate(projRow2).isValid(), "recent video date is valid");
+    require(!testProjects.data(testProjects.index(projRow2, TableProjects::IND_LAST_UPDATE), Qt::DisplayRole).toString().isEmpty(),
+            "recent video has formatted display date");
+    const QColor bgRecent = testProjects.data(testProjects.index(projRow2, TableProjects::IND_LAST_UPDATE), Qt::BackgroundRole).value<QColor>();
+    require(bgRecent.isValid() && bgRecent.green() > bgRecent.red() && bgRecent.green() > bgRecent.blue(),
+            "recent video date is highlighted in green");
+    require(bgRecent == TableProjects::COLOR_RECENT_BG, "recent video background matches COLOR_RECENT_BG");
+    const QColor fgRecent = testProjects.data(testProjects.index(projRow2, TableProjects::IND_LAST_UPDATE), Qt::ForegroundRole).value<QColor>();
+    require(fgRecent == TableProjects::COLOR_RECENT_FG, "recent video foreground matches COLOR_RECENT_FG");
+
+    // Project with old video (> 3 days old)
+    const int projRow3 = testProjects.addProject({}, {}, "Old Video Project", {});
+    const QUuid projId3 = testProjects.projectId(projRow3);
+    const QUuid vidOld = testVideos.addVideo({}, {}, "original", projId3);
+    const QString oldCode = testVideos.recordFromId(vidOld)->shortCode;
+    const QDir oldDir = testProjects.generationDir(projRow3, oldCode);
+    writeFile(oldDir.filePath("video.mp4"), "dummy video");
+
+    // Artificially age the old video record by rewriting videos.json
+    {
+        QFile vFile(testDir.filePath("videos.json"));
+        require(vFile.open(QIODevice::ReadOnly), "open videos.json");
+        auto doc = QJsonDocument::fromJson(vFile.readAll());
+        vFile.close();
+        auto rootObj = doc.object();
+        auto arr = rootObj["videos"].toArray();
+        for (int i = 0; i < arr.size(); ++i)
+        {
+            auto obj = arr[i].toObject();
+            if (obj["id"].toString() == vidOld.toString(QUuid::WithoutBraces))
+            {
+                obj["generatedDate"] = now.addDays(-10).toString(Qt::ISODate);
+                arr[i] = obj;
+            }
+        }
+        rootObj["videos"] = arr;
+        doc.setObject(rootObj);
+        require(vFile.open(QIODevice::WriteOnly), "write aged videos.json");
+        vFile.write(doc.toJson());
+        vFile.close();
+    }
+    // Reload testVideos from disk
+    TableVideos reloadedVideos(testDir.path());
+    testProjects.setVideosModel(&reloadedVideos);
+
+    require(testProjects.lastVideoDate(projRow3).isValid(), "old video date is valid");
+    require(!TableProjects::isRecentDate(testProjects.lastVideoDate(projRow3)), "old video date is not recent");
+    require(!testProjects.data(testProjects.index(projRow3, TableProjects::IND_LAST_UPDATE), Qt::DisplayRole).toString().isEmpty(),
+            "old video has formatted display date");
+    require(!testProjects.data(testProjects.index(projRow3, TableProjects::IND_LAST_UPDATE), Qt::BackgroundRole).isValid(),
+            "old video date is not highlighted in green");
+
+    // Simulate "generate again video of old folder":
+    // Adding a new video today to the old project row 3
+    const QUuid vidNewForOld = reloadedVideos.addVideo({}, {}, "original", projId3);
+    const QString newCode = reloadedVideos.recordFromId(vidNewForOld)->shortCode;
+    const QDir newGenDir = testProjects.generationDir(projRow3, newCode);
+    writeFile(newGenDir.filePath("take2.mp4"), "new video in old folder");
+
+    require(testProjects.lastVideoDate(projRow3).isValid(), "new video in old folder has valid date");
+    require(TableProjects::isRecentDate(testProjects.lastVideoDate(projRow3)), "new video in old folder is recent");
+    const QColor bgOldNowRecent = testProjects.data(testProjects.index(projRow3, TableProjects::IND_LAST_UPDATE), Qt::BackgroundRole).value<QColor>();
+    require(bgOldNowRecent.isValid() && bgOldNowRecent.green() > bgOldNowRecent.red(),
+            "old folder with new video turns green");
+}
+
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
@@ -1631,6 +1850,7 @@ int main(int argc, char **argv)
         checkExtraPromptPhrase();
         checkDialogHooksPickQuote(root);
         checkInspirationModelsAndPane(root);
+        checkLastUpdateColumn(root);
 
         TableProjects projects(root.path());
         const int row = projects.addProject({}, {}, "Test project", {});
