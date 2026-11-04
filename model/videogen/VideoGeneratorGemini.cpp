@@ -16,6 +16,9 @@ QString VideoGeneratorGemini::getName() const
 QList<AbstractVideoGenerator::SettingSpec> VideoGeneratorGemini::availableSettings() const
 {
     return {
+        {QStringLiteral("closeBrowserOnFinish"),
+         QObject::tr("Automatically close the browser once video generation is complete (releases Chrome profile lock)"),
+         true},
         {QStringLiteral("continuationDurationSec"),
          QObject::tr("New segment duration in multi-video continuations (seconds; 0 disables trimming)"),
          10.0},

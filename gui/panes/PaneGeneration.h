@@ -328,6 +328,7 @@ private:
     void _logProgress(const QString &message);
     // Final log line + stops the spinner, enables Close, hides Cancel.
     void _finishProgress(const QString &message);
+    void _stopVideoGeneratorsIfConfigured();
     // Step 2 of the Generate flow: the pane's CLI preselects/filters the A/B
     // properties and suggests 10 hook/description pairs (strict JSON) — it
     // no longer writes any content prompt text (see DialogGenerationPlan,

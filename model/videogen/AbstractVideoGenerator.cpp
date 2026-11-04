@@ -26,17 +26,42 @@ AbstractVideoGenerator::AbstractVideoGenerator() = default;
 
 AbstractVideoGenerator::~AbstractVideoGenerator()
 {
+    stopWorker();
+}
+
+bool AbstractVideoGenerator::isWorkerRunning() const
+{
+    return m_worker && m_worker->state() != QProcess::NotRunning;
+}
+
+void AbstractVideoGenerator::stopWorker()
+{
     if (!m_worker)
     {
         return;
     }
-    // Closing stdin is the worker's shutdown signal (its read loop ends and
-    // it closes the browser itself); kill only if it ignores that.
-    m_worker->closeWriteChannel();
-    if (!m_worker->waitForFinished(5000))
+    if (m_worker->state() != QProcess::NotRunning)
     {
-        m_worker->kill();
-        m_worker->waitForFinished(2000);
+        // Closing stdin is the worker's shutdown signal (its read loop ends and
+        // it closes the browser context and Playwright itself); kill only if it ignores that.
+        m_worker->closeWriteChannel();
+        if (!m_worker->waitForFinished(5000))
+        {
+            m_worker->kill();
+            m_worker->waitForFinished(2000);
+        }
+    }
+    m_worker.reset();
+}
+
+void AbstractVideoGenerator::stopAllWorkers()
+{
+    for (AbstractVideoGenerator *generator : ALL_VIDEO_GENERATORS())
+    {
+        if (generator)
+        {
+            generator->stopWorker();
+        }
     }
 }
 

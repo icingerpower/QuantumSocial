@@ -88,6 +88,16 @@ public:
                                          const QString &outputDir,
                                          const QVariantMap &settings) const = 0;
 
+    // Shuts down this backend's persistent worker process (if running),
+    // which cleanly closes the browser context and releases any profile locks.
+    void stopWorker();
+
+    // True when the persistent worker process is currently running.
+    bool isWorkerRunning() const;
+
+    // Shuts down persistent workers across all registered video generators.
+    static void stopAllWorkers();
+
     // Returns all registered backends keyed by id.
     static const QMap<QString, AbstractVideoGenerator *> &ALL_VIDEO_GENERATORS();
 

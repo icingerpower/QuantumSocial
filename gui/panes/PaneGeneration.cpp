@@ -521,6 +521,7 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
 
 PaneGeneration::~PaneGeneration()
 {
+    AbstractVideoGenerator::stopAllWorkers();
     delete ui;
 }
 
@@ -1055,6 +1056,7 @@ void PaneGeneration::_startMultiVideoGeneration(
 
         connect(workflow, &ProductShowcaseMultiVideoWorkflow::allCompleted,
                 this, [this, row, projectId, workflow](const QStringList &videoPaths) {
+            _stopVideoGeneratorsIfConfigured();
             if (!videoPaths.isEmpty())
             {
                 if (!_prepareMultiVideoGeneration(row, workflow)) return;
@@ -1105,6 +1107,7 @@ void PaneGeneration::_startMultiVideoGeneration(
 
         connect(workflow, &ProductShowcaseMultiVideoWorkflow::failed,
                 this, [this, row](const QString &err) {
+            _stopVideoGeneratorsIfConfigured();
             _finishProgress(tr("Multi-video generation failed: %1").arg(err));
             _updateResumeButtonState(row);
         });
@@ -2417,6 +2420,7 @@ void PaneGeneration::_runNextInGroup(int row, const QUuid &projectId, QString gr
             // subfolder under it, is no longer needed by anything.
             setEnabled(true);
             m_projects->stagingDir(row).removeRecursively();
+            _stopVideoGeneratorsIfConfigured();
             if (m_batchCancelled)
             {
                 _finishProgress(tr("Cancelled. %1 completed generation(s) saved.")
@@ -3963,6 +3967,7 @@ void PaneGeneration::_openProgress()
             {
                 m_activeMultiVideoWorkflow->cancel();
             }
+            _stopVideoGeneratorsIfConfigured();
             _logProgress(tr("Cancelling remaining generations after the current steps finish..."));
         });
     }
@@ -3997,6 +4002,29 @@ void PaneGeneration::_finishProgress(const QString &message)
     if (m_progress.cancelBtn)
     {
         m_progress.cancelBtn->hide();
+    }
+}
+
+void PaneGeneration::_stopVideoGeneratorsIfConfigured()
+{
+    const auto &generators = AbstractVideoGenerator::ALL_VIDEO_GENERATORS();
+    for (auto it = generators.constBegin(); it != generators.constEnd(); ++it)
+    {
+        const QString genId = it.key();
+        AbstractVideoGenerator *gen = it.value();
+        if (!gen)
+        {
+            continue;
+        }
+        const bool shouldClose = m_generationSettings
+            ? m_generationSettings->settingsFor(genId)
+                  .value(QStringLiteral("closeBrowserOnFinish"), true)
+                  .toBool()
+            : true;
+        if (shouldClose)
+        {
+            gen->stopWorker();
+        }
     }
 }
 
