@@ -318,13 +318,14 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
     // side (still user-adjustable).
     ui->splitter_3->setStretchFactor(0, 1);
     ui->splitter_3->setStretchFactor(1, 3);
-    ui->splitter_3->setSizes({300, 900});
+    ui->splitter_3->setSizes({350, 850});
 
     m_planProxy = new VideoPlanProxy(this);
     m_planProxy->setSourceModel(m_properties);
 
     m_projects = new TableProjects(
         WorkingDirectoryManager::instance()->workingDir().absolutePath(), this);
+    m_projects->setVideosModel(m_videos);
     ui->tableViewProjects->setModel(m_projects);
     ui->tableViewProjects->setSelectionBehavior(QAbstractItemView::SelectRows);
     for (int column : {TableProjects::IND_CREATED, TableProjects::IND_KEYWORD,
@@ -342,6 +343,9 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
     ui->tableViewProjects->horizontalHeader()->setSectionResizeMode(
         TableProjects::IND_TYPE, QHeaderView::Interactive);
     ui->tableViewProjects->horizontalHeader()->resizeSection(TableProjects::IND_TYPE, 100);
+    ui->tableViewProjects->horizontalHeader()->setSectionResizeMode(
+        TableProjects::IND_LAST_UPDATE, QHeaderView::Interactive);
+    ui->tableViewProjects->horizontalHeader()->resizeSection(TableProjects::IND_LAST_UPDATE, 130);
 
     // The Source page edits the selected row directly: focus-out submits.
     m_projectMapper = new QDataWidgetMapper(this);
@@ -2856,6 +2860,10 @@ void PaneGeneration::_refreshHooksView(const QDir &hooksDir)
 
 void PaneGeneration::_refreshGenerationsView(int row)
 {
+    if (m_projects)
+    {
+        m_projects->refreshLastUpdate(row);
+    }
     const auto *current = ui->treeViewGenerations->currentItem();
     const QUuid selectedId = current
         ? (current->parent() ? current->parent() : current)->data(0, Qt::UserRole).toUuid()

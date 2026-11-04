@@ -4,6 +4,7 @@
 #include <QTextStream>
 
 #include "TableProjects.h"
+#include "videos/TableVideos.h"
 
 namespace {
 
@@ -106,7 +107,7 @@ QStringList splitCsvLine(const QString &line)
 
 const QStringList TableProjects::HEADER{
     "Name", "Created", "Keyword", "Hook idea", "Image", "Gen prompt",
-    "Gen hook", "Gen description", "Image 2", "Type", "Id"};
+    "Gen hook", "Gen description", "Image 2", "Type", "Last update", "Id"};
 const int TableProjects::IND_NAME{0};
 const int TableProjects::IND_CREATED{1};
 const int TableProjects::IND_KEYWORD{2};
@@ -117,7 +118,11 @@ const int TableProjects::IND_GEN_HOOK{6};
 const int TableProjects::IND_GEN_DESC{7};
 const int TableProjects::IND_IMAGE2{8};
 const int TableProjects::IND_TYPE{9};
-const int TableProjects::IND_ID{10};
+const int TableProjects::IND_LAST_UPDATE{10};
+const int TableProjects::IND_ID{11};
+
+const QColor TableProjects::COLOR_RECENT_BG{34, 100, 48};
+const QColor TableProjects::COLOR_RECENT_FG{230, 255, 230};
 
 TableProjects::TableProjects(const QString &workingDirectory, QObject *parent)
     : QAbstractTableModel(parent)
@@ -147,6 +152,10 @@ QVariant TableProjects::headerData(int section, Qt::Orientation orientation, int
             {
                 return tr("Created");
             }
+            if (section == IND_LAST_UPDATE)
+            {
+                return tr("Last update");
+            }
             return HEADER[section];
         }
     }
@@ -167,6 +176,53 @@ int TableProjects::columnCount(const QModelIndex &parent) const
 
 QVariant TableProjects::data(const QModelIndex &index, int role) const
 {
+    if (!index.isValid() || index.row() < 0 || index.row() >= m_listOfVariantList.size())
+    {
+        return QVariant{};
+    }
+
+    if (index.column() == IND_LAST_UPDATE)
+    {
+        const QDateTime dt = lastVideoDate(index.row());
+        if (role == Qt::DisplayRole)
+        {
+            if (dt.isValid())
+            {
+                return dt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd hh:mm"));
+            }
+            return QString{};
+        }
+        if (role == Qt::EditRole)
+        {
+            return dt.isValid() ? dt.toUTC().toString(Qt::ISODate) : QString{};
+        }
+        if (role == Qt::ToolTipRole)
+        {
+            if (dt.isValid())
+            {
+                return dt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd hh:mm"));
+            }
+            return QString{};
+        }
+        if (role == Qt::BackgroundRole)
+        {
+            if (isRecentDate(dt))
+            {
+                return COLOR_RECENT_BG;
+            }
+            return QVariant{};
+        }
+        if (role == Qt::ForegroundRole)
+        {
+            if (isRecentDate(dt))
+            {
+                return COLOR_RECENT_FG;
+            }
+            return QVariant{};
+        }
+        return QVariant{};
+    }
+
     if (role != Qt::DisplayRole && role != Qt::EditRole)
     {
         return QVariant{};
@@ -197,6 +253,14 @@ bool TableProjects::setData(const QModelIndex &index, const QVariant &value, int
     if (role == Qt::EditRole)
     {
         const int row = index.row();
+        if (index.column() == IND_LAST_UPDATE)
+        {
+            m_listOfVariantList[index.row()][index.column()] = value;
+            _saveInFile();
+            emit dataChanged(index, index, {role, Qt::DisplayRole, Qt::BackgroundRole, Qt::ForegroundRole});
+            return true;
+        }
+
         const QString oldFolderName = (index.column() == IND_NAME && row >= 0 && row < m_listOfVariantList.size())
             ? projectGenerationFolderName(row) : QString{};
 
@@ -292,6 +356,7 @@ int TableProjects::addProject(const QString &imagePath, const QString &imagePath
         , QString{} // picked description (with hashtags)
         , storedImagePath2
         , storedType
+        , QString{} // last update
         , idString
     };
     endInsertRows();
@@ -326,6 +391,7 @@ int TableProjects::addMultiVideoProject(const QString &keyword, const QString &f
         , QString{} // gen desc
         , QString{} // image 2
         , QStringLiteral("multi_video")
+        , QString{} // last update
         , idString
     };
     endInsertRows();
@@ -619,6 +685,7 @@ void TableProjects::_loadFromFile()
             , elements[IND_GEN_DESC]
             , elements[IND_IMAGE2]
             , type
+            , elements[IND_LAST_UPDATE]
             , id
         };
     }
@@ -634,14 +701,183 @@ void TableProjects::_saveInFile()
 
     QTextStream stream{&file};
     stream << HEADER.join(QStringLiteral(","));
-    for (const auto &variantList : m_listOfVariantList)
+    for (int row = 0; row < m_listOfVariantList.size(); ++row)
     {
+        const QDateTime dt = lastVideoDate(row);
+        if (dt.isValid() && IND_LAST_UPDATE < m_listOfVariantList[row].size())
+        {
+            m_listOfVariantList[row][IND_LAST_UPDATE] = dt.toUTC().toString(Qt::ISODate);
+        }
         QStringList elements;
-        for (const auto &value : variantList)
+        for (const auto &value : m_listOfVariantList[row])
         {
             elements << escapeCsvField(value.toString());
         }
         stream << "\n" + elements.join(QStringLiteral(","));
     }
     file.close();
+}
+
+void TableProjects::setVideosModel(TableVideos *videos)
+{
+    if (m_videos == videos)
+    {
+        return;
+    }
+    if (m_videos)
+    {
+        disconnect(m_videos, nullptr, this, nullptr);
+    }
+    m_videos = videos;
+    if (m_videos)
+    {
+        const auto notifyAll = [this]() {
+            refreshLastUpdate(-1);
+        };
+        connect(m_videos, &QAbstractItemModel::rowsInserted, this, notifyAll);
+        connect(m_videos, &QAbstractItemModel::rowsRemoved, this, notifyAll);
+        connect(m_videos, &QAbstractItemModel::modelReset, this, notifyAll);
+        connect(m_videos, &QAbstractItemModel::dataChanged, this, notifyAll);
+        notifyAll();
+    }
+}
+
+void TableProjects::refreshLastUpdate(int row)
+{
+    if (rowCount() == 0)
+    {
+        return;
+    }
+    if (row >= 0 && row < rowCount())
+    {
+        emit dataChanged(index(row, IND_LAST_UPDATE), index(row, IND_LAST_UPDATE),
+                         {Qt::DisplayRole, Qt::BackgroundRole, Qt::ForegroundRole, Qt::ToolTipRole});
+    }
+    else
+    {
+        emit dataChanged(index(0, IND_LAST_UPDATE), index(rowCount() - 1, IND_LAST_UPDATE),
+                         {Qt::DisplayRole, Qt::BackgroundRole, Qt::ForegroundRole, Qt::ToolTipRole});
+    }
+}
+
+bool TableProjects::isRecentDate(const QDateTime &dt)
+{
+    if (!dt.isValid())
+    {
+        return false;
+    }
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    const QDateTime dtUtc = dt.toUTC();
+    const qint64 secs = dtUtc.secsTo(now);
+    return secs >= -60 && secs < 3 * 86400;
+}
+
+QDateTime TableProjects::lastVideoDate(int row) const
+{
+    if (row < 0 || row >= m_listOfVariantList.size())
+    {
+        return QDateTime{};
+    }
+
+    const QUuid projId = projectId(row);
+
+    if (m_videos)
+    {
+        const auto records = m_videos->recordsForProject(projId);
+        for (const auto *record : records)
+        {
+            if (!record)
+            {
+                continue;
+            }
+            const QDir genDir = generationDir(row, record->shortCode, false);
+            if (genDir.exists())
+            {
+                const bool hasVideo = genDir.exists(QStringLiteral("final_video.mp4"))
+                    || (genDir.exists(QStringLiteral("takes")) && genDir.exists(QStringLiteral("multi_video_workflow.json")))
+                    || !genDir.entryList({QStringLiteral("*.mp4"), QStringLiteral("*.mov"),
+                                          QStringLiteral("*.webm"), QStringLiteral("*.mkv")},
+                                         QDir::Files).isEmpty();
+                const bool hasOnlyImages = !hasVideo && !genDir.entryList({QStringLiteral("*.png"), QStringLiteral("*.jpg"),
+                                                                           QStringLiteral("*.jpeg"), QStringLiteral("*.webp")},
+                                                                          QDir::Files).isEmpty();
+                if (hasVideo || !hasOnlyImages)
+                {
+                    if (record->generatedDate.isValid())
+                    {
+                        return record->generatedDate;
+                    }
+                }
+            }
+            else
+            {
+                if (record->generatedDate.isValid())
+                {
+                    return record->generatedDate;
+                }
+            }
+        }
+    }
+
+    const QDir genBaseDir = projectGenerationsDir(row);
+    if (genBaseDir.exists())
+    {
+        QDateTime newest;
+        const auto subDirs = genBaseDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QFileInfo &subDirInfo : subDirs)
+        {
+            const QDir subDir{subDirInfo.absoluteFilePath()};
+            const auto videoFiles = subDir.entryInfoList({QStringLiteral("*.mp4"), QStringLiteral("*.mov"),
+                                                          QStringLiteral("*.webm"), QStringLiteral("*.mkv")},
+                                                         QDir::Files);
+            for (const QFileInfo &vFile : videoFiles)
+            {
+                const QDateTime modTime = vFile.lastModified();
+                if (!newest.isValid() || modTime > newest)
+                {
+                    newest = modTime;
+                }
+            }
+        }
+        if (newest.isValid())
+        {
+            return newest;
+        }
+    }
+
+    const QDir projDir = projectDir(row);
+    if (projDir.exists())
+    {
+        QDateTime newest;
+        const auto videoFiles = projDir.entryInfoList({QStringLiteral("*.mp4"), QStringLiteral("*.mov"),
+                                                       QStringLiteral("*.webm"), QStringLiteral("*.mkv")},
+                                                      QDir::Files);
+        for (const QFileInfo &vFile : videoFiles)
+        {
+            const QDateTime modTime = vFile.lastModified();
+            if (!newest.isValid() || modTime > newest)
+            {
+                newest = modTime;
+            }
+        }
+        if (newest.isValid())
+        {
+            return newest;
+        }
+    }
+
+    if (IND_LAST_UPDATE < m_listOfVariantList[row].size())
+    {
+        const QString stored = m_listOfVariantList[row][IND_LAST_UPDATE].toString();
+        if (!stored.isEmpty())
+        {
+            const QDateTime parsed = QDateTime::fromString(stored, Qt::ISODate);
+            if (parsed.isValid())
+            {
+                return parsed;
+            }
+        }
+    }
+
+    return QDateTime{};
 }

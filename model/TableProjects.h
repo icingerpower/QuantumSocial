@@ -2,8 +2,12 @@
 #define TABLEPROJECTS_H
 
 #include <QAbstractTableModel>
+#include <QColor>
+#include <QDateTime>
 #include <QDir>
 #include <QUuid>
+
+class TableVideos;
 
 // One row per video project. Visible columns: Name (renameable in place)
 // and Type. The trailing columns are hidden in the view: Created, Keyword and
@@ -39,7 +43,11 @@ public:
     // unchanged as extra reference material.
     static const int IND_IMAGE2;
     static const int IND_TYPE;
+    static const int IND_LAST_UPDATE;
     static const int IND_ID;
+
+    static const QColor COLOR_RECENT_BG;
+    static const QColor COLOR_RECENT_FG;
 
     explicit TableProjects(const QString &workingDirectory, QObject *parent = nullptr);
 
@@ -101,12 +109,19 @@ public:
     QDir stagingDir(int row) const;
     void resetStagingDir(int row) const;
 
+    void setVideosModel(TableVideos *videos);
+    TableVideos *videosModel() const { return m_videos; }
+    void refreshLastUpdate(int row = -1);
+    QDateTime lastVideoDate(int row) const;
+    static bool isRecentDate(const QDateTime &dt);
+
 private:
     static const QStringList HEADER;
 
     QDir m_workingDir;
     QString m_filePath;
     QList<QVariantList> m_listOfVariantList;
+    TableVideos *m_videos = nullptr;
 
     void _loadFromFile();
     void _saveInFile();
