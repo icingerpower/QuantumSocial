@@ -7,6 +7,7 @@
 #include <QStringList>
 
 class AbstractCli;
+class PreferredHashtags;
 class QTableWidgetItem;
 
 QT_BEGIN_NAMESPACE
@@ -38,6 +39,7 @@ public:
         QString videoPrompt;
         QString videoIdea;
         QStringList preferredHashtags;
+        PreferredHashtags *preferredHashtagsModel = nullptr;
         QString favoriteHooksPrompt;
         QStringList favoriteHooks;
         QString codeTag;

@@ -3,6 +3,7 @@
 
 #include "AbstractCli.h"
 #include "model/FavoriteHooks.h"
+#include "model/PreferredHashtags.h"
 #include "model/accounts/AbstractSocialAccount.h"
 
 #include <QClipboard>
@@ -758,6 +759,15 @@ void DialogHooks::_regenerateHooks()
                 continue;
             }
             seenHooks.insert(hook.toLower());
+            if (m_context.preferredHashtagsModel)
+            {
+                desc = m_context.preferredHashtagsModel->optimizeDescriptionHashtags(desc, m_context.keyword);
+            }
+            else
+            {
+                desc = PreferredHashtags::optimizeDescriptionHashtags(
+                    desc, m_context.keyword, m_context.preferredHashtags);
+            }
             const QString existingCode = AbstractSocialAccount::extractShortCode(desc);
             const QString tagCode = AbstractSocialAccount::extractShortCode(m_context.codeTag);
             if (!m_context.codeTag.isEmpty()
@@ -945,12 +955,19 @@ QString DialogHooks::_buildRegenerationPrompt() const
             "the 10 descriptions must include \"%1\" as plain readable text somewhere in the caption "
             "AND include %2 as one of its hashtags (total hashtags must not exceed 5).\n").arg(m_context.keyword, keywordHashtag);
     }
-    if (!m_context.preferredHashtags.isEmpty())
-    {
-        prompt += QStringLiteral(
-            "Preferred hashtags (chosen by the user — use ONLY these unless truly none fit, in which case add at most one relevant new one; at most 5 hashtags in total): %1\n")
-            .arg(m_context.preferredHashtags.join(QStringLiteral(" ")));
-    }
+    const QStringList prefTags = m_context.preferredHashtagsModel
+        ? m_context.preferredHashtagsModel->hashtags()
+        : m_context.preferredHashtags;
+    prompt += PreferredHashtags::viralHashtagPromptSection(prefTags, m_context.keyword);
+    prompt += QStringLiteral(
+        "VIRAL HOOK GUIDELINES (Maximize 3-Second Retention):\n"
+        "The first 3 seconds decide viral distribution. Write 10 short, punchy hooks (< 8 words each) covering distinct psychological triggers:\n"
+        "- Curiosity Gap / Mystery (e.g. \"The one thing nobody tells you about...\")\n"
+        "- Pattern Interrupt / Contrarian (e.g. \"Stop doing this if you want...\")\n"
+        "- Transformation / Before & After (e.g. \"Wait until you see how this transforms...\")\n"
+        "- Relatable Social Proof / Secret Club (e.g. \"If you're obsessed with...\")\n"
+        "- Direct Benefit / Value (e.g. \"The easiest way to style this look...\")\n"
+        "Do NOT use generic or boring openings.\n");
     if (!m_context.favoriteHooksPrompt.isEmpty())
     {
         prompt += m_context.favoriteHooksPrompt;

@@ -40,6 +40,27 @@ public:
 
     QStringList hashtags(bool onlyHuman = false) const;
     QString asPromptSection(bool onlyHuman = false) const;
+
+    // Prompt section explaining the viral 4+1 hashtag laddering strategy
+    // (pick 3-4 existing validated tags + at most 1 high-volume discovery tag,
+    // capped at 5 hashtags total, with target keyword SEO anchor).
+    QString viralHashtagPromptSection(const QString &keyword = QString{}) const;
+    static QString viralHashtagPromptSection(const QStringList &preferredTags, const QString &keyword = QString{});
+
+    // Optimizes a post description's trailing hashtags to adhere to the
+    // viral 4+1 strategy (up to 4 validated preferred/keyword tags + at most 1
+    // high-volume discovery tag, capped at 5 hashtags total).
+    // If a new discovery tag is accepted, it is automatically registered into
+    // this PreferredHashtags model with source "AI" and saved to disk.
+    QString optimizeDescriptionHashtags(const QString &rawDescription, const QString &keyword = QString{});
+
+    // Static helper that does the optimization without requiring a model instance.
+    // Newly accepted discovery tags are appended to outNewTags if provided.
+    static QString optimizeDescriptionHashtags(const QString &rawDescription,
+                                              const QString &keyword,
+                                              const QStringList &preferredTags,
+                                              QStringList *outNewTags = nullptr);
+
     // Normalizes (ensures a leading '#', trims, case-insensitive dedupe,
     // drops empties) and persists immediately.
     void setHashtags(const QStringList &hashtags);

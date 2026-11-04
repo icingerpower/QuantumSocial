@@ -1772,16 +1772,10 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
         "After writing the file, reply with the single word: done. If you "
         "cannot write files, reply with the JSON object itself instead.")
         .arg(SUGGESTIONS_FILE_NAME);
-    // CLI-invented hashtags are pure guesswork with zero engagement data
-    // behind them — once the user has curated a list (Settings pane /
-    // first-run setup), pick from it instead.
-    const QStringList preferredHashtags = m_hashtags->hashtags();
-    if (!preferredHashtags.isEmpty())
+    // Viral 4+1 Hashtag Strategy (validated from PreferredHashtags + at most 1 discovery tag)
+    if (m_hashtags)
     {
-        metaPrompt += QStringLiteral(
-            "Preferred hashtags (chosen by the user — use ONLY these unless "
-            "truly none fit a given description, in which case add at most "
-            "one relevant new one; at most 5 hashtags in total): %1\n").arg(preferredHashtags.join(QStringLiteral(" ")));
+        metaPrompt += m_hashtags->viralHashtagPromptSection(keyword);
     }
     // Curated examples of hooks that actually performed well (harvested
     // from top-ranked videos) — style/tone/pattern reference for the 10
@@ -1792,6 +1786,18 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
     // reaches the actual generation prompt directly, see
     // ImageGeneratorCli::generate() / VideoGenerationWorkflow.)
     metaPrompt += m_favoriteHooks->asPromptSection();
+
+    // Hook diversity guidelines to maximize 3-second watch-time retention
+    metaPrompt += QStringLiteral(
+        "VIRAL HOOK GUIDELINES (Maximize 3-Second Retention):\n"
+        "The first 3 seconds decide viral distribution. Write 10 short, punchy hooks (< 8 words each) covering distinct psychological triggers:\n"
+        "- Curiosity Gap / Mystery (e.g. \"The one thing nobody tells you about...\")\n"
+        "- Pattern Interrupt / Contrarian (e.g. \"Stop doing this if you want...\")\n"
+        "- Transformation / Before & After (e.g. \"Wait until you see how this transforms...\")\n"
+        "- Relatable Social Proof / Secret Club (e.g. \"If you're obsessed with...\")\n"
+        "- Direct Benefit / Value (e.g. \"The easiest way to style this look...\")\n"
+        "Do NOT use generic or boring openings.\n");
+
     if (!keyword.isEmpty())
     {
         // Root-caused live: the keyword was only ever given as loose
@@ -1938,7 +1944,8 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
     cli->runPromptAsync(metaPrompt, staging.absolutePath(),
                         this, [this, projectId, cli, videoFormatLabel,
                                attempt, staging,
-                               usedReferenceImagesForBootstrap](CliRunResult result) {
+                               usedReferenceImagesForBootstrap,
+                               keyword](CliRunResult result) {
         constexpr int MAX_SUGGESTION_TRIES = 3;
         setEnabled(true);
         if (!result.processStarted || result.exitCode != 0
@@ -1984,8 +1991,13 @@ void PaneGeneration::_suggestPlan(const QUuid &projectId,
         for (const QJsonValue &value : object.value(QStringLiteral("hooks")).toArray())
         {
             const QJsonObject hookObj = value.toObject();
-            hooks << qMakePair(hookObj.value(QStringLiteral("hook")).toString(),
-                               hookObj.value(QStringLiteral("description")).toString());
+            const QString hook = hookObj.value(QStringLiteral("hook")).toString().trimmed();
+            QString desc = hookObj.value(QStringLiteral("description")).toString().trimmed();
+            if (m_hashtags)
+            {
+                desc = m_hashtags->optimizeDescriptionHashtags(desc, keyword);
+            }
+            hooks << qMakePair(hook, desc);
         }
         // The CLI no longer writes any prompt text (see DialogGenerationPlan)
         // — hooks are the only thing left it must actually produce, so an
@@ -3900,6 +3912,7 @@ void PaneGeneration::_openHooksDialog()
     context.videoFormatLabel = m_runVideoFormatLabel.isEmpty()
         ? QStringLiteral("9:16 vertical") : m_runVideoFormatLabel;
     context.preferredHashtags = m_hashtags ? m_hashtags->hashtags() : QStringList{};
+    context.preferredHashtagsModel = m_hashtags;
     context.favoriteHooksPrompt = m_favoriteHooks ? m_favoriteHooks->asPromptSection() : QString{};
     context.favoriteHooks = m_favoriteHooks ? m_favoriteHooks->hooks() : QStringList{};
     context.codeTag = codeTagFromShortCode(shortCode);
