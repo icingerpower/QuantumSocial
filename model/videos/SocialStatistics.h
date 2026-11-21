@@ -1,6 +1,7 @@
 #ifndef SOCIALSTATISTICS_H
 #define SOCIALSTATISTICS_H
 
+#include <QJsonObject>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -55,6 +56,38 @@ public:
     static const TableVideos::VideoRecord *matchVideoRecord(
         const TableVideos *videos,
         const AbstractSocialAccount::AccountPostStatistics &post);
+
+    struct WinningVideoTextEntry
+    {
+        QString shortCode;
+        QString text;
+        qint64 views = 0;
+        qint64 likes = 0;
+    };
+
+    struct VideoTextExperimentSummary
+    {
+        int withTextCount = 0;
+        double withTextAvgViews = 0.0;
+        double withTextAvgEngagementPct = 0.0;
+        qint64 withTextBestViews = 0;
+
+        int withoutTextCount = 0;
+        double withoutTextAvgViews = 0.0;
+        double withoutTextAvgEngagementPct = 0.0;
+        qint64 withoutTextBestViews = 0;
+
+        QString recommendation; // "explore", "prefer_text", "prefer_clean", "balanced"
+        QList<WinningVideoTextEntry> winningTexts;
+
+        QJsonObject toJson() const;
+        QString humanSummary() const;
+        QString plannerPromptAddendum() const;
+    };
+
+    static VideoTextExperimentSummary summarizeVideoTextExperiment(
+        const TableVideos *videos,
+        FavoriteHooks *favoriteHooksToPromote = nullptr);
 
     static QCoro::Task<void> retrieveFromAccounts(TableAccounts *accounts,
                                                   TableVideos *videos,

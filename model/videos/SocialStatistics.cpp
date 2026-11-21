@@ -284,6 +284,305 @@ const TableVideos::VideoRecord *SocialStatistics::matchVideoRecord(
     return nullptr;
 }
 
+QJsonObject SocialStatistics::VideoTextExperimentSummary::toJson() const
+{
+    QJsonArray winnersArr;
+    for (const auto &w : winningTexts)
+    {
+        winnersArr.append(QJsonObject{
+            {QStringLiteral("shortCode"), w.shortCode},
+            {QStringLiteral("text"), w.text},
+            {QStringLiteral("views"), w.views},
+            {QStringLiteral("likes"), w.likes}
+        });
+    }
+    return QJsonObject{
+        {QStringLiteral("withTextCount"), withTextCount},
+        {QStringLiteral("withTextAvgViews"), withTextAvgViews},
+        {QStringLiteral("withTextAvgEngagementPct"), withTextAvgEngagementPct},
+        {QStringLiteral("withTextBestViews"), withTextBestViews},
+        {QStringLiteral("withoutTextCount"), withoutTextCount},
+        {QStringLiteral("withoutTextAvgViews"), withoutTextAvgViews},
+        {QStringLiteral("withoutTextAvgEngagementPct"), withoutTextAvgEngagementPct},
+        {QStringLiteral("withoutTextBestViews"), withoutTextBestViews},
+        {QStringLiteral("recommendation"), recommendation},
+        {QStringLiteral("winningTexts"), winnersArr}
+    };
+}
+
+QString SocialStatistics::VideoTextExperimentSummary::humanSummary() const
+{
+    if (withTextCount == 0 && withoutTextCount == 0)
+    {
+        return QObject::tr("Video Text A/B: 0 measured videos yet — exploring ~50/50 With vs Without native TikTok text to learn what works best.");
+    }
+    QString verdict;
+    if (recommendation == QLatin1String("prefer_text"))
+    {
+        verdict = QObject::tr("Native TikTok text is outperforming -> favoring text overlays (~75%) while keeping ~25% clean holdout");
+    }
+    else if (recommendation == QLatin1String("prefer_clean"))
+    {
+        verdict = QObject::tr("Clean unobstructed video is outperforming -> favoring clean video (~75%) while testing fresh hooks (~25%)");
+    }
+    else if (recommendation == QLatin1String("balanced"))
+    {
+        verdict = QObject::tr("Both perform similarly -> alternating ~50/50 by creative fit");
+    }
+    else
+    {
+        verdict = QObject::tr("Gathering baseline A/B sample -> alternating ~50/50");
+    }
+    return QObject::tr("Video Text A/B: With text=%1 video(s) (avg %2 views, %3% eng) vs Clean=%4 video(s) (avg %5 views, %6% eng) — %7.")
+        .arg(withTextCount)
+        .arg(qRound64(withTextAvgViews))
+        .arg(QString::number(withTextAvgEngagementPct, 'f', 1))
+        .arg(withoutTextCount)
+        .arg(qRound64(withoutTextAvgViews))
+        .arg(QString::number(withoutTextAvgEngagementPct, 'f', 1))
+        .arg(verdict);
+}
+
+QString SocialStatistics::VideoTextExperimentSummary::plannerPromptAddendum() const
+{
+    QString out = QStringLiteral("\nMeasured TikTok Native Video Text ('Aa Texte') A/B Performance on this account:\n");
+    out += QStringLiteral("- Videos WITH native TikTok text overlay: %1 measured | avg views=%2 | best views=%3 | avg engagement=%4%\n")
+        .arg(withTextCount)
+        .arg(qRound64(withTextAvgViews))
+        .arg(withTextBestViews)
+        .arg(QString::number(withTextAvgEngagementPct, 'f', 2));
+    out += QStringLiteral("- Videos WITHOUT text overlay (clean video): %1 measured | avg views=%2 | best views=%3 | avg engagement=%4%\n")
+        .arg(withoutTextCount)
+        .arg(qRound64(withoutTextAvgViews))
+        .arg(withoutTextBestViews)
+        .arg(QString::number(withoutTextAvgEngagementPct, 'f', 2));
+
+    if (!winningTexts.isEmpty())
+    {
+        out += QStringLiteral("- Highest-performing video overlay texts measured so far (imitate their brevity/curiosity style, never copy verbatim):\n");
+        for (int i = 0; i < qMin<int>(5, winningTexts.size()); ++i)
+        {
+            const auto &w = winningTexts[i];
+            out += QStringLiteral("  * \"%1\" (%2 views, %3 likes)\n")
+                .arg(w.text).arg(w.views).arg(w.likes);
+        }
+    }
+
+    if (recommendation == QLatin1String("prefer_text"))
+    {
+        out += QStringLiteral("- Strategy directive: Native TikTok text overlays are winning! Set \"addVideoText\": true on ~75-80% of VIDEO items (using a punchy 4-8 word curiosity/story \"videoOverlayText\"), and false on ~20-25% as a clean control.\n");
+    }
+    else if (recommendation == QLatin1String("prefer_clean"))
+    {
+        out += QStringLiteral("- Strategy directive: Clean unobstructed videos currently get more views! Set \"addVideoText\": false on ~75-80% of VIDEO items, and test \"addVideoText\": true on ~20-25% with a sharper, shorter 4-7 word hook to see if it beats the baseline.\n");
+    }
+    else
+    {
+        out += QStringLiteral("- Strategy directive: Alternate ~50/50 between \"addVideoText\": true and \"addVideoText\": false across VIDEO items so we measure and improve what works best on this account. Always still provide a concise 4-8 word \"videoOverlayText\" suggestion even when \"addVideoText\" is false so the user can toggle it on if desired.\n");
+    }
+    return out;
+}
+
+SocialStatistics::VideoTextExperimentSummary SocialStatistics::summarizeVideoTextExperiment(
+    const TableVideos *videos,
+    FavoriteHooks *favoriteHooksToPromote)
+{
+    VideoTextExperimentSummary summary;
+    summary.recommendation = QStringLiteral("explore");
+    if (!videos)
+    {
+        return summary;
+    }
+
+    // Build fast shortCode -> generation directory lookup across both current
+    // (projects/generations/<folder>/<shortCode>) and legacy (projects/<id>/generations/<shortCode>) layouts
+    QHash<QString, QString> genDirByCode;
+    const auto indexGenerationsInDir = [&](const QDir &gensDir) {
+        if (!gensDir.exists())
+        {
+            return;
+        }
+        const QStringList genEntries = gensDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString &ge : genEntries)
+        {
+            const QString fullPath = gensDir.filePath(ge);
+            const QString extracted = AbstractSocialAccount::extractShortCode(ge);
+            if (!extracted.isEmpty())
+            {
+                genDirByCode.insert(extracted.toUpper(), fullPath);
+            }
+            else
+            {
+                genDirByCode.insert(ge.toUpper(), fullPath);
+            }
+        }
+    };
+
+    const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+    const QDir projectsRoot{wd.filePath(QStringLiteral("projects"))};
+    if (projectsRoot.exists())
+    {
+        const QDir currentGensRoot{projectsRoot.filePath(QStringLiteral("generations"))};
+        if (currentGensRoot.exists())
+        {
+            const QStringList projGenFolders = currentGensRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+            for (const QString &pgf : projGenFolders)
+            {
+                indexGenerationsInDir(QDir{currentGensRoot.filePath(pgf)});
+            }
+        }
+        const QStringList projDirs = projectsRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString &pd : projDirs)
+        {
+            if (pd == QLatin1String("generations"))
+            {
+                continue;
+            }
+            indexGenerationsInDir(QDir{projectsRoot.filePath(pd + QStringLiteral("/generations"))});
+        }
+    }
+
+    double withViewsSum = 0.0;
+    double withEngSum = 0.0;
+    double withoutViewsSum = 0.0;
+    double withoutEngSum = 0.0;
+
+    for (int r = 0; r < videos->rowCount(); ++r)
+    {
+        const auto *rec = videos->recordAt(r);
+        if (!rec || (!rec->published && rec->publications.isEmpty()))
+        {
+            continue;
+        }
+
+        // Find highest measured views + likes/comments/shares across snapshots of this record
+        qint64 bestViews = -1;
+        qint64 bestLikes = 0;
+        qint64 bestComments = 0;
+        qint64 bestShares = 0;
+        for (const auto &pub : rec->publications)
+        {
+            for (const auto &snap : pub.snapshots)
+            {
+                if (snap.stats.views >= 0 && snap.stats.views >= bestViews)
+                {
+                    bestViews = snap.stats.views;
+                    bestLikes = qMax<qint64>(0, snap.stats.likes);
+                    bestComments = qMax<qint64>(0, snap.stats.comments);
+                    bestShares = qMax<qint64>(0, snap.stats.shares);
+                }
+            }
+        }
+        if (bestViews < 0)
+        {
+            continue;
+        }
+
+        const QString gPath = genDirByCode.value(rec->shortCode.toUpper());
+        if (gPath.isEmpty())
+        {
+            continue;
+        }
+        const QDir gDir{gPath};
+        const bool hasMp4 = gDir.exists(QStringLiteral("final_video.mp4"))
+            || !gDir.entryList({QStringLiteral("*.mp4"), QStringLiteral("*.mov"), QStringLiteral("*.webm")}, QDir::Files).isEmpty();
+        if (!hasMp4)
+        {
+            continue; // Exclude photo carousels / static images so video-text A/B compares videos fairly
+        }
+
+        bool hasVideoText = false;
+        QString overlayText;
+        QFile dnaFile{gDir.filePath(QStringLiteral("creative_dna.json"))};
+        if (dnaFile.open(QIODevice::ReadOnly))
+        {
+            const QJsonObject dna = QJsonDocument::fromJson(dnaFile.readAll()).object();
+            hasVideoText = dna.value(QStringLiteral("tiktokVideoTextAdded")).toBool(false);
+            overlayText = dna.value(QStringLiteral("tiktokVideoText")).toString().trimmed();
+        }
+
+        const double engPct = bestViews > 0
+            ? (100.0 * double(bestLikes + bestComments + bestShares) / double(bestViews))
+            : 0.0;
+
+        if (hasVideoText)
+        {
+            ++summary.withTextCount;
+            withViewsSum += double(bestViews);
+            withEngSum += engPct;
+            summary.withTextBestViews = qMax(summary.withTextBestViews, bestViews);
+            if (!overlayText.isEmpty())
+            {
+                summary.winningTexts.append(WinningVideoTextEntry{
+                    rec->shortCode, overlayText, bestViews, bestLikes
+                });
+            }
+        }
+        else
+        {
+            ++summary.withoutTextCount;
+            withoutViewsSum += double(bestViews);
+            withoutEngSum += engPct;
+            summary.withoutTextBestViews = qMax(summary.withoutTextBestViews, bestViews);
+        }
+    }
+
+    if (summary.withTextCount > 0)
+    {
+        summary.withTextAvgViews = withViewsSum / double(summary.withTextCount);
+        summary.withTextAvgEngagementPct = withEngSum / double(summary.withTextCount);
+    }
+    if (summary.withoutTextCount > 0)
+    {
+        summary.withoutTextAvgViews = withoutViewsSum / double(summary.withoutTextCount);
+        summary.withoutTextAvgEngagementPct = withoutEngSum / double(summary.withoutTextCount);
+    }
+
+    std::sort(summary.winningTexts.begin(), summary.winningTexts.end(),
+              [](const WinningVideoTextEntry &a, const WinningVideoTextEntry &b) {
+                  if (a.views != b.views) return a.views > b.views;
+                  return a.likes > b.likes;
+              });
+    if (summary.winningTexts.size() > 8)
+    {
+        summary.winningTexts.resize(8);
+    }
+
+    if (summary.withTextCount >= 2 && summary.withoutTextCount >= 2)
+    {
+        if (summary.withTextAvgViews >= summary.withoutTextAvgViews * 1.10)
+        {
+            summary.recommendation = QStringLiteral("prefer_text");
+        }
+        else if (summary.withoutTextAvgViews > summary.withTextAvgViews * 1.10)
+        {
+            summary.recommendation = QStringLiteral("prefer_clean");
+        }
+        else
+        {
+            summary.recommendation = QStringLiteral("balanced");
+        }
+    }
+    else
+    {
+        summary.recommendation = QStringLiteral("explore");
+    }
+
+    if (favoriteHooksToPromote && !summary.winningTexts.isEmpty())
+    {
+        const double baselineViews = qMax(25.0, qMax(summary.withTextAvgViews, summary.withoutTextAvgViews));
+        for (int i = 0; i < qMin<int>(3, summary.winningTexts.size()); ++i)
+        {
+            if (double(summary.winningTexts[i].views) >= baselineViews)
+            {
+                favoriteHooksToPromote->addHook(summary.winningTexts[i].text, FavoriteHooks::SOURCE_AI);
+            }
+        }
+    }
+
+    return summary;
+}
+
 QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts,
                                                          TableVideos *videos,
                                                          QWidget *parentWidget,
@@ -675,7 +974,10 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
         }
     }
 
-    if (!discoveredTopPostsByUrl.isEmpty())
+    const VideoTextExperimentSummary videoTextExp = summarizeVideoTextExperiment(videos, favoriteHooks);
+    appendRetrieveStatsLog(videoTextExp.humanSummary());
+
+    if (!discoveredTopPostsByUrl.isEmpty() || videoTextExp.withTextCount > 0 || videoTextExp.withoutTextCount > 0)
     {
         QList<QJsonObject> sortedPosts = discoveredTopPostsByUrl.values();
         std::sort(sortedPosts.begin(), sortedPosts.end(),
@@ -696,7 +998,8 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
             {
                 sf.write(QJsonDocument{QJsonObject{
                     {QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
-                    {QStringLiteral("posts"), outArr}
+                    {QStringLiteral("posts"), outArr},
+                    {QStringLiteral("videoTextExperiment"), videoTextExp.toJson()}
                 }}.toJson(QJsonDocument::Indented));
                 sf.commit();
             }

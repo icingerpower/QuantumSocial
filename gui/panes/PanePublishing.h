@@ -97,6 +97,9 @@ private:
         AccountTarget target;
         int delayMinutesFromPrevious = 0;
         QDateTime scheduledAt;
+        bool addVideoText = false;
+        bool aiSuggestedVideoText = false;
+        QString videoOverlayText;
         QString aiReason;
         QString status; // "Queued", "Uploading", "Published", "Dry-run OK", "Failed", "Stopped"
     };
@@ -107,7 +110,8 @@ private:
                                                       int *outSingleImagesExcluded = nullptr) const;
     bool _reviewPlannedSelectionDialog(const PublishJobConfig &config,
                                        const QList<EligibleCreative> &allCandidates,
-                                       int baseIntervalMins);
+                                       int baseIntervalMins,
+                                       const QString &experimentSummaryLine);
     QCoro::Task<void> _runJobCoroutine(PublishJobConfig config, QList<EligibleCreative> candidates);
     void _appendLog(const QString &line);
     void _refreshQueueTable();

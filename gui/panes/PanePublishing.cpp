@@ -33,6 +33,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QMediaPlayer>
 #include <QMessageBox>
@@ -84,9 +85,180 @@ QJsonObject parseJsonObjFromText(const QString &raw)
     return QJsonDocument::fromJson(raw.mid(first, last - first + 1).toUtf8()).object();
 }
 
+QString strategicWrapSingleLine(const QString &paragraph, int maxLineChars = 24)
+{
+    const QString cleaned = paragraph.simplified();
+    if (cleaned.isEmpty())
+    {
+        return QString{};
+    }
+    const QStringList words = cleaned.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    const int n = words.size();
+    if (cleaned.size() <= 18 || n <= 2)
+    {
+        return cleaned;
+    }
+
+    static const QSet<QString> danglingEndWords{
+        QStringLiteral("a"), QStringLiteral("an"), QStringLiteral("the"),
+        QStringLiteral("this"), QStringLiteral("these"), QStringLiteral("that"), QStringLiteral("those"),
+        QStringLiteral("my"), QStringLiteral("your"), QStringLiteral("our"), QStringLiteral("her"), QStringLiteral("his"),
+        QStringLiteral("in"), QStringLiteral("on"), QStringLiteral("of"), QStringLiteral("to"),
+        QStringLiteral("for"), QStringLiteral("with"), QStringLiteral("at"), QStringLiteral("by"), QStringLiteral("from"),
+        QStringLiteral("le"), QStringLiteral("la"), QStringLiteral("les"), QStringLiteral("un"), QStringLiteral("une"),
+        QStringLiteral("des"), QStringLiteral("du"), QStringLiteral("de"), QStringLiteral("d"),
+        QStringLiteral("ce"), QStringLiteral("ces"), QStringLiteral("cet"), QStringLiteral("cette"),
+        QStringLiteral("mon"), QStringLiteral("ma"), QStringLiteral("mes"), QStringLiteral("en"), QStringLiteral("au"), QStringLiteral("aux")
+    };
+    static const QSet<QString> clauseStartWords{
+        QStringLiteral("in"), QStringLiteral("on"), QStringLiteral("with"), QStringLiteral("for"),
+        QStringLiteral("when"), QStringLiteral("until"), QStringLiteral("while"), QStringLiteral("from"),
+        QStringLiteral("into"), QStringLiteral("that"), QStringLiteral("but"), QStringLiteral("and"), QStringLiteral("or"), QStringLiteral("to"),
+        QStringLiteral("pour"), QStringLiteral("avec"), QStringLiteral("dans"), QStringLiteral("sans"),
+        QStringLiteral("quand"), QStringLiteral("mais"), QStringLiteral("ou"), QStringLiteral("sur"), QStringLiteral("chez")
+    };
+
+    QList<int> kCandidates;
+    if (cleaned.size() <= 44)
+    {
+        kCandidates = {2, 3};
+    }
+    else if (cleaned.size() <= 68)
+    {
+        kCandidates = {3, 2, 4};
+    }
+    else
+    {
+        kCandidates = {3, 4};
+    }
+
+    double bestOverallCost = 1e18;
+    QStringList bestLines{cleaned};
+
+    for (int k : kCandidates)
+    {
+        if (k < 1 || k > n)
+        {
+            continue;
+        }
+        const double idealLen = double(cleaned.size()) / double(k);
+        QVector<QVector<double>> costDp(n + 1, QVector<double>(k + 1, 1e18));
+        QVector<QVector<int>> prevIdx(n + 1, QVector<int>(k + 1, -1));
+        costDp[0][0] = 0.0;
+
+        for (int used = 0; used < k; ++used)
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                if (costDp[i][used] >= 1e17)
+                {
+                    continue;
+                }
+                const int maxJ = n - (k - used - 1);
+                for (int j = i + 1; j <= maxJ; ++j)
+                {
+                    if (used == k - 1 && j != n)
+                    {
+                        continue;
+                    }
+                    const QStringList segWords = words.mid(i, j - i);
+                    const QString seg = segWords.join(QLatin1Char(' '));
+                    const int segLen = seg.size();
+                    const bool isLast = (j == n);
+
+                    const double diff = double(segLen) - idealLen;
+                    double c = diff * diff * 2.5;
+                    if (segLen > maxLineChars)
+                    {
+                        const double over = double(segLen - maxLineChars);
+                        c += 900.0 + over * over * 38.0;
+                    }
+                    if (segWords.size() == 1 && segLen <= 6 && n >= 4)
+                    {
+                        c += 450.0; // avoid 1-word orphan line
+                    }
+                    if (!isLast)
+                    {
+                        const QString lastW = segWords.last();
+                        if (!lastW.isEmpty() && QStringLiteral(",;:—-?!.").contains(lastW.back()))
+                        {
+                            c -= 85.0;
+                        }
+                        QString lastClean = lastW.toLower();
+                        if (lastClean.contains(QLatin1Char('\'')))
+                        {
+                            lastClean = lastClean.section(QLatin1Char('\''), -1);
+                        }
+                        lastClean.remove(QRegularExpression{QStringLiteral("[^a-zà-ÿ0-9]")});
+                        QString nextClean = words[j].toLower();
+                        nextClean.remove(QRegularExpression{QStringLiteral("[^a-zà-ÿ0-9]")});
+                        if (danglingEndWords.contains(lastClean))
+                        {
+                            c += 145.0;
+                        }
+                        if (clauseStartWords.contains(nextClean))
+                        {
+                            c -= 35.0;
+                        }
+                    }
+
+                    const double candTotal = costDp[i][used] + c;
+                    if (candTotal < costDp[j][used + 1])
+                    {
+                        costDp[j][used + 1] = candTotal;
+                        prevIdx[j][used + 1] = i;
+                    }
+                }
+            }
+        }
+
+        if (costDp[n][k] < 1e17)
+        {
+            const double kPenalty = k >= 2 ? double(k - 2) * 30.0 : 0.0;
+            if (costDp[n][k] + kPenalty < bestOverallCost)
+            {
+                bestOverallCost = costDp[n][k] + kPenalty;
+                QStringList recon;
+                int cur = n;
+                for (int u = k; u >= 1; --u)
+                {
+                    const int p = prevIdx[cur][u];
+                    recon.prepend(words.mid(p, cur - p).join(QLatin1Char(' ')));
+                    cur = p;
+                }
+                bestLines = recon;
+            }
+        }
+    }
+    return bestLines.join(QLatin1Char('\n'));
+}
+
+QString strategicWrapOverlayText(const QString &raw, int maxLineChars = 24)
+{
+    const QString trimmed = raw.trimmed();
+    if (trimmed.isEmpty())
+    {
+        return QString{};
+    }
+    if (trimmed.contains(QLatin1Char('\n')))
+    {
+        QStringList out;
+        for (const QString &ln : trimmed.split(QLatin1Char('\n'), Qt::SkipEmptyParts))
+        {
+            const QString s = ln.trimmed();
+            if (!s.isEmpty())
+            {
+                out << (s.size() > maxLineChars ? strategicWrapSingleLine(s, maxLineChars) : s);
+            }
+        }
+        return out.join(QLatin1Char('\n'));
+    }
+    return strategicWrapSingleLine(trimmed, maxLineChars);
+}
+
 void drawHookTextOverSlidePub(const QString &imagePath, const QString &hookText)
 {
-    const QString text = hookText.trimmed();
+    const QString text = strategicWrapOverlayText(hookText, 24);
     if (imagePath.isEmpty() || text.isEmpty())
     {
         return;
@@ -227,7 +399,8 @@ QPixmap renderCreativeCardPixmap(const QString &imagePath,
                                  const QString &productSummary,
                                  const QString &badgeText,
                                  const QColor &badgeColor,
-                                 const QSize &targetSize)
+                                 const QSize &targetSize,
+                                 const QString &overlayPreviewText = QString{})
 {
     QImage canvas(targetSize, QImage::Format_ARGB32_Premultiplied);
     canvas.fill(Qt::transparent);
@@ -283,12 +456,66 @@ QPixmap renderCreativeCardPixmap(const QString &imagePath,
         p.drawText(pill, Qt::AlignCenter, badgeText);
     }
 
+    const QString cleanOverlay = strategicWrapOverlayText(overlayPreviewText, 24);
+    if (!cleanOverlay.isEmpty())
+    {
+        QFont tf = p.font();
+        tf.setBold(true);
+        tf.setPixelSize(qMax(8, qMin(14, targetSize.width() / 15)));
+        p.setFont(tf);
+        const int marginX = qMax(6, targetSize.width() / 10);
+        const int maxW = qMax(36, targetSize.width() - 2 * marginX);
+        const QRect tb = p.fontMetrics().boundingRect(
+            QRect(0, 0, maxW, targetSize.height() / 2),
+            Qt::AlignCenter | Qt::TextWordWrap,
+            cleanOverlay);
+        const int padX = qMax(5, targetSize.width() / 28);
+        const int padY = qMax(3, targetSize.height() / 65);
+        const int boxW = qMin(targetSize.width() - 8, tb.width() + 2 * padX);
+        const int boxH = tb.height() + 2 * padY;
+        const QRect pillRect((targetSize.width() - boxW) / 2,
+                             qMax(24, int(targetSize.height() * 0.19)),
+                             boxW,
+                             boxH);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(12, 14, 20, 215));
+        p.drawRoundedRect(pillRect, 6.0, 6.0);
+        p.setPen(Qt::white);
+        p.drawText(pillRect.adjusted(padX, padY, -padX, -padY),
+                   Qt::AlignCenter | Qt::TextWordWrap,
+                   cleanOverlay);
+    }
+
     p.setClipping(false);
     p.setPen(QPen(QColor(255, 255, 255, 38), 1.0));
     p.setBrush(Qt::NoBrush);
     p.drawRoundedRect(QRectF(0.5, 0.5, targetSize.width() - 1.0, targetSize.height() - 1.0), 8.0, 8.0);
     p.end();
     return QPixmap::fromImage(canvas);
+}
+
+QString cleanShortHookForOverlay(const QString &rawHook, const QString &productSummary)
+{
+    QString text = rawHook.trimmed();
+    text.remove(QRegularExpression{QStringLiteral("(?:#\\s*)[A-Za-z0-9_]+")});
+    text.remove(QRegularExpression{QStringLiteral("\\bqs[-_]?[0-9a-z]+\\b"),
+                                   QRegularExpression::CaseInsensitiveOption});
+    text = text.simplified();
+    if (text.size() > 62)
+    {
+        const int sp = text.lastIndexOf(QLatin1Char(' '), 58);
+        text = (sp > 20 ? text.left(sp) : text.left(58)).trimmed();
+    }
+    if (text.isEmpty())
+    {
+        QString prod = productSummary.section(QStringLiteral(" — "), 0, 0).trimmed();
+        if (prod.isEmpty())
+        {
+            prod = QStringLiteral("these heels");
+        }
+        text = QObject::tr("How would you style %1?").arg(prod);
+    }
+    return text;
 }
 
 QString readCaptionFromGenDir(const QDir &genDir,
@@ -1232,6 +1459,47 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         .arg(config.dryRun ? QStringLiteral("true") : QStringLiteral("false")));
     m_statusLabel->setText(tr("Planning optimal publish order and timing with AI..."));
 
+    // Summarize measured TikTok native video text ('Aa Texte') A/B performance so AI suggestions improve over time!
+    const auto videoTextExp = SocialStatistics::summarizeVideoTextExperiment(m_videos, m_favoriteHooks);
+    _appendLog(QStringLiteral("[LEARNING] ") + videoTextExp.humanSummary());
+    if (videoTextExp.withTextCount > 0 || videoTextExp.withoutTextCount > 0)
+    {
+        // Also persist updated videoTextExperiment into account_top_posts.json so Generation learns too
+        const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+        if (wd.exists())
+        {
+            const QString topPath = wd.filePath(QStringLiteral("account_top_posts.json"));
+            QJsonObject topRoot;
+            {
+                QFile tf{topPath};
+                if (tf.open(QIODevice::ReadOnly))
+                {
+                    topRoot = QJsonDocument::fromJson(tf.readAll()).object();
+                }
+            }
+            topRoot.insert(QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+            topRoot.insert(QStringLiteral("videoTextExperiment"), videoTextExp.toJson());
+            QSaveFile sf{topPath};
+            if (sf.open(QIODevice::WriteOnly))
+            {
+                sf.write(QJsonDocument{topRoot}.toJson(QJsonDocument::Indented));
+                sf.commit();
+            }
+        }
+    }
+
+    const auto defaultVideoTextFlag = [&](int videoOrdinal) -> bool {
+        if (videoTextExp.recommendation == QLatin1String("prefer_text"))
+        {
+            return (videoOrdinal % 4) != 3; // ~75% with text, ~25% clean holdout
+        }
+        if (videoTextExp.recommendation == QLatin1String("prefer_clean"))
+        {
+            return (videoOrdinal % 4) == 3; // ~25% text exploration, ~75% clean
+        }
+        return (videoOrdinal % 2) == 0; // ~50/50 A/B split
+    };
+
     // Default spacing between posts during a 12-hour active daytime window (720 mins / postsPerDay)
     const int baseIntervalMins = qMax(30, 720 / qMax(1, config.postsPerDay));
 
@@ -1247,11 +1515,13 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
             "after every %2 posts).\n"
             "- Item 0 MUST have \"delayMinutes\": 0 so the first post publishes immediately.\n"
             "- Maximize variety: alternate different products/colors, formats (video vs carousel vs image), "
-            "and hook categories so consecutive posts never look repetitive.\n\n"
-            "Target accounts:\n")
+            "and hook categories so consecutive posts never look repetitive.\n")
             .arg(targetTotal)
             .arg(config.postsPerDay)
             .arg(baseIntervalMins);
+
+        prompt += videoTextExp.plannerPromptAddendum();
+        prompt += QStringLiteral("\nTarget accounts:\n");
 
         for (int a = 0; a < config.targets.size(); ++a)
         {
@@ -1270,9 +1540,10 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         prompt += QStringLiteral(
             "\nReply with STRICT JSON only (no markdown fences):\n"
             "{\"plan\": [{\"shortCode\": \"QS-...\", \"accountIndex\": 0, "
-            "\"delayMinutes\": 0, \"reason\": \"...\"}]}");
+            "\"delayMinutes\": 0, \"addVideoText\": true, "
+            "\"videoOverlayText\": \"Short 4-8 word curiosity hook\", \"reason\": \"...\"}]}");
 
-        _appendLog(tr("[AI-PLANNER] Asking %1 to choose what to publish, in what order, and spacing...")
+        _appendLog(tr("[AI-PLANNER] Asking %1 to choose what to publish, in what order, spacing, and whether to add TikTok video text...")
             .arg(config.plannerCli->getName()));
 
         CliRunResult cliRes;
@@ -1295,6 +1566,7 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
 
     QSet<QString> chosenCodes;
     QDateTime cursorTime = QDateTime::currentDateTime();
+    int plannedVideoOrdinal = 0;
 
     for (const QJsonValue &v : plannedJsonItems)
     {
@@ -1326,6 +1598,18 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         item.target = config.targets[accIdx];
         item.delayMinutesFromPrevious = delayMins;
         item.scheduledAt = cursorTime;
+        if (item.creative.format == QLatin1String("video"))
+        {
+            item.addVideoText = o.contains(QStringLiteral("addVideoText"))
+                ? o.value(QStringLiteral("addVideoText")).toBool()
+                : defaultVideoTextFlag(plannedVideoOrdinal);
+            item.aiSuggestedVideoText = item.addVideoText;
+            const QString aiOverlay = o.value(QStringLiteral("videoOverlayText")).toString().trimmed();
+            item.videoOverlayText = !aiOverlay.isEmpty()
+                ? cleanShortHookForOverlay(aiOverlay, item.creative.productSummary)
+                : cleanShortHookForOverlay(item.creative.hook, item.creative.productSummary);
+            ++plannedVideoOrdinal;
+        }
         item.aiReason = o.value(QStringLiteral("reason")).toString().trimmed();
         if (item.aiReason.isEmpty())
         {
@@ -1380,6 +1664,13 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
             item.target = config.targets[slotNum % config.targets.size()];
             item.delayMinutesFromPrevious = delayMins;
             item.scheduledAt = cursorTime;
+            if (picked.format == QLatin1String("video"))
+            {
+                item.addVideoText = defaultVideoTextFlag(plannedVideoOrdinal);
+                item.aiSuggestedVideoText = item.addVideoText;
+                item.videoOverlayText = cleanShortHookForOverlay(picked.hook, picked.productSummary);
+                ++plannedVideoOrdinal;
+            }
             item.aiReason = tr("Diversity rotation (%1)").arg(picked.format);
             item.status = QStringLiteral("Queued");
             m_queue.append(item);
@@ -1390,14 +1681,19 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
     for (int i = 0; i < m_queue.size(); ++i)
     {
         const auto &it = m_queue[i];
-        _appendLog(tr("  #%1 %2 (%3, %4d old) → %5 at %6 (+%7m) — %8")
+        const QString textNote = (it.creative.format == QLatin1String("video"))
+            ? (it.addVideoText
+                   ? tr(" [TikTok Text: \"%1\"]").arg(it.videoOverlayText)
+                   : tr(" [Clean Video: no text]"))
+            : QString{};
+        _appendLog(tr("  #%1 %2 (%3, %4d old)%9 → %5 at %6 (+%7m) — %8")
             .arg(i + 1)
             .arg(it.creative.shortCode, it.creative.format)
             .arg(it.creative.ageDays)
             .arg(it.target.accountUrl,
                  it.scheduledAt.toString(QStringLiteral("yyyy-MM-dd HH:mm")))
             .arg(it.delayMinutesFromPrevious)
-            .arg(it.aiReason));
+            .arg(it.aiReason, textNote));
     }
 
     _refreshQueueTable();
@@ -1407,7 +1703,8 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         m_statusLabel->setText(tr("Reviewing AI selection & publish order (%1 of %2 candidate(s))...")
             .arg(m_queue.size()).arg(candidates.size()));
         const QPointer<PanePublishing> self(this);
-        const bool confirmed = _reviewPlannedSelectionDialog(config, candidates, baseIntervalMins);
+        const bool confirmed = _reviewPlannedSelectionDialog(
+            config, candidates, baseIntervalMins, videoTextExp.humanSummary());
         if (!self || (cancelToken && *cancelToken))
         {
             co_return;
@@ -1426,13 +1723,19 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         for (int i = 0; i < m_queue.size(); ++i)
         {
             const auto &it = m_queue[i];
-            _appendLog(tr("  #%1 %2 (%3, %4d old) → %5 at %6 (+%7m)")
+            const QString textNote = (it.creative.format == QLatin1String("video"))
+                ? (it.addVideoText
+                       ? tr(" [TikTok Text: \"%1\"]").arg(it.videoOverlayText)
+                       : tr(" [Clean Video: no text]"))
+                : QString{};
+            _appendLog(tr("  #%1 %2 (%3, %4d old)%8 → %5 at %6 (+%7m)")
                 .arg(i + 1)
                 .arg(it.creative.shortCode, it.creative.format)
                 .arg(it.creative.ageDays)
                 .arg(it.target.accountUrl,
                      it.scheduledAt.toString(QStringLiteral("yyyy-MM-dd HH:mm")))
-                .arg(it.delayMinutesFromPrevious));
+                .arg(it.delayMinutesFromPrevious)
+                .arg(textNote));
         }
         _refreshQueueTable();
     }
@@ -1443,7 +1746,8 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
 
 bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &config,
                                                    const QList<EligibleCreative> &allCandidates,
-                                                   int baseIntervalMins)
+                                                   int baseIntervalMins,
+                                                   const QString &experimentSummaryLine)
 {
     if (allCandidates.isEmpty() || config.targets.isEmpty())
     {
@@ -1455,6 +1759,9 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         EligibleCreative creative;
         bool checked = false;
         int aiInitialRank = 0; // 1..K if AI selected, 0 if not initially picked
+        bool addVideoText = false;
+        bool aiSuggestedVideoText = false;
+        QString videoOverlayText;
         QString aiReason;
         int targetIndex = 0;
         int customDelayMinutes = 180; // Delay used whenever this item is NOT #1
@@ -1495,6 +1802,23 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         }
     };
 
+    const auto makeRowThumb = [&](const CandidateRowState &r) -> QPixmap {
+        QString badgeTxt;
+        QColor badgeCol;
+        makeBadgeInfo(r.creative, &badgeTxt, &badgeCol);
+        const QString overlayPreview = (r.creative.format == QLatin1String("video") && r.addVideoText)
+            ? r.videoOverlayText
+            : QString{};
+        return renderCreativeCardPixmap(
+            r.creative.previewImagePath,
+            r.creative.shortCode,
+            r.creative.productSummary,
+            badgeTxt,
+            badgeCol,
+            QSize(72, 112),
+            overlayPreview);
+    };
+
     QList<CandidateRowState> initialRows;
     QSet<QString> seenCodes;
 
@@ -1515,6 +1839,11 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
             : scheduled.creative;
         row.checked = true;
         row.aiInitialRank = i + 1;
+        row.addVideoText = scheduled.addVideoText;
+        row.aiSuggestedVideoText = scheduled.aiSuggestedVideoText;
+        row.videoOverlayText = !scheduled.videoOverlayText.isEmpty()
+            ? scheduled.videoOverlayText
+            : cleanShortHookForOverlay(row.creative.hook, row.creative.productSummary);
         row.aiReason = scheduled.aiReason;
         row.targetIndex = 0;
         for (int t = 0; t < config.targets.size(); ++t)
@@ -1529,17 +1858,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         row.customDelayMinutes = scheduled.delayMinutesFromPrevious > 0
             ? scheduled.delayMinutesFromPrevious
             : qMax(15, baseIntervalMins);
-
-        QString badgeTxt;
-        QColor badgeCol;
-        makeBadgeInfo(row.creative, &badgeTxt, &badgeCol);
-        row.rowThumb = renderCreativeCardPixmap(
-            row.creative.previewImagePath,
-            row.creative.shortCode,
-            row.creative.productSummary,
-            badgeTxt,
-            badgeCol,
-            QSize(72, 112));
+        row.rowThumb = makeRowThumb(row);
         initialRows.append(row);
     }
 
@@ -1558,22 +1877,18 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         row.creative = c;
         row.checked = false;
         row.aiInitialRank = 0;
+        if (c.format == QLatin1String("video"))
+        {
+            row.addVideoText = ((extraIdx % 2) == 0);
+            row.aiSuggestedVideoText = row.addVideoText;
+            row.videoOverlayText = cleanShortHookForOverlay(c.hook, c.productSummary);
+        }
         row.aiReason = tr("Not picked by AI planner (available candidate)");
         row.targetIndex = (m_queue.size() + extraIdx) % config.targets.size();
         const int jitter = (((m_queue.size() + extraIdx + 1) * 37) % 41) - 15;
         row.customDelayMinutes = qMax(15, baseIntervalMins + jitter);
         ++extraIdx;
-
-        QString badgeTxt;
-        QColor badgeCol;
-        makeBadgeInfo(row.creative, &badgeTxt, &badgeCol);
-        row.rowThumb = renderCreativeCardPixmap(
-            row.creative.previewImagePath,
-            row.creative.shortCode,
-            row.creative.productSummary,
-            badgeTxt,
-            badgeCol,
-            QSize(72, 112));
+        row.rowThumb = makeRowThumb(row);
         initialRows.append(row);
     }
 
@@ -1582,16 +1897,22 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
     QDialog dlg(this);
     dlg.setObjectName(QStringLiteral("dialogReviewPublishPlan"));
     dlg.setWindowTitle(tr("Review & Customize Publish Selection and Order"));
-    dlg.resize(1120, 720);
+    dlg.resize(1140, 750);
 
     auto *mainLayout = new QVBoxLayout(&dlg);
 
-    auto *banner = new QLabel(
-        tr("The AI planner selected <b>%1</b> of <b>%2</b> eligible creative(s) in recommended publish order. "
-           "Check or uncheck any candidate below to change what gets published, and use "
-           "<b>Move Up / Move Down / Move to #1</b> to customize the exact publishing order.")
+    QString bannerHtml = tr(
+        "The AI planner selected <b>%1</b> of <b>%2</b> eligible creative(s) in recommended publish order. "
+        "Check/uncheck candidates, reorder with <b>Move Up / Move Down / Move to #1</b>, and customize "
+        "each video's optional native TikTok text overlay (<i>Aa Texte</i>).")
             .arg(m_queue.size())
-            .arg(rows.size()));
+            .arg(rows.size());
+    if (!experimentSummaryLine.trimmed().isEmpty())
+    {
+        bannerHtml += QStringLiteral("<br><span style='color:#93c5fd; font-size:11px;'>📊 %1</span>")
+            .arg(experimentSummaryLine.toHtmlEscaped());
+    }
+    auto *banner = new QLabel(bannerHtml);
     banner->setObjectName(QStringLiteral("labelReviewBanner"));
     banner->setWordWrap(true);
     mainLayout->addWidget(banner);
@@ -1754,6 +2075,26 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
     slotForm->addRow(tr("Spacing delay:"), delaySpin);
     rightLayout->addLayout(slotForm);
 
+    // Optional native TikTok video text track ('Aa Texte') controls — AI suggests ON/OFF + editable hook!
+    auto *videoTextBox = new QWidget;
+    videoTextBox->setObjectName(QStringLiteral("widgetReviewVideoTextControls"));
+    auto *videoTextLayout = new QVBoxLayout(videoTextBox);
+    videoTextLayout->setContentsMargins(0, 2, 0, 4);
+    videoTextLayout->setSpacing(4);
+
+    auto *chkVideoText = new QCheckBox(tr("Add native TikTok text over video (\"Aa Texte\")"));
+    chkVideoText->setObjectName(QStringLiteral("checkReviewVideoTextOverlay"));
+    chkVideoText->setToolTip(tr("Uses TikTok Studio's native 'Aa Texte' track in the upper safe zone so TikTok indexes it for SEO while keeping the shoes unobstructed."));
+    videoTextLayout->addWidget(chkVideoText);
+
+    auto *editVideoText = new QLineEdit;
+    editVideoText->setObjectName(QStringLiteral("editReviewVideoOverlayText"));
+    editVideoText->setMaxLength(80);
+    editVideoText->setPlaceholderText(tr("Short 4–9 word hook overlaid near top of video..."));
+    videoTextLayout->addWidget(editVideoText);
+    videoTextBox->setVisible(false);
+    rightLayout->addWidget(videoTextBox);
+
     auto *detailsBox = new QPlainTextEdit;
     detailsBox->setObjectName(QStringLiteral("textReviewCandidateDetails"));
     detailsBox->setReadOnly(true);
@@ -1890,6 +2231,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
             stopInlineVideo();
             largePreviewLbl->setPixmap(QPixmap{});
             videoTransportWidget->setVisible(false);
+            videoTextBox->setVisible(false);
             slideStripWidget->setVisible(false);
             detailsBox->clear();
             btnOpenMedia->setEnabled(false);
@@ -1905,17 +2247,32 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         QString badgeTxt;
         QColor badgeCol;
         makeBadgeInfo(c, &badgeTxt, &badgeCol);
+        const QString liveOverlayPreview = (c.format == QLatin1String("video") && st.addVideoText)
+            ? st.videoOverlayText
+            : QString{};
         largePreviewLbl->setPixmap(renderCreativeCardPixmap(
             c.previewImagePath,
             c.shortCode,
             c.productSummary,
             badgeTxt,
             badgeCol,
-            QSize(228, 352)));
+            QSize(228, 352),
+            liveOverlayPreview));
 
         if (c.format == QLatin1String("video") && !c.mediaPaths.isEmpty())
         {
             videoTransportWidget->setVisible(true);
+            videoTextBox->setVisible(true);
+            const QString aiRecBadge = st.aiSuggestedVideoText
+                ? tr(" (AI suggested: ON)")
+                : tr(" (AI suggested: OFF)");
+            chkVideoText->setText(tr("Add TikTok video text") + aiRecBadge);
+            chkVideoText->setChecked(st.addVideoText);
+            if (editVideoText->text() != st.videoOverlayText)
+            {
+                editVideoText->setText(st.videoOverlayText);
+            }
+            editVideoText->setEnabled(st.addVideoText);
             if (loadedVideoPath != c.mediaPaths.first())
             {
                 stopInlineVideo();
@@ -1929,6 +2286,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         {
             stopInlineVideo();
             videoTransportWidget->setVisible(false);
+            videoTextBox->setVisible(false);
         }
 
         // Rebuild slide strip for multi-image carousels so every slide can be inspected
@@ -2087,10 +2445,17 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
             const QString aiTag = st.aiInitialRank > 0
                 ? tr("★ AI Pick #%1: %2").arg(st.aiInitialRank).arg(st.aiReason)
                 : st.aiReason;
-            const QString detailsText = QStringLiteral("%1 · %2 · %3d old\n%4\nHook: %5\n%6")
+            QString videoTextRowNote;
+            if (c.format == QLatin1String("video"))
+            {
+                videoTextRowNote = st.addVideoText
+                    ? tr("\n📝 TikTok Text: \"%1\"").arg(st.videoOverlayText.left(64))
+                    : tr("\n🎬 Clean Video (no TikTok text overlay)");
+            }
+            const QString detailsText = QStringLiteral("%1 · %2 · %3d old\n%4\nHook: %5%7\n%6")
                 .arg(c.shortCode, fmtDesc)
                 .arg(c.ageDays)
-                .arg(c.productSummary, hookSnippet, aiTag);
+                .arg(c.productSummary, hookSnippet, aiTag, videoTextRowNote);
 
             auto *detailsItem = new QTableWidgetItem(detailsText);
             if (!st.checked)
@@ -2253,6 +2618,71 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         }
     });
 
+    connect(chkVideoText, &QCheckBox::toggled, &dlg, [&](bool on) {
+        if (updatingUi)
+        {
+            return;
+        }
+        const int r = table->currentRow();
+        if (r >= 0 && r < rows.size() && rows[r].creative.format == QLatin1String("video"))
+        {
+            rows[r].addVideoText = on;
+            if (on && rows[r].videoOverlayText.trimmed().isEmpty())
+            {
+                rows[r].videoOverlayText = cleanShortHookForOverlay(
+                    rows[r].creative.hook, rows[r].creative.productSummary);
+            }
+            rows[r].rowThumb = makeRowThumb(rows[r]);
+            rebuildTable(r);
+        }
+    });
+
+    connect(editVideoText, &QLineEdit::textEdited, &dlg, [&](const QString &txt) {
+        if (updatingUi)
+        {
+            return;
+        }
+        const int r = table->currentRow();
+        if (r >= 0 && r < rows.size() && rows[r].creative.format == QLatin1String("video"))
+        {
+            rows[r].videoOverlayText = txt;
+            rows[r].rowThumb = makeRowThumb(rows[r]);
+            if (auto *thumbCell = table->item(r, 1))
+            {
+                thumbCell->setData(Qt::DecorationRole, rows[r].rowThumb);
+            }
+            QString badgeTxt;
+            QColor badgeCol;
+            makeBadgeInfo(rows[r].creative, &badgeTxt, &badgeCol);
+            largePreviewLbl->setPixmap(renderCreativeCardPixmap(
+                rows[r].creative.previewImagePath,
+                rows[r].creative.shortCode,
+                rows[r].creative.productSummary,
+                badgeTxt,
+                badgeCol,
+                QSize(228, 352),
+                rows[r].addVideoText ? rows[r].videoOverlayText : QString{}));
+            // Also keep row text snippet updated
+            const EligibleCreative &c = rows[r].creative;
+            const QString hookSnippet = !c.hook.trimmed().isEmpty()
+                ? QStringLiteral("\"%1\"").arg(c.hook.trimmed().left(85))
+                : tr("(Auto-caption + #hashtags on publish)");
+            const QString aiTag = rows[r].aiInitialRank > 0
+                ? tr("★ AI Pick #%1: %2").arg(rows[r].aiInitialRank).arg(rows[r].aiReason)
+                : rows[r].aiReason;
+            const QString videoTextRowNote = rows[r].addVideoText
+                ? tr("\n📝 TikTok Text: \"%1\"").arg(rows[r].videoOverlayText.left(64))
+                : tr("\n🎬 Clean Video (no TikTok text overlay)");
+            if (auto *detCell = table->item(r, 2))
+            {
+                detCell->setText(QStringLiteral("%1 · VIDEO · %2d old\n%3\nHook: %4%6\n%5")
+                    .arg(c.shortCode)
+                    .arg(c.ageDays)
+                    .arg(c.productSummary, hookSnippet, aiTag, videoTextRowNote));
+            }
+        }
+    });
+
     connect(table, &QTableWidget::cellDoubleClicked, &dlg, [&](int r, int col) {
         if (col == 0 || r < 0 || r >= rows.size() || rows[r].creative.format != QLatin1String("video"))
         {
@@ -2306,6 +2736,9 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         item.target = config.targets[qBound(0, st.targetIndex, int(config.targets.size()) - 1)];
         item.delayMinutesFromPrevious = delayMins;
         item.scheduledAt = cursorTime;
+        item.addVideoText = (st.creative.format == QLatin1String("video")) && st.addVideoText;
+        item.aiSuggestedVideoText = st.aiSuggestedVideoText;
+        item.videoOverlayText = st.videoOverlayText.trimmed();
         item.aiReason = st.aiInitialRank > 0
             ? st.aiReason
             : tr("Manually selected by user (%1)").arg(st.creative.format);
@@ -2725,6 +3158,12 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
     req.accountUrl = item.target.accountUrl;
     req.mediaPaths = item.creative.mediaPaths;
     req.caption = effectiveCaption;
+    if (item.creative.format == QLatin1String("video") && item.addVideoText)
+    {
+        req.videoOverlayText = !item.videoOverlayText.trimmed().isEmpty()
+            ? item.videoOverlayText.trimmed()
+            : cleanShortHookForOverlay(m_queue[itemIndex].creative.hook, item.creative.productSummary);
+    }
     req.shortCode = item.creative.shortCode;
     req.useSystemChromeProfile = m_activeConfig.useSystemChromeProfile;
     req.muteOriginalAudio = m_activeConfig.muteOriginalAudio;
@@ -2784,6 +3223,13 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
         dna.insert(QStringLiteral("publishedAccountUrl"), item.target.accountUrl);
         dna.insert(QStringLiteral("publishedCaption"), effectiveCaption);
         dna.insert(QStringLiteral("mutedOriginalAudio"), m_activeConfig.muteOriginalAudio);
+        if (item.creative.format == QLatin1String("video"))
+        {
+            dna.insert(QStringLiteral("tiktokVideoTextAdded"), res.videoTextApplied);
+            dna.insert(QStringLiteral("tiktokVideoText"),
+                       res.videoTextApplied ? req.videoOverlayText : QString{});
+            dna.insert(QStringLiteral("aiSuggestedVideoText"), item.aiSuggestedVideoText);
+        }
         if (!res.soundTitle.isEmpty())
         {
             dna.insert(QStringLiteral("tiktokSound"), res.soundTitle);

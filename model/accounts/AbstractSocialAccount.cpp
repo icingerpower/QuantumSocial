@@ -489,6 +489,7 @@ QCoro::Task<AbstractSocialAccount::PublishResult> AbstractSocialAccount::runPubl
         {QStringLiteral("accountUrl"), request.accountUrl},
         {QStringLiteral("mediaPaths"), QJsonArray::fromStringList(request.mediaPaths)},
         {QStringLiteral("caption"), request.caption},
+        {QStringLiteral("videoOverlayText"), request.videoOverlayText},
         {QStringLiteral("shortCode"), request.shortCode},
         {QStringLiteral("useSystemChromeProfile"), request.useSystemChromeProfile},
         {QStringLiteral("muteOriginalAudio"), request.muteOriginalAudio},
@@ -586,6 +587,7 @@ QCoro::Task<AbstractSocialAccount::PublishResult> AbstractSocialAccount::runPubl
     result.published = obj.value(QStringLiteral("published")).toBool(false);
     result.dryRun = obj.value(QStringLiteral("dry_run")).toBool(false);
     result.fatal = obj.value(QStringLiteral("fatal")).toBool(false);
+    result.videoTextApplied = obj.value(QStringLiteral("video_text_applied")).toBool(false);
     result.postUrl = obj.value(QStringLiteral("post_url")).toString().trimmed();
     result.soundTitle = obj.value(QStringLiteral("sound_title")).toString().trimmed();
     result.logFilePath = obj.value(QStringLiteral("log_file")).toString().trimmed();

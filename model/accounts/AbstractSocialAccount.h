@@ -123,6 +123,7 @@ public:
         QString accountUrl;
         QStringList mediaPaths;
         QString caption;
+        QString videoOverlayText; // Non-empty -> add native TikTok Studio 'Aa Texte' track over video
         QString shortCode;
         bool useSystemChromeProfile = true;
         bool muteOriginalAudio = true;
@@ -137,6 +138,7 @@ public:
         bool dryRun = false;
         bool fatal = false;
         bool notSupported = false;
+        bool videoTextApplied = false;
         QString postUrl;
         QString soundTitle;
         QString logFilePath;

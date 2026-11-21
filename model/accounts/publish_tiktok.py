@@ -42,7 +42,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
 SYSTEM_CHROME_PROFILE = os.path.expanduser("~/.config/google-chrome")
@@ -121,6 +121,7 @@ def _finish(
     dry_run: bool = False,
     post_url: str = "",
     sound_title: str = "",
+    video_text_applied: bool = False,
     log_file: str = "",
     screenshot: str = "",
     fatal: bool = False,
@@ -131,6 +132,7 @@ def _finish(
         "dry_run": dry_run,
         "post_url": post_url,
         "sound_title": sound_title,
+        "video_text_applied": video_text_applied,
         "log_file": log_file,
         "screenshot": screenshot,
         "fatal": fatal,
@@ -138,6 +140,130 @@ def _finish(
     }
     print(json.dumps(payload, ensure_ascii=False), flush=True)
     return 0
+
+
+_DANGLING_END_WORDS = {
+    "a", "an", "the", "this", "these", "that", "those", "my", "your", "our", "her", "his", "its",
+    "in", "on", "of", "to", "for", "with", "at", "by", "from", "into",
+    "le", "la", "les", "un", "une", "des", "du", "de", "d", "ce", "ces", "cet", "cette",
+    "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "en", "au", "aux",
+}
+_CLAUSE_START_WORDS = {
+    "in", "on", "with", "for", "when", "until", "while", "from", "into", "that", "but", "and", "or", "to", "before", "after",
+    "pour", "avec", "dans", "sans", "quand", "mais", "ou", "sur", "chez", "avant", "après",
+}
+
+
+def _wrap_single_paragraph_strategically(paragraph: str, max_line_chars: int = 24) -> str:
+    cleaned = re.sub(r"\s+", " ", (paragraph or "").strip())
+    if not cleaned:
+        return ""
+    words = cleaned.split(" ")
+    n = len(words)
+    if len(cleaned) <= 18 or n <= 2:
+        return cleaned
+
+    if len(cleaned) <= 44:
+        k_candidates = [2, 3]
+    elif len(cleaned) <= 68:
+        k_candidates = [3, 2, 4]
+    else:
+        k_candidates = [3, 4]
+    k_candidates = [k for k in k_candidates if 1 <= k <= n] or [min(n, 3)]
+
+    best_overall_cost = float("inf")
+    best_overall_lines: List[str] = [cleaned]
+
+    for k in k_candidates:
+        ideal_len = len(cleaned) / float(k)
+        # dp[(idx, used)] = (cost, lines_list)
+        dp: Dict[Tuple[int, int], Tuple[float, List[str]]] = {(0, 0): (0.0, [])}
+        for used in range(k):
+            for i in range(n):
+                state = dp.get((i, used))
+                if state is None:
+                    continue
+                base_cost, prev_lines = state
+                for j in range(i + 1, n - (k - used - 1) + 1):
+                    if used == k - 1 and j != n:
+                        continue
+                    seg_words = words[i:j]
+                    seg = " ".join(seg_words)
+                    seg_len = len(seg)
+                    is_last = (j == n)
+
+                    cost = (seg_len - ideal_len) ** 2 * 2.5
+                    if seg_len > max_line_chars:
+                        cost += 900.0 + ((seg_len - max_line_chars) ** 2) * 38.0
+                    if len(seg_words) == 1 and seg_len <= 6 and n >= 4:
+                        cost += 450.0  # avoid awkward 1-word orphan lines
+
+                    if not is_last:
+                        last_w = seg_words[-1]
+                        last_clean = re.sub(r"[^A-Za-zÀ-ÿ0-9']+", "", last_w).lower().split("'")[-1]
+                        next_clean = re.sub(r"[^A-Za-zÀ-ÿ0-9]+", "", words[j]).lower()
+                        if re.search(r"[,;:—\-?!.]$", last_w):
+                            cost -= 85.0
+                        if last_clean in _DANGLING_END_WORDS:
+                            cost += 145.0
+                        if next_clean in _CLAUSE_START_WORDS:
+                            cost -= 35.0
+
+                    total_cost = base_cost + cost
+                    nxt = dp.get((j, used + 1))
+                    if nxt is None or total_cost < nxt[0]:
+                        dp[(j, used + 1)] = (total_cost, prev_lines + [seg])
+
+        final_state = dp.get((n, k))
+        if final_state is not None:
+            # Slight preference for fewer lines when all lines fit comfortably
+            k_penalty = (k - 2) * 30.0 if k >= 2 else 0.0
+            if final_state[0] + k_penalty < best_overall_cost:
+                best_overall_cost = final_state[0] + k_penalty
+                best_overall_lines = final_state[1]
+
+    return "\n".join(best_overall_lines)
+
+
+def _wrap_tiktok_overlay_text(raw: str, max_line_chars: int = 24) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if "\n" in text:
+        explicit_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        out: List[str] = []
+        for ln in explicit_lines:
+            out.append(
+                _wrap_single_paragraph_strategically(ln, max_line_chars)
+                if len(ln) > max_line_chars
+                else ln
+            )
+        return "\n".join(out)
+    return _wrap_single_paragraph_strategically(text, max_line_chars)
+
+
+def _probe_video_duration_secs(video_path: str) -> float:
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin or not os.path.isfile(video_path):
+        return 0.0
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return max(0.0, float(proc.stdout.strip()))
+    except Exception:
+        pass
+    return 0.0
 
 
 def _strip_video_audio_copy(video_path: str, logger: Logger) -> Optional[str]:
@@ -169,115 +295,314 @@ def _strip_video_audio_copy(video_path: str, logger: Logger) -> Optional[str]:
     return None
 
 
-def _apply_suggested_tiktok_sound(
+def _apply_video_text_inside_editor(
+    surface: Any,
+    page: Any,
+    overlay_text: str,
+    headless: bool,
+    logger: Logger,
+) -> bool:
+    """Adds a native TikTok text track inside the open TikTok Studio video editor, styled and moved to the upper safe zone."""
+    wrapped_text = _wrap_tiktok_overlay_text(overlay_text, max_line_chars=24)
+    if not wrapped_text:
+        return False
+
+    # Switch to the 'Texte / Text' tab inside the open editor if 'Ajouter du texte' isn't already visible
+    add_btn_loc = surface.locator('[class*="AddTextPanel__addTextBasicButton"]')
+    try:
+        if not (add_btn_loc.count() > 0 and add_btn_loc.first.is_visible()):
+            switched = bool(
+                surface.evaluate(
+                    """() => {
+                        const menuItems = Array.from(document.querySelectorAll('[class*="EditorLeftSideMenu__menuItem"], button, [role="tab"]'));
+                        const item = menuItems.find(el => {
+                            const txt = (el.innerText || '').trim();
+                            const r = el.getBoundingClientRect();
+                            return /^(texte|text)$/i.test(txt) && r.width > 0 && r.height > 0 && r.x < 120;
+                        });
+                        if (!item) return false;
+                        item.click();
+                        return true;
+                    }"""
+                )
+            )
+            if switched:
+                page.wait_for_timeout(1200 if not headless else 120)
+    except Exception as exc:
+        logger.emit_log("VIDEO-TEXT", f"Could not switch to 'Texte' editor tab: {exc}")
+
+    # Wait for 'Ajouter du texte / Add text' button to become visible
+    add_ready = False
+    deadline = time.monotonic() + (8.0 if not headless else 2.0)
+    while time.monotonic() < deadline:
+        try:
+            if add_btn_loc.count() > 0 and add_btn_loc.first.is_visible():
+                add_ready = True
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(350 if not headless else 80)
+
+    if not add_ready:
+        logger.emit_log("VIDEO-TEXT", "TikTok 'AddTextPanel__addTextBasicButton' did not appear; skipping video text track.")
+        return False
+
+    try:
+        add_btn_loc.first.click(timeout=4000)
+    except Exception as exc:
+        logger.emit_log("VIDEO-TEXT", f"Could not click 'Ajouter du texte': {exc}")
+        return False
+
+    # Wait for the right-panel PropSettingTextArea__input to become visible (confirming the new text track is active!)
+    ta_loc = surface.locator('textarea[class*="PropSettingTextArea__input"]')
+    ta_ready = False
+    ta_deadline = time.monotonic() + (6.0 if not headless else 1.5)
+    while time.monotonic() < ta_deadline:
+        try:
+            if ta_loc.count() > 0 and ta_loc.first.is_visible():
+                ta_ready = True
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(250 if not headless else 60)
+
+    if not ta_ready:
+        logger.emit_log("VIDEO-TEXT", "Text property textarea did not mount after clicking 'Ajouter du texte'.")
+        return False
+
+    # 1. FIRST fill PropSettingTextArea__input so the text box expands to its full horizontal multi-word width!
+    #    (Never drag BEFORE filling, because when the box only holds 'Text' its side resize handles sit right
+    #     next to the center and can pinch the box width down to 1 character!)
+    try:
+        ta = surface.locator('textarea[class*="PropSettingTextArea__input"]').first
+        ta.click(timeout=3000)
+        ta.fill(wrapped_text)
+        page.wait_for_timeout(500 if not headless else 60)
+    except Exception as exc:
+        logger.emit_log("VIDEO-TEXT", f"Failed filling video overlay text input: {exc}")
+        return False
+
+    # 2. Compute the true interior center of the expanded text box from .moveable-line edges
+    #    (guaranteed far inside the box, well away from left/right/corner resize handles!)
+    #    and drag smoothly up to 20% height of StageCanvas__screen (top safe zone above heels/legs).
+    try:
+        coords = surface.evaluate(
+            """() => {
+                const lines = Array.from(document.querySelectorAll('.moveable-control-box .moveable-line'))
+                    .filter(el => {
+                        const r = el.getBoundingClientRect();
+                        return (r.width > 10 || r.height > 10) && !String(el.className || '').includes('rotation');
+                    });
+                const stage = document.querySelector('[class*="StageCanvas__screen"]');
+                if (lines.length < 2 || !stage) return null;
+                let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+                for (const l of lines) {
+                    const r = l.getBoundingClientRect();
+                    minX = Math.min(minX, r.left);
+                    maxX = Math.max(maxX, r.right);
+                    minY = Math.min(minY, r.top);
+                    maxY = Math.max(maxY, r.bottom);
+                }
+                const boxW = maxX - minX;
+                const boxH = maxY - minY;
+                if (boxW < 45 || boxH < 14) return null;
+                const sr = stage.getBoundingClientRect();
+                if (sr.height < 120 || sr.width < 80) return null;
+                return {
+                    boxW: Math.round(boxW),
+                    boxH: Math.round(boxH),
+                    fromX: (minX + maxX) * 0.5,
+                    fromY: (minY + maxY) * 0.5,
+                    toX: sr.x + sr.width * 0.5,
+                    toY: sr.y + sr.height * 0.20
+                };
+            }"""
+        )
+        if coords:
+            page.mouse.move(coords["fromX"], coords["fromY"])
+            page.mouse.down()
+            page.mouse.move(coords["toX"], coords["toY"], steps=12)
+            page.mouse.up()
+            page.wait_for_timeout(350 if not headless else 50)
+            logger.emit_log(
+                "VIDEO-TEXT",
+                f"Positioned horizontal text box ({coords['boxW']}x{coords['boxH']}px) into upper safe zone.",
+            )
+    except Exception as exc:
+        logger.emit_log("VIDEO-TEXT", f"Note: could not reposition text box on stage ({exc}); keeping centered position.")
+
+    # 3. Enable Bold + clean dark background pill ('Arrière-plan') for crisp readability over any background
+    try:
+        surface.evaluate(
+            """() => {
+                const fontStyleWrap = document.querySelector('[class*="PropSettingText__fontStyle"]');
+                if (fontStyleWrap) {
+                    const boldBtn = fontStyleWrap.querySelector('button, div[role="button"], span');
+                    if (boldBtn) boldBtn.click();
+                }
+                const labelGroup = document.querySelector('[class*="PropSettingText__labelGroup"]');
+                if (labelGroup) {
+                    const addBtns = labelGroup.querySelectorAll('[class*="PropSettingColorPopup__addBtn"]');
+                    if (addBtns.length >= 2) addBtns[1].click();
+                    else if (addBtns.length >= 1) addBtns[0].click();
+                }
+            }"""
+        )
+        page.wait_for_timeout(250 if not headless else 40)
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    # 4. Guardrail: verify the text box was NOT squished into a narrow vertical column before saving!
+    try:
+        squished = bool(
+            surface.evaluate(
+                """() => {
+                    const lines = Array.from(document.querySelectorAll('.moveable-control-box .moveable-line'))
+                        .filter(el => {
+                            const r = el.getBoundingClientRect();
+                            return (r.width > 5 || r.height > 5) && !String(el.className || '').includes('rotation');
+                        });
+                    if (lines.length < 2) return false;
+                    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+                    for (const l of lines) {
+                        const r = l.getBoundingClientRect();
+                        minX = Math.min(minX, r.left);
+                        maxX = Math.max(maxX, r.right);
+                        minY = Math.min(minY, r.top);
+                        maxY = Math.max(maxY, r.bottom);
+                    }
+                    const w = maxX - minX;
+                    const h = maxY - minY;
+                    return w < 45 && h > w * 2.0;
+                }"""
+            )
+        )
+        if squished:
+            logger.emit_log("VIDEO-TEXT", "Detected narrow vertical text box anomaly — undoing text track rather than saving deformed text.")
+            page.keyboard.press("Delete")
+            return False
+    except Exception:
+        pass
+
+    single_line_log = wrapped_text.replace("\n", " / ")
+    logger.emit_log("VIDEO-TEXT", f"Added native TikTok video text track in upper safe zone: '{single_line_log}'")
+    return True
+
+
+def _apply_video_editor_sound_and_text(
     surface: Any,
     page: Any,
     mute_original: bool,
+    use_suggested_sound: bool,
+    video_overlay_text: str,
     headless: bool,
     logger: Logger,
-) -> str:
-    """Opens TikTok Studio's 'Sons / Sounds' editor, mutes original track if present, picks the 1st suggested TikTok sound, and clicks Save."""
-    clicked_sons = False
+) -> Tuple[str, bool]:
+    """Opens TikTok Studio's video editor once, applies #1 suggested sound and/or native 'Aa Texte' overlay, and clicks Save once."""
+    clean_overlay = (video_overlay_text or "").strip()
+    if not use_suggested_sound and not clean_overlay:
+        return "", False
+
+    target_btn_pattern = "^(sons|sounds)$" if use_suggested_sound else "^(texte|text)$"
+    clicked_entry = False
     try:
-        clicked_sons = bool(
+        clicked_entry = bool(
             surface.evaluate(
-                """() => {
-                    // Match ONLY the video editor's 'Sons'/'Sounds' button (never 'Sons libres de droits' in left nav)
+                """(pat) => {
+                    const re = new RegExp(pat, 'i');
                     const candidates = Array.from(document.querySelectorAll('button.editor-entrance, button'));
                     const btn = candidates.find(b => {
                         const txt = (b.innerText || '').trim();
                         const r = b.getBoundingClientRect();
-                        return /^(sons|sounds)$/i.test(txt) && r.width > 0 && r.height > 0 && r.x > 250;
-                    }) || candidates.find(b => b.classList.contains('editor-entrance') && /^(sons|sounds)$/i.test((b.innerText || '').trim()));
+                        return re.test(txt) && r.width > 0 && r.height > 0 && r.x > 250;
+                    }) || candidates.find(b => b.classList.contains('editor-entrance') && re.test((b.innerText || '').trim()));
                     if (!btn) return false;
                     btn.scrollIntoView({ block: 'center' });
                     btn.click();
                     return true;
-                }"""
+                }""",
+                target_btn_pattern,
             )
         )
     except Exception as exc:
-        logger.emit_log("SOUND", f"Could not click 'Sons / Sounds' editor button: {exc}")
-        return ""
+        logger.emit_log("SOUND", f"Could not click TikTok Studio video editor button: {exc}")
+        return "", False
 
-    if not clicked_sons:
-        logger.emit_log("SOUND", "No 'Sons / Sounds' editor button visible on this post layout; skipping music step.")
-        return ""
-
-    logger.emit_log("SOUND", "Opened TikTok Studio 'Sons / Sounds' panel; loading suggested sounds...")
-    music_ready = False
-    deadline = time.monotonic() + (20.0 if not headless else 4.0)
-    while time.monotonic() < deadline:
-        _dismiss_studio_popups(surface, page, logger)
-        try:
-            if surface.locator('[class*="MusicPanelMusicItem__wrap"]').count() > 0:
-                music_ready = True
-                break
-        except Exception:
-            pass
-        page.wait_for_timeout(600 if not headless else 100)
-
-    if not music_ready:
-        logger.emit_log("SOUND", "Suggested music list did not appear inside 'Sons / Sounds' panel; closing editor.")
-        try:
-            surface.evaluate(
-                """() => {
-                    const cancelBtn = Array.from(document.querySelectorAll('button'))
-                        .find(b => /^(annuler|cancel)$/i.test((b.innerText || '').trim()));
-                    if (cancelBtn) cancelBtn.click();
-                }"""
-            )
-        except Exception:
-            pass
-        return ""
-
-    _dismiss_studio_popups(surface, page, logger)
-
-    # If an original video track mute speaker icon exists at the left of the top timeline track, mute it too
-    if mute_original:
-        try:
-            muted_in_ui = surface.evaluate(
-                """() => {
-                    const trackMuteBtns = Array.from(document.querySelectorAll('button')).filter(b => {
-                        const r = b.getBoundingClientRect();
-                        return r.width >= 20 && r.width <= 44 && r.x > 20 && r.x < 180 && r.y > 760;
-                    });
-                    if (trackMuteBtns.length === 1) {
-                        trackMuteBtns[0].click();
-                        return true;
-                    }
-                    return false;
-                }"""
-            )
-            if muted_in_ui:
-                logger.emit_log("SOUND", "Muted original video audio track in TikTok Studio timeline.")
-                page.wait_for_timeout(300 if not headless else 50)
-        except Exception:
-            pass
+    if not clicked_entry:
+        logger.emit_log("SOUND", "No 'Sons / Texte' video editor button visible on this layout; skipping editor step.")
+        return "", False
 
     chosen_title = ""
-    try:
-        items = surface.locator('[class*="MusicPanelMusicItem__wrap"]')
-        item_count = items.count()
-        for idx in range(min(item_count, 5)):
-            item = items.nth(idx)
-            if not item.is_visible():
-                continue
-            raw_txt = (item.inner_text() or "").strip()
-            title_line = raw_txt.splitlines()[0].strip() if raw_txt else f"Suggested Sound #{idx + 1}"
-            item.hover(timeout=2500)
-            page.wait_for_timeout(350 if not headless else 50)
-            plus_btn = item.locator('button[class*="type-primary"], button').last
-            if plus_btn.count() > 0 and plus_btn.is_visible() and plus_btn.is_enabled():
-                logger.emit_log("SOUND", f"Selecting #{idx + 1} suggested TikTok sound: '{title_line}'...")
-                plus_btn.click(timeout=4000)
-                chosen_title = title_line
-                break
-    except Exception as exc:
-        logger.emit_log("SOUND", f"Failed to click '+' on suggested sound: {exc}")
+    if use_suggested_sound:
+        logger.emit_log("SOUND", "Opened TikTok Studio 'Sons / Sounds' panel; loading suggested sounds...")
+        music_ready = False
+        deadline = time.monotonic() + (20.0 if not headless else 4.0)
+        while time.monotonic() < deadline:
+            _dismiss_studio_popups(surface, page, logger)
+            try:
+                if surface.locator('[class*="MusicPanelMusicItem__wrap"]').count() > 0:
+                    music_ready = True
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(600 if not headless else 100)
 
-    if not chosen_title:
-        logger.emit_log("SOUND", "Could not select a suggested sound; closing 'Sons' editor without changes.")
+        if music_ready:
+            _dismiss_studio_popups(surface, page, logger)
+            if mute_original:
+                try:
+                    muted_in_ui = surface.evaluate(
+                        """() => {
+                            const trackMuteBtns = Array.from(document.querySelectorAll('button')).filter(b => {
+                                const r = b.getBoundingClientRect();
+                                return r.width >= 20 && r.width <= 44 && r.x > 20 && r.x < 180 && r.y > 760;
+                            });
+                            if (trackMuteBtns.length === 1) {
+                                trackMuteBtns[0].click();
+                                return true;
+                            }
+                            return false;
+                        }"""
+                    )
+                    if muted_in_ui:
+                        logger.emit_log("SOUND", "Muted original video audio track in TikTok Studio timeline.")
+                        page.wait_for_timeout(300 if not headless else 50)
+                except Exception:
+                    pass
+
+            try:
+                items = surface.locator('[class*="MusicPanelMusicItem__wrap"]')
+                item_count = items.count()
+                for idx in range(min(item_count, 5)):
+                    item = items.nth(idx)
+                    if not item.is_visible():
+                        continue
+                    raw_txt = (item.inner_text() or "").strip()
+                    title_line = raw_txt.splitlines()[0].strip() if raw_txt else f"Suggested Sound #{idx + 1}"
+                    item.hover(timeout=2500)
+                    page.wait_for_timeout(350 if not headless else 50)
+                    plus_btn = item.locator('button[class*="type-primary"], button').last
+                    if plus_btn.count() > 0 and plus_btn.is_visible() and plus_btn.is_enabled():
+                        logger.emit_log("SOUND", f"Selecting #{idx + 1} suggested TikTok sound: '{title_line}'...")
+                        plus_btn.click(timeout=4000)
+                        chosen_title = title_line
+                        break
+            except Exception as exc:
+                logger.emit_log("SOUND", f"Failed to click '+' on suggested sound: {exc}")
+        else:
+            logger.emit_log("SOUND", "Suggested music list did not appear in time.")
+
+    text_applied = False
+    if clean_overlay:
+        page.wait_for_timeout(800 if not headless else 80)
+        _dismiss_studio_popups(surface, page, logger)
+        text_applied = _apply_video_text_inside_editor(
+            surface, page, clean_overlay, headless, logger
+        )
+
+    if not chosen_title and not text_applied:
+        logger.emit_log("SOUND", "Neither sound nor text track changed; closing editor without saving.")
         try:
             surface.evaluate(
                 """() => {
@@ -288,9 +613,9 @@ def _apply_suggested_tiktok_sound(
             )
         except Exception:
             pass
-        return ""
+        return "", False
 
-    page.wait_for_timeout(2200 if not headless else 150)
+    page.wait_for_timeout(2000 if not headless else 150)
     _dismiss_studio_popups(surface, page, logger)
 
     saved = False
@@ -307,22 +632,41 @@ def _apply_suggested_tiktok_sound(
             )
         )
     except Exception as exc:
-        logger.emit_log("SOUND", f"Could not click 'Enregistrer / Save' in sound editor: {exc}")
+        logger.emit_log("SOUND", f"Could not click 'Enregistrer / Save' in video editor: {exc}")
 
     if saved:
-        close_deadline = time.monotonic() + (35.0 if not headless else 5.0)
+        close_deadline = time.monotonic() + (40.0 if not headless else 5.0)
         while time.monotonic() < close_deadline:
             try:
-                if surface.locator('[class*="MusicPanelContainer__root"]').count() == 0:
+                if (
+                    surface.locator('[class*="MusicPanelContainer__root"]').count() == 0
+                    and surface.locator('[class*="AddTextPanel__addTextBasicButton"]').count() == 0
+                ):
                     break
             except Exception:
                 break
             page.wait_for_timeout(700 if not headless else 100)
         page.wait_for_timeout(1200 if not headless else 100)
-        logger.emit_log("SOUND", f"Saved video with 1st suggested TikTok sound: '{chosen_title}'.")
-        return chosen_title
+        logger.emit_log(
+            "SOUND",
+            f"Saved TikTok Studio video edits (sound='{chosen_title or 'none'}', videoText={text_applied}).",
+        )
+        return chosen_title, text_applied
 
-    return ""
+    return "", False
+
+
+def _apply_suggested_tiktok_sound(
+    surface: Any,
+    page: Any,
+    mute_original: bool,
+    headless: bool,
+    logger: Logger,
+) -> str:
+    sound_title, _ = _apply_video_editor_sound_and_text(
+        surface, page, mute_original, True, "", headless, logger
+    )
+    return sound_title
 
 
 def _apply_suggested_photo_sound(
@@ -796,6 +1140,7 @@ def main() -> int:
     account_url = str(req.get("accountUrl") or "").strip()
     media_paths = [str(p) for p in (req.get("mediaPaths") or []) if p]
     caption = str(req.get("caption") or "").strip()
+    video_overlay_text = str(req.get("videoOverlayText") or "").strip()
     short_code = str(req.get("shortCode") or "QS").strip()
     use_system_profile = bool(req.get("useSystemChromeProfile", True))
     mute_original_audio = bool(req.get("muteOriginalAudio", True))
@@ -1007,18 +1352,26 @@ def main() -> int:
                     logger.emit_log("ERROR", err)
                     return _finish(log_file=logger.log_file, screenshot=snap, fatal=False, error=err)
 
-                # Attach 1st suggested TikTok sound BEFORE filling caption (for BOTH Video and Photo Slideshow!)
+                # Attach 1st suggested TikTok sound AND/OR native TikTok 'Aa Texte' video overlay BEFORE filling caption
                 applied_sound_title = ""
-                if use_suggested_sound:
+                applied_video_text = False
+                if is_video_post and (use_suggested_sound or bool(video_overlay_text)):
                     _dismiss_studio_popups(surface, page, logger)
-                    if is_video_post:
-                        applied_sound_title = _apply_suggested_tiktok_sound(
-                            surface, page, mute_original_audio, headless, logger
-                        )
-                    elif is_image_post:
-                        applied_sound_title = _apply_suggested_photo_sound(
-                            surface, page, headless, logger
-                        )
+                    applied_sound_title, applied_video_text = _apply_video_editor_sound_and_text(
+                        surface,
+                        page,
+                        mute_original_audio,
+                        use_suggested_sound,
+                        video_overlay_text,
+                        headless,
+                        logger,
+                    )
+                    surface = _find_upload_surface(page)
+                elif is_image_post and use_suggested_sound:
+                    _dismiss_studio_popups(surface, page, logger)
+                    applied_sound_title = _apply_suggested_photo_sound(
+                        surface, page, headless, logger
+                    )
                     surface = _find_upload_surface(page)
 
                 # On TikTok Photo Slideshow mode, also populate the 90-char Catchy Title input if present
@@ -1137,6 +1490,7 @@ def main() -> int:
                         published=False,
                         dry_run=True,
                         sound_title=applied_sound_title,
+                        video_text_applied=applied_video_text,
                         log_file=logger.log_file,
                         screenshot=ready_snap,
                         error=None,
@@ -1237,6 +1591,7 @@ def main() -> int:
                     dry_run=False,
                     post_url=placeholder_url,
                     sound_title=applied_sound_title,
+                    video_text_applied=applied_video_text,
                     log_file=logger.log_file,
                     screenshot=done_snap,
                     fatal=False,

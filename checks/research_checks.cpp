@@ -18,10 +18,12 @@
 #include "model/properties/TreeProperties.h"
 #include "model/videogen/AbstractVideoGenerator.h"
 #include "model/videogen/TableGenerationSettings.h"
+#include "model/videos/SocialStatistics.h"
 #include "model/videos/TableVideos.h"
 #include "../common/workingdirectory/WorkingDirectoryManager.h"
 #include "AbstractCli.h"
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDate>
 #include <QElapsedTimer>
@@ -1413,6 +1415,9 @@ void checkResearch(const QDir &callerWorkingDir)
             "document.getElementById('sonsBtn').addEventListener('click', () => {"
             "  document.getElementById('musicModalWrap').innerHTML = "
             "    '<div class=\"MusicPanelContainer__root\" style=\"position:fixed;inset:20px;background:#fff;z-index:5000;\">'"
+            "    + '<div class=\"EditorLeftSideMenu__menuItem\" style=\"position:fixed;left:14px;top:140px;width:56px;height:54px;\" onclick=\"document.getElementById(\\'textSubPanel\\').style.display=\\'block\\'\">Texte</div>'"
+            "    + '<div id=\"textSubPanel\" style=\"display:none;\"><button type=\"button\" class=\"AddTextPanel__addTextBasicButton\" onclick=\"document.getElementById(\\'textPropWrap\\').style.display=\\'block\\'\">Ajouter du texte</button></div>'"
+            "    + '<div id=\"textPropWrap\" style=\"display:none;\"><textarea class=\"PropSettingTextArea__input\">Text</textarea></div>'"
             "    + '<div class=\"MusicPanelMusicItem__wrap\"><div>Trending Runway Beat</div><div>00:30 · Studio</div><button type=\"button\" class=\"Button__root--type-primary\">+</button></div>'"
             "    + '<button type=\"button\" onclick=\"document.getElementById(\\'musicModalWrap\\').innerHTML=\\'\\'\">Enregistrer</button>'"
             "    + '</div>';"
@@ -1563,8 +1568,11 @@ void checkResearch(const QDir &callerWorkingDir)
             if (candTable && candTable->rowCount() == 2 && slideStrip && videoBar
                 && btnPlayVid && prevStack && vidWidget && vidPlayer && btnMoveDown)
             {
-                // 1. Select the VIDEO row and test inline video playback!
+                // 1. Select the VIDEO row, test inline video playback, AND customize native TikTok video text!
                 bool inlineVideoPlayed = false;
+                bool videoTextCustomized = false;
+                auto *chkVidTxt = revDlg->findChild<QCheckBox *>("checkReviewVideoTextOverlay");
+                auto *editVidTxt = revDlg->findChild<QLineEdit *>("editReviewVideoOverlayText");
                 for (int r = 0; r < 2; ++r)
                 {
                     if (candTable->item(r, 2)->text().contains("VIDEO"))
@@ -1578,6 +1586,14 @@ void checkResearch(const QDir &callerWorkingDir)
                             barVisible
                             && prevStack->currentWidget() == vidWidget
                             && vidPlayer->source().isLocalFile();
+                        if (chkVidTxt && editVidTxt && chkVidTxt->isVisible())
+                        {
+                            chkVidTxt->setChecked(true);
+                            editVidTxt->setText(QStringLiteral("Custom Edited Runway Hook"));
+                            emit editVidTxt->textEdited(QStringLiteral("Custom Edited Runway Hook"));
+                            QApplication::processEvents();
+                            videoTextCustomized = candTable->item(r, 2)->text().contains("Custom Edited Runway Hook");
+                        }
                         break;
                     }
                 }
@@ -1601,6 +1617,7 @@ void checkResearch(const QDir &callerWorkingDir)
                 expectedFirstCodeAfterReorder = origSecondCode;
                 verifiedReorderAndConfirm =
                     inlineVideoPlayed
+                    && videoTextCustomized
                     && slideStripShown
                     && candTable->item(0, 2)->text().startsWith(origSecondCode)
                     && candTable->item(0, 3)->text().contains("Immediate (+0m)")
@@ -1643,16 +1660,18 @@ void checkResearch(const QDir &callerWorkingDir)
         requireResearch(!panePub.isJobRunning() && triggeredSecondSlot,
                         "Auto-Publish job completes both Slot #1 (immediate) and Slot #2 (Publish Next Now)");
         const QString allLogs = pubLogs->toPlainText();
-        requireResearch(allLogs.contains("[AI-PLANNER]")
+        requireResearch(allLogs.contains("[LEARNING]")
+                            && allLogs.contains("[AI-PLANNER]")
                             && allLogs.contains("[USER-PLAN]")
                             && allLogs.contains("[CAPTION-AUTO]")
                             && allLogs.contains("[SLIDESHOW-TEXT]")
+                            && allLogs.contains("[VIDEO-TEXT]")
                             && allLogs.contains("[SOUND]")
                             && allLogs.contains("[UPLOAD]")
                             && allLogs.contains("[CAPTION]")
                             && allLogs.contains("[SUCCESS]")
                             && allLogs.contains("[JOB-DONE]"),
-                        "PanePublishing overlays slideshow text, enriches caption/#hashtags, attaches 1st TikTok sound on both Video & Photo Mode, and streams logs");
+                        "PanePublishing logs measured learning summary, applies native TikTok video text + slideshow text + #1 sound, and completes publish");
 
         // Both aged creatives (Video + 4-slide Carousel) must now be marked published with linux-chrome DNA
         int publishedAgedCount = 0;
@@ -1673,8 +1692,10 @@ void checkResearch(const QDir &callerWorkingDir)
                 if (rec->shortCode == agedVideoCode)
                 {
                     requireResearch(dna.value("mutedOriginalAudio").toBool()
+                                        && dna.value("tiktokVideoTextAdded").toBool()
+                                        && dna.value("tiktokVideoText").toString() == QLatin1String("Custom Edited Runway Hook")
                                         && QFileInfo::exists(gDir.filePath("hook-description.txt")),
-                                    "Video publish mutes original audio and persists generated hook-description.txt");
+                                    "Video publish mutes original audio, applies native TikTok text track, and records tiktokVideoText in creative_dna.json");
                 }
                 else if (rec->shortCode == agedCarouselCode)
                 {
@@ -1735,6 +1756,53 @@ void checkResearch(const QDir &callerWorkingDir)
                             && pubLogs->toPlainText().contains("ACCOUNT-MISMATCH")
                             && pubLogs->toPlainText().contains("[AUTO-STOP]"),
                         "Account mismatch triggers fatal safety auto-stop with clear diagnostic logs");
+
+        // Verify continuous measurement & self-improvement loop for native TikTok video text:
+        // record measured views on the with-text video vs a clean video without text, and verify
+        // SocialStatistics::summarizeVideoTextExperiment aggregates performance and promotes winning hooks!
+        for (int r = 0; r < pubVideos.rowCount(); ++r)
+        {
+            const auto *rec = pubVideos.recordAt(r);
+            if (rec->shortCode == agedVideoCode && !rec->publications.isEmpty())
+            {
+                AbstractSocialAccount::VideoStatistics vs;
+                vs.views = 1850;
+                vs.likes = 140;
+                vs.comments = 12;
+                vs.shares = 18;
+                pubVideos.addSnapshot(rec->id, rec->publications.first().postUrl,
+                                      AbstractSocialAccount::StatSource::PublicView, vs);
+            }
+            else if (!rec->published)
+            {
+                const int pRow = pubProjects.rowOfId(rec->projectId);
+                const QDir candGDir = pubProjects.generationDir(qMax(0, pRow), rec->shortCode, false);
+                if (!candGDir.entryList({QStringLiteral("*.mp4")}, QDir::Files).isEmpty())
+                {
+                    pubVideos.setPublished(rec->id, true);
+                    const QString cleanUrl = QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/999");
+                    pubVideos.addPublication(rec->id, QStringLiteral("tiktok"), cleanUrl,
+                                             QDateTime::currentDateTimeUtc(), 1200);
+                    AbstractSocialAccount::VideoStatistics cleanStats;
+                    cleanStats.views = 210;
+                    cleanStats.likes = 9;
+                    cleanStats.comments = 1;
+                    cleanStats.shares = 0;
+                    pubVideos.addSnapshot(rec->id, cleanUrl,
+                                          AbstractSocialAccount::StatSource::PublicView, cleanStats);
+                }
+            }
+        }
+        const auto expSummary = SocialStatistics::summarizeVideoTextExperiment(&pubVideos, &gHooks);
+        requireResearch(expSummary.withTextCount == 1
+                            && qRound64(expSummary.withTextAvgViews) == 1850
+                            && expSummary.withoutTextCount == 1
+                            && qRound64(expSummary.withoutTextAvgViews) == 210
+                            && !expSummary.winningTexts.isEmpty()
+                            && expSummary.winningTexts.first().text == QLatin1String("Custom Edited Runway Hook")
+                            && gHooks.hooks(false).contains(QStringLiteral("Custom Edited Runway Hook"))
+                            && expSummary.plannerPromptAddendum().contains("Custom Edited Runway Hook"),
+                        "SocialStatistics::summarizeVideoTextExperiment measures With-Text vs Clean-Video views, promotes winning text hooks, and builds AI learning prompt");
 
         liveGenPane.close();
         panePub.close();
