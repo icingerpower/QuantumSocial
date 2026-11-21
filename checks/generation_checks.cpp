@@ -1818,6 +1818,8 @@ static void checkLastUpdateColumn(const QDir &root)
             "old folder with new video turns green");
 }
 
+void checkResearch(const QDir &root);
+
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
@@ -1833,6 +1835,8 @@ int main(int argc, char **argv)
         WorkingDirectoryManager::instance()->setWorkingDir(root);
         FakeGenerator generator;
         AbstractVideoGenerator::Recorder registration(&generator);
+        checkResearch(root);
+        if (qEnvironmentVariableIsSet("QS_RESEARCH_ONLY")) return 0;
         checkRecipes(root);
         checkPropertyRetrieveStatistics(root);
         TreeProperties properties(root.filePath("properties.json"));

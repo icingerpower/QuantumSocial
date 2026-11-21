@@ -106,6 +106,11 @@ public:
     {
     public:
         explicit Recorder(AbstractVideoGenerator *generator);
+        ~Recorder();
+
+    private:
+        QString m_id;
+        AbstractVideoGenerator *m_generator = nullptr;
     };
 
 protected:

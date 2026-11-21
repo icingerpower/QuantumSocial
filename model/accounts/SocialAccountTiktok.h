@@ -16,6 +16,21 @@ public:
     QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(
         const QString &profileUrl,
         const QStringList &knownShortCodes = {}) const override;
+    bool supportsSpyScrollAndSave() const override;
+    QString defaultSpySearchUrl(const QString &query) const override;
+    QCoro::Task<SpyResult> spyScrollAndSave(
+        const QString &queryOrUrl,
+        const QString &downloadDir,
+        int maxPosts = 24,
+        bool autoScroll = true,
+        int minEngagement = 0,
+        const QStringList &excludeUrls = {},
+        int maxDaysOld = 0) const override;
+    bool supportsAutoPublish() const override;
+    QCoro::Task<PublishResult> publishCreative(
+        const PublishRequest &request,
+        const std::function<void(const QString &)> &onLog = {},
+        std::shared_ptr<bool> cancelFlag = {}) const override;
 };
 
 #endif // SOCIALACCOUNTTIKTOK_H

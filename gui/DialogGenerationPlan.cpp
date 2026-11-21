@@ -37,7 +37,9 @@ DialogGenerationPlan::DialogGenerationPlan(const QList<QList<PlanProperty>> &pro
                                            const QList<AbstractCli *> &availableClis,
                                            SavedPrompts *savedPrompts,
                                            const QString &videoFormatLabel,
-                                           QWidget *parent)
+                                           QWidget *parent,
+                                           const QStringList &initialStrategyPrompts,
+                                           bool preferVideoOnly)
     : QDialog(parent)
     , ui(new Ui::DialogGenerationPlan)
     , m_savedPrompts(savedPrompts)
@@ -61,14 +63,19 @@ DialogGenerationPlan::DialogGenerationPlan(const QList<QList<PlanProperty>> &pro
         }
     }
 
-    // Last ticked options are the defaults.
+    // Last ticked options are the defaults, except right after regenerating a
+    // starting image for video animation (preferVideoOnly = true), where we
+    // default straight to animating the image into a video.
     QSettings settings;
     m_imageSection = _makeSection(tr("One image"), propertiesPerStrategy,
-        settings.value(SETTING_ONE_IMAGE, true).toBool());
+        preferVideoOnly ? false : settings.value(SETTING_ONE_IMAGE, true).toBool(),
+        initialStrategyPrompts);
     _addCliCombo(m_imageSection, availableClis, SETTING_IMAGE_CLI);
     m_imageSection.group->setGenerationCount(settings.value("generation/count/image", 1).toInt());
     m_slideshowSection = _makeSection(tr("Several images (slideshow)"),
-        propertiesPerStrategy, settings.value(SETTING_SLIDESHOW, false).toBool());
+        propertiesPerStrategy,
+        preferVideoOnly ? false : settings.value(SETTING_SLIDESHOW, false).toBool(),
+        initialStrategyPrompts);
     _addCliCombo(m_slideshowSection, availableClis, SETTING_SLIDESHOW_CLI);
     m_slideshowSection.group->setGenerationCount(settings.value("generation/count/slideshow", 1).toInt());
 
@@ -76,13 +83,29 @@ DialogGenerationPlan::DialogGenerationPlan(const QList<QList<PlanProperty>> &pro
     // AbstractVideoGenerator subclass appears here on its own.
     const QStringList savedVideos = settings.value(SETTING_VIDEOS).toStringList();
     const auto &generators = AbstractVideoGenerator::ALL_VIDEO_GENERATORS();
+    bool anyVideoChecked = false;
     for (auto it = generators.cbegin(); it != generators.cend(); ++it)
     {
+        const bool isChecked = savedVideos.contains(it.key());
+        anyVideoChecked |= isChecked;
         m_videoSections << qMakePair(it.key(),
             _makeSection(tr("Video — %1").arg(it.value()->getName()),
-                         propertiesPerStrategy, savedVideos.contains(it.key())));
+                         propertiesPerStrategy, isChecked, initialStrategyPrompts));
         m_videoSections.last().second.group->setGenerationCount(
             settings.value("generation/count/video/" + it.key(), 1).toInt());
+    }
+    if (preferVideoOnly && !anyVideoChecked && !m_videoSections.isEmpty())
+    {
+        int preferredIdx = 0;
+        for (int i = 0; i < m_videoSections.size(); ++i)
+        {
+            if (m_videoSections[i].first.contains(QStringLiteral("gemini"), Qt::CaseInsensitive))
+            {
+                preferredIdx = i;
+                break;
+            }
+        }
+        m_videoSections[preferredIdx].second.group->setChecked(true);
     }
 
     _refreshSavedPromptCombos();
@@ -318,7 +341,8 @@ void DialogGenerationPlan::_onPropertyValueChanged(const QString &syncKey, const
 
 DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
     const QString &title,
-    const QList<QList<PlanProperty>> &propertiesPerStrategy, bool checked)
+    const QList<QList<PlanProperty>> &propertiesPerStrategy, bool checked,
+    const QStringList &initialPrompts)
 {
     OptionSection section;
     section.group = new GenerationPlanSection{this};
@@ -481,6 +505,10 @@ DialogGenerationPlan::OptionSection DialogGenerationPlan::_makeSection(
             section.group->propertyScroll(i)->hide();
         }
         page->previewLabel = section.group->previewLabel(i);
+        if (!initialPrompts.value(i).trimmed().isEmpty())
+        {
+            page->promptEdit->setPlainText(initialPrompts.value(i).trimmed());
+        }
         section.strategies << page;
 
         connect(page->promptEdit, &QPlainTextEdit::textChanged, this, [this, page]() {

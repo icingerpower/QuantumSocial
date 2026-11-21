@@ -1,4 +1,6 @@
 SET(GUI_FILES
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneResearch.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneResearch.cpp
     ${CMAKE_CURRENT_LIST_DIR}/DialogGenerateAgain.cpp
     ${CMAKE_CURRENT_LIST_DIR}/DialogGenerateAgain.h
     ${CMAKE_CURRENT_LIST_DIR}/DialogGenerateAgain.ui
@@ -41,6 +43,8 @@ SET(GUI_FILES
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.ui
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PanePublishing.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PanePublishing.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.ui

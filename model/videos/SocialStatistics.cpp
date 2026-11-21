@@ -10,16 +10,24 @@
 #include <QFile>
 #include <QHash>
 #include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMessageBox>
 #include <QObject>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
 #include <QStandardPaths>
 #include <QTextStream>
 #include <QWidget>
 
+#include <algorithm>
+
 #include "../../../common/workingdirectory/WorkingDirectoryManager.h"
 
+#include "../FavoriteHooks.h"
+#include "../PreferredHashtags.h"
 #include "../TableAccounts.h"
 
 namespace {
@@ -278,7 +286,9 @@ const TableVideos::VideoRecord *SocialStatistics::matchVideoRecord(
 
 QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts,
                                                          TableVideos *videos,
-                                                         QWidget *parentWidget)
+                                                         QWidget *parentWidget,
+                                                         PreferredHashtags *hashtags,
+                                                         FavoriteHooks *favoriteHooks)
 {
     appendRetrieveStatsLog(QStringLiteral("=== Retrieve statistics started ==="));
     struct AccountRowInfo
@@ -345,6 +355,25 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
     QSet<QString> refreshedPostUrls;
     QHash<QString, qint64> platformFollowers;
     int totalMatchedVideos = 0;
+    QHash<QString, QJsonObject> discoveredTopPostsByUrl;
+    {
+        const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+        QFile existingTop{wd.filePath(QStringLiteral("account_top_posts.json"))};
+        if (existingTop.open(QIODevice::ReadOnly))
+        {
+            for (const QJsonValue &v : QJsonDocument::fromJson(existingTop.readAll()).object().value(QStringLiteral("posts")).toArray())
+            {
+                const QJsonObject po = v.toObject();
+                const QString u = po.value(QStringLiteral("postUrl")).toString();
+                if (!u.isEmpty())
+                {
+                    discoveredTopPostsByUrl.insert(u, po);
+                }
+            }
+        }
+    }
+    int harvestedHashtags = 0;
+    int harvestedHooks = 0;
 
     for (const AccountRowInfo &entry : accountRows)
     {
@@ -429,8 +458,113 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
             continue;
         }
 
+        // Compute median views across this account's returned posts so we automatically
+        // harvest proven winning #hashtags & opening hooks into the Inspiration bank!
+        QList<qint64> accountViewList;
+        for (const auto &p : accountResult.posts)
+        {
+            if (p.stats.views >= 0)
+            {
+                accountViewList << p.stats.views;
+            }
+        }
+        std::sort(accountViewList.begin(), accountViewList.end());
+        const qint64 medianAccountViews = accountViewList.isEmpty()
+            ? 100
+            : accountViewList[accountViewList.size() / 2];
+        const qint64 winnerViewThreshold = qMax<qint64>(80, medianAccountViews);
+
+        static const QRegularExpression hashtagExtractRe{QStringLiteral("(#[A-Za-z0-9_]+)")};
+        static const QRegularExpression qsTagRe{QStringLiteral("^#?qs[-_]?[0-9a-z]+$"),
+                                                 QRegularExpression::CaseInsensitiveOption};
+
         for (const auto &post : accountResult.posts)
         {
+            if (!post.postUrl.isEmpty() && post.stats.views >= 0)
+            {
+                QString cleanText = post.caption;
+                cleanText.remove(QRegularExpression{QStringLiteral("(?:#\\s*)?\\bqs[-_]?[0-9a-z]{4,}\\b"),
+                                                    QRegularExpression::CaseInsensitiveOption});
+                QStringList postTags;
+                auto tagIt = hashtagExtractRe.globalMatch(cleanText);
+                while (tagIt.hasNext())
+                {
+                    const QString t = tagIt.next().captured(1);
+                    if (!qsTagRe.match(t).hasMatch()
+                        && t.compare(QLatin1String("#milestone"), Qt::CaseInsensitive) != 0)
+                    {
+                        postTags << t.toLower();
+                    }
+                }
+                QString bodyWithoutTags = cleanText;
+                bodyWithoutTags.remove(hashtagExtractRe);
+                bodyWithoutTags = bodyWithoutTags.simplified();
+
+                QString openingHook;
+                const int qMark = bodyWithoutTags.indexOf(QLatin1Char('?'));
+                const int dotPos = bodyWithoutTags.indexOf(QStringLiteral(". "));
+                const int dashPos = bodyWithoutTags.indexOf(QStringLiteral(" — "));
+                int splitAt = -1;
+                for (int cand : {qMark >= 0 ? qMark + 1 : -1, dotPos >= 0 ? dotPos + 1 : -1, dashPos})
+                {
+                    if (cand >= 14 && (splitAt < 0 || cand < splitAt))
+                    {
+                        splitAt = cand;
+                    }
+                }
+                openingHook = (splitAt > 0 ? bodyWithoutTags.left(splitAt) : bodyWithoutTags.left(95)).trimmed();
+
+                discoveredTopPostsByUrl.insert(post.postUrl, QJsonObject{
+                    {QStringLiteral("platformId"), account->getId()},
+                    {QStringLiteral("accountUrl"), entry.url},
+                    {QStringLiteral("postUrl"), post.postUrl},
+                    {QStringLiteral("shortCode"), post.shortCode},
+                    {QStringLiteral("caption"), post.caption.trimmed()},
+                    {QStringLiteral("hook"), openingHook},
+                    {QStringLiteral("hashtags"), QJsonArray::fromStringList(postTags)},
+                    {QStringLiteral("views"), post.stats.views},
+                    {QStringLiteral("likes"), post.stats.likes},
+                    {QStringLiteral("comments"), post.stats.comments},
+                    {QStringLiteral("shares"), post.stats.shares},
+                    {QStringLiteral("followers"), followers},
+                    {QStringLiteral("fetchedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
+                });
+
+                if (post.stats.views >= winnerViewThreshold)
+                {
+                    if (hashtags)
+                    {
+                        const QStringList existingTags = hashtags->hashtags(false);
+                        for (const QString &wt : postTags)
+                        {
+                            bool known = false;
+                            for (const QString &et : existingTags)
+                            {
+                                if (et.compare(wt, Qt::CaseInsensitive) == 0)
+                                {
+                                    known = true;
+                                    break;
+                                }
+                            }
+                            if (!known)
+                            {
+                                hashtags->addHashtag(wt, PreferredHashtags::SOURCE_AI);
+                                ++harvestedHashtags;
+                            }
+                        }
+                    }
+                    if (favoriteHooks && openingHook.size() >= 15 && openingHook.size() <= 110)
+                    {
+                        const int beforeCnt = favoriteHooks->rowCount();
+                        favoriteHooks->addHook(openingHook, FavoriteHooks::SOURCE_AI);
+                        if (favoriteHooks->rowCount() > beforeCnt)
+                        {
+                            ++harvestedHooks;
+                        }
+                    }
+                }
+            }
+
             const TableVideos::VideoRecord *record = matchVideoRecord(videos, post);
             if (!record)
             {
@@ -492,7 +626,15 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
             }
             for (const TableVideos::Publication &pub : record->publications)
             {
-                if (!pub.postUrl.isEmpty() && !refreshedPostUrls.contains(pub.postUrl))
+                const bool isPostUrl = !pub.postUrl.isEmpty()
+                    && !pub.postUrl.contains(QLatin1Char('#'))
+                    && (pub.postUrl.contains(QLatin1String("/video/"), Qt::CaseInsensitive)
+                        || pub.postUrl.contains(QLatin1String("/photo/"), Qt::CaseInsensitive)
+                        || pub.postUrl.contains(QLatin1String("/pin/"), Qt::CaseInsensitive)
+                        || pub.postUrl.contains(QLatin1String("/shorts/"), Qt::CaseInsensitive)
+                        || pub.postUrl.contains(QLatin1String("/reel/"), Qt::CaseInsensitive)
+                        || pub.postUrl.contains(QLatin1String("watch?v="), Qt::CaseInsensitive));
+                if (isPostUrl && !refreshedPostUrls.contains(pub.postUrl))
                 {
                     targets << ExistingTarget{record->id, pub.platformId, pub.postUrl,
                                               pub.publishDate, pub.followersAtPublish};
@@ -531,6 +673,41 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
                                     AbstractSocialAccount::StatSource::PublicView, stats);
             }
         }
+    }
+
+    if (!discoveredTopPostsByUrl.isEmpty())
+    {
+        QList<QJsonObject> sortedPosts = discoveredTopPostsByUrl.values();
+        std::sort(sortedPosts.begin(), sortedPosts.end(),
+                  [](const QJsonObject &a, const QJsonObject &b) {
+                      return a.value(QStringLiteral("views")).toInteger()
+                           > b.value(QStringLiteral("views")).toInteger();
+                  });
+        QJsonArray outArr;
+        for (int i = 0; i < qMin<int>(60, sortedPosts.size()); ++i)
+        {
+            outArr.append(sortedPosts[i]);
+        }
+        const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+        if (wd.exists())
+        {
+            QSaveFile sf{wd.filePath(QStringLiteral("account_top_posts.json"))};
+            if (sf.open(QIODevice::WriteOnly))
+            {
+                sf.write(QJsonDocument{QJsonObject{
+                    {QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+                    {QStringLiteral("posts"), outArr}
+                }}.toJson(QJsonDocument::Indented));
+                sf.commit();
+            }
+        }
+    }
+    if (harvestedHashtags > 0 || harvestedHooks > 0)
+    {
+        appendRetrieveStatsLog(
+            QStringLiteral("Harvested %1 winning hashtag(s) and %2 winning hook(s) into Inspiration bank.")
+                .arg(harvestedHashtags)
+                .arg(harvestedHooks));
     }
 
     appendRetrieveStatsLog(

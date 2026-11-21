@@ -4,6 +4,7 @@
 #include "gui/MainWindow.h"
 
 #include "model/PreferredHashtags.h"
+#include "model/research/ResearchCommand.h"
 
 #include <QApplication>
 #include <QDir>
@@ -123,6 +124,11 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationName("GRDF");
     QCoreApplication::setOrganizationDomain("grdf.fr");
     QCoreApplication::setApplicationName("QuantumSocial");
+    if (argc > 1 && QString::fromLocal8Bit(argv[1]) == QLatin1String("research"))
+    {
+        QCoreApplication app(argc, argv);
+        return ResearchCommand::run(app.arguments());
+    }
     QApplication a(argc, argv);
     WorkingDirectoryManager::instance()->installDarkOrangePalette();
 

@@ -5,8 +5,11 @@
 #include "PaneStatistics.h"
 #include "ui_PaneStatistics.h"
 
+#include <QDesktopServices>
 #include <QHeaderView>
+#include <QMessageBox>
 #include <QPushButton>
+#include <QUrl>
 
 #include "../../../common/workingdirectory/WorkingDirectoryManager.h"
 
@@ -25,13 +28,17 @@ PaneStatistics::PaneStatistics(TableVideos *videos, StatisticsScheduler *schedul
 
 PaneStatistics::PaneStatistics(TableVideos *videos, StatisticsScheduler *scheduler,
                                TableAccounts *accounts, TableProjects *projects,
-                               QWidget *parent)
+                               QWidget *parent,
+                               PreferredHashtags *hashtags,
+                               FavoriteHooks *favoriteHooks)
     : QWidget(parent)
     , ui(new Ui::PaneStatistics)
     , m_videos(videos)
     , m_scheduler(scheduler)
     , m_accounts(accounts)
     , m_projects(projects)
+    , m_hashtags(hashtags)
+    , m_favoriteHooks(favoriteHooks)
     , m_model(nullptr)
 {
     ui->setupUi(this);
@@ -72,6 +79,14 @@ PaneStatistics::PaneStatistics(TableVideos *videos, StatisticsScheduler *schedul
     connect(ui->buttonRetrieve, &QPushButton::clicked, this, [this]() {
         m_retrieveStatisticsTask = _retrieveStatistics();
     });
+
+    auto *btnOpenPost = new QPushButton(tr("Open Post in Browser"), this);
+    btnOpenPost->setObjectName(QStringLiteral("buttonOpenStatPostInBrowser"));
+    btnOpenPost->setToolTip(tr("Open the selected published post URL (or double-click any row) in your browser."));
+    ui->horizontalLayout->insertWidget(1, btnOpenPost);
+    connect(btnOpenPost, &QPushButton::clicked, this, &PaneStatistics::_openSelectedPostInBrowser);
+    connect(ui->tableViewStatistics, &QTableView::doubleClicked,
+            this, [this](const QModelIndex &) { _openSelectedPostInBrowser(); });
 }
 
 PaneStatistics::~PaneStatistics()
@@ -86,5 +101,44 @@ TableVideoStatistics *PaneStatistics::statisticsModel() const
 
 QCoro::Task<void> PaneStatistics::_retrieveStatistics()
 {
-    co_await SocialStatistics::retrieveFromAccounts(m_accounts, m_videos, this);
+    co_await SocialStatistics::retrieveFromAccounts(
+        m_accounts, m_videos, this, m_hashtags, m_favoriteHooks);
+}
+
+void PaneStatistics::_openSelectedPostInBrowser()
+{
+    if (!m_model || !m_videos)
+    {
+        return;
+    }
+    const QModelIndex cur = ui->tableViewStatistics->currentIndex();
+    if (!cur.isValid())
+    {
+        QMessageBox::information(this, tr("No post selected"),
+            tr("Select a published post in the Statistics table first."));
+        return;
+    }
+    const QUuid vid = m_model->videoIdAt(cur.row());
+    const auto *rec = m_videos->recordFromId(vid);
+    if (!rec || rec->publications.isEmpty())
+    {
+        return;
+    }
+    QString bestUrl;
+    for (const auto &pub : rec->publications)
+    {
+        if (!pub.postUrl.isEmpty() && !pub.postUrl.contains(QLatin1Char('#')))
+        {
+            bestUrl = pub.postUrl;
+            break;
+        }
+    }
+    if (bestUrl.isEmpty())
+    {
+        bestUrl = rec->publications.first().postUrl;
+    }
+    if (!bestUrl.isEmpty())
+    {
+        QDesktopServices::openUrl(QUrl{bestUrl});
+    }
 }

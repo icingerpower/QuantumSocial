@@ -5,6 +5,16 @@ include(${CMAKE_CURRENT_LIST_DIR}/videogen/videogen.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/videos/videos.cmake)
 
 SET(MODEL_FILES
+    ${CMAKE_CURRENT_LIST_DIR}/research/ResearchCommand.h
+    ${CMAKE_CURRENT_LIST_DIR}/research/ResearchCommand.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/research/ProductSource.h
+    ${CMAKE_CURRENT_LIST_DIR}/research/ProductSource.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/research/ResearchStore.h
+    ${CMAKE_CURRENT_LIST_DIR}/research/ResearchStore.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/research/ReferenceAssessor.h
+    ${CMAKE_CURRENT_LIST_DIR}/research/ReferenceAssessor.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/research/ResearchProject.h
+    ${CMAKE_CURRENT_LIST_DIR}/research/ResearchProject.cpp
     ${CMAKE_CURRENT_LIST_DIR}/TableAccounts.h
     ${CMAKE_CURRENT_LIST_DIR}/TableAccounts.cpp
     ${CMAKE_CURRENT_LIST_DIR}/TableProjects.h

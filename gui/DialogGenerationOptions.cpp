@@ -18,10 +18,13 @@ DialogGenerationOptions::DialogGenerationOptions(
     const QList<AbstractCli *> &availableClis, bool hasImage,
     bool hasPreviousGenerated, const QString &previousGeneratedImagePath,
     bool hasSecondaryImage,
-    QWidget *parent)
+    QWidget *parent,
+    bool hasResearchReference,
+    const QString &researchReferencePreviewPath)
     : QDialog(parent)
     , ui(new Ui::DialogGenerationOptions)
     , m_hasSecondaryImage(hasSecondaryImage)
+    , m_hasResearchReference(hasResearchReference)
 {
     ui->setupUi(this);
 
@@ -29,16 +32,20 @@ DialogGenerationOptions::DialogGenerationOptions(
     // (imageMode() stays KeepInput through the hidden default radio).
     ui->groupInputImage->setVisible(hasImage);
     ui->radioReusePrevious->setVisible(hasPreviousGenerated);
+    ui->radioReplaceReferenceProduct->setVisible(hasResearchReference);
+    ui->lineEditSwapInstruction->setVisible(hasResearchReference);
 
     if (hasPreviousGenerated)
     {
         m_previousImagePixmap = QPixmap{previousGeneratedImagePath};
     }
-    ui->groupPreviousImagePreview->setVisible(!m_previousImagePixmap.isNull());
-    if (!m_previousImagePixmap.isNull())
+    if (hasResearchReference && !researchReferencePreviewPath.isEmpty())
+    {
+        m_researchReferencePixmap = QPixmap{researchReferencePreviewPath};
+    }
+    if (!m_previousImagePixmap.isNull() || !m_researchReferencePixmap.isNull())
     {
         ui->labelPreviousImagePreview->installEventFilter(this);
-        _rescalePreviousImagePreview();
     }
 
     for (AbstractCli *cli : availableClis)
@@ -52,6 +59,8 @@ DialogGenerationOptions::DialogGenerationOptions(
     {
         // Without an image-capable CLI only "keep as it is" can work.
         const QString why = tr("No image-capable CLI is available.");
+        ui->radioReplaceReferenceProduct->setEnabled(false);
+        ui->radioReplaceReferenceProduct->setToolTip(why);
         ui->radioRegenerate->setEnabled(false);
         ui->radioRegenerate->setToolTip(why);
         ui->radioBootstrap->setEnabled(false);
@@ -65,6 +74,12 @@ DialogGenerationOptions::DialogGenerationOptions(
         // A regenerated image already exists: preselect its reuse so a
         // re-run does not silently redo the (slow) image step.
         ui->radioReusePrevious->setChecked(true);
+    }
+    else if (hasResearchReference && ui->radioReplaceReferenceProduct->isEnabled())
+    {
+        // Research project with a Pinterest/social reference: preselect replacing
+        // the reference's product with our product before animating.
+        ui->radioReplaceReferenceProduct->setChecked(true);
     }
     else if (savedMode == static_cast<int>(ImageMode::RegenerateInput)
              && ui->radioRegenerate->isEnabled())
@@ -101,6 +116,8 @@ DialogGenerationOptions::DialogGenerationOptions(
             this, &DialogGenerationOptions::_updateCliEnabled);
     connect(ui->radioReusePrevious, &QRadioButton::toggled,
             this, &DialogGenerationOptions::_updateCliEnabled);
+    connect(ui->radioReplaceReferenceProduct, &QRadioButton::toggled,
+            this, &DialogGenerationOptions::_updateCliEnabled);
     connect(ui->radioRegenerate, &QRadioButton::toggled,
             this, &DialogGenerationOptions::_updateCliEnabled);
     connect(ui->radioBootstrap, &QRadioButton::toggled,
@@ -124,7 +141,22 @@ bool DialogGenerationOptions::eventFilter(QObject *watched, QEvent *event)
 
 void DialogGenerationOptions::_rescalePreviousImagePreview()
 {
-    ui->labelPreviousImagePreview->setPixmap(m_previousImagePixmap.scaled(
+    const bool showRef = ui->radioReplaceReferenceProduct->isChecked()
+        && !m_researchReferencePixmap.isNull();
+    const QPixmap &activePixmap = showRef
+        ? m_researchReferencePixmap
+        : (!m_previousImagePixmap.isNull() ? m_previousImagePixmap : m_researchReferencePixmap);
+    if (activePixmap.isNull())
+    {
+        ui->groupPreviousImagePreview->setVisible(false);
+        return;
+    }
+    ui->groupPreviousImagePreview->setTitle(
+        (showRef || m_previousImagePixmap.isNull())
+            ? tr("Reference scene to adapt")
+            : tr("Previously regenerated image"));
+    ui->groupPreviousImagePreview->setVisible(true);
+    ui->labelPreviousImagePreview->setPixmap(activePixmap.scaled(
         ui->labelPreviousImagePreview->size(), Qt::KeepAspectRatio,
         Qt::SmoothTransformation));
 }
@@ -167,6 +199,10 @@ DialogGenerationOptions::ImageMode DialogGenerationOptions::imageMode() const
     {
         return ImageMode::ReusePrevious;
     }
+    if (m_hasResearchReference && ui->radioReplaceReferenceProduct->isChecked())
+    {
+        return ImageMode::ReplaceReferenceProduct;
+    }
     if (ui->radioRegenerate->isChecked())
     {
         return ImageMode::RegenerateInput;
@@ -196,7 +232,10 @@ void DialogGenerationOptions::accept()
     // hidden defaults overwrite the remembered ones.
     if (ui->groupInputImage->isVisibleTo(this))
     {
-        settings.setValue(SETTING_MODE, static_cast<int>(imageMode()));
+        if (imageMode() != ImageMode::ReplaceReferenceProduct)
+        {
+            settings.setValue(SETTING_MODE, static_cast<int>(imageMode()));
+        }
         settings.setValue(SETTING_WHITE_BACKGROUND, ui->checkBoxWhiteBackground->isChecked());
         if (m_hasSecondaryImage)
         {
@@ -213,15 +252,26 @@ void DialogGenerationOptions::accept()
 void DialogGenerationOptions::_updateCliEnabled()
 {
     const ImageMode mode = imageMode();
-    ui->comboBoxCli->setEnabled((mode == ImageMode::RegenerateInput
+    ui->comboBoxCli->setEnabled((mode == ImageMode::ReplaceReferenceProduct
+                                 || mode == ImageMode::RegenerateInput
                                  || mode == ImageMode::BootstrapImage)
                                 && ui->comboBoxCli->count() > 0);
     ui->labelCli->setEnabled(ui->comboBoxCli->isEnabled());
+    ui->lineEditSwapInstruction->setEnabled(
+        m_hasResearchReference && mode == ImageMode::ReplaceReferenceProduct);
     // Only makes sense for RegenerateInput — disabled (and left unchecked
     // when not applicable) rather than hidden, so its state isn't lost by
     // toggling between radios back and forth.
     ui->checkBoxWhiteBackground->setEnabled(mode == ImageMode::RegenerateInput);
     ui->checkBoxApplyBoth->setEnabled(m_hasSecondaryImage && mode == ImageMode::RegenerateInput);
+    _rescalePreviousImagePreview();
+}
+
+QString DialogGenerationOptions::swapInstruction() const
+{
+    return (m_hasResearchReference && ui->radioReplaceReferenceProduct->isChecked())
+        ? ui->lineEditSwapInstruction->text().trimmed()
+        : QString{};
 }
 
 bool DialogGenerationOptions::whiteBackgroundProduct() const

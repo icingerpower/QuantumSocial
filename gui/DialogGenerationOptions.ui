@@ -40,6 +40,43 @@
          </widget>
         </item>
         <item>
+         <widget class="QRadioButton" name="radioReplaceReferenceProduct">
+          <property name="text">
+           <string>Replace product in reference video / image with my product (recommended)</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="horizontalLayoutSwapInstruction">
+          <item>
+           <spacer name="horizontalSpacerSwapInstruction">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+            <property name="sizeType">
+             <enum>QSizePolicy::Policy::Fixed</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>20</width>
+              <height>1</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QLineEdit" name="lineEditSwapInstruction">
+            <property name="placeholderText">
+             <string>Optional note for image step (e.g. &quot;keep close-up on heels&quot;, &quot;match evening dress&quot;)…</string>
+            </property>
+            <property name="clearButtonEnabled">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
          <widget class="QRadioButton" name="radioRegenerate">
           <property name="text">
            <string>Regenerate the input (remove social icons / text, improve quality)</string>

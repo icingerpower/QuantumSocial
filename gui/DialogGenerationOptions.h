@@ -25,10 +25,11 @@ class DialogGenerationOptions : public QDialog
 public:
     enum class ImageMode
     {
-        KeepInput,        // use the source image untouched
-        RegenerateInput,  // same image, cleaned (no social icons/text) + quality
-        BootstrapImage,   // a close but different image is generated
-        ReusePrevious,    // reuse generation_source.png from an earlier run
+        KeepInput,               // use the source image untouched
+        RegenerateInput,         // same image, cleaned (no social icons/text) + quality
+        BootstrapImage,          // a close but different image is generated
+        ReusePrevious,           // reuse generation_source.png from an earlier run
+        ReplaceReferenceProduct, // recreate the reference video/image scene replacing its product with our product
     };
 
     enum class VideoFormat
@@ -49,7 +50,9 @@ public:
                                      bool hasPreviousGenerated,
                                      const QString &previousGeneratedImagePath,
                                      bool hasSecondaryImage = false,
-                                     QWidget *parent = nullptr);
+                                     QWidget *parent = nullptr,
+                                     bool hasResearchReference = false,
+                                     const QString &researchReferencePreviewPath = QString{});
     ~DialogGenerationOptions();
 
     // Human-readable form used inside prompts, e.g. "vertical (9:16)".
@@ -69,6 +72,8 @@ public:
     // whether to apply the regeneration step to both images instead of only
     // the primary one.
     bool applyToBothImages() const;
+    // Optional extra instruction when imageMode() == ReplaceReferenceProduct.
+    QString swapInstruction() const;
 
     void accept() override;
 
@@ -85,7 +90,9 @@ private slots:
 private:
     Ui::DialogGenerationOptions *ui;
     QPixmap m_previousImagePixmap;
+    QPixmap m_researchReferencePixmap;
     bool m_hasSecondaryImage = false;
+    bool m_hasResearchReference = false;
 
     void _rescalePreviousImagePreview();
 };

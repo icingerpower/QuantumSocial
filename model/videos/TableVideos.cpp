@@ -567,6 +567,15 @@ void TableVideos::addPublication(const QUuid &videoId, const QString &platformId
     {
         return;
     }
+    const auto isConcretePostUrl = [](const QString &u) {
+        return !u.contains(QLatin1Char('#'))
+            && (u.contains(QLatin1String("/video/"), Qt::CaseInsensitive)
+                || u.contains(QLatin1String("/photo/"), Qt::CaseInsensitive)
+                || u.contains(QLatin1String("/pin/"), Qt::CaseInsensitive)
+                || u.contains(QLatin1String("/shorts/"), Qt::CaseInsensitive)
+                || u.contains(QLatin1String("/reel/"), Qt::CaseInsensitive)
+                || u.contains(QLatin1String("watch?v="), Qt::CaseInsensitive));
+    };
     record->published = true;
     for (Publication &existing : record->publications)
     {
@@ -577,6 +586,26 @@ void TableVideos::addPublication(const QUuid &videoId, const QString &platformId
                 existing.platformId = platformId;
             }
             if (!existing.publishDate.isValid() && publishDate.isValid())
+            {
+                existing.publishDate = publishDate;
+            }
+            if (existing.followersAtPublish <= 0 && followersAtPublish > 0)
+            {
+                existing.followersAtPublish = followersAtPublish;
+            }
+            _emitRowChanged(rowOfId(videoId));
+            _saveInFile();
+            return;
+        }
+        // Upgrade a profile-level placeholder URL (recorded at publish time before
+        // the platform assigned a post ID) to the real discovered post URL in-place.
+        if (existing.platformId == platformId
+            && !isConcretePostUrl(existing.postUrl)
+            && isConcretePostUrl(postUrl))
+        {
+            existing.postUrl = postUrl;
+            existing.snapshots.clear();
+            if (publishDate.isValid())
             {
                 existing.publishDate = publishDate;
             }
@@ -678,7 +707,16 @@ QList<TableVideos::DuePublication> TableVideos::duePublications(const QDateTime 
     {
         for (const Publication &publication : record.publications)
         {
-            if (publication.postUrl.isEmpty() || !publication.publishDate.isValid())
+            const QString &u = publication.postUrl;
+            const bool isPostUrl = !u.isEmpty()
+                && !u.contains(QLatin1Char('#'))
+                && (u.contains(QLatin1String("/video/"), Qt::CaseInsensitive)
+                    || u.contains(QLatin1String("/photo/"), Qt::CaseInsensitive)
+                    || u.contains(QLatin1String("/pin/"), Qt::CaseInsensitive)
+                    || u.contains(QLatin1String("/shorts/"), Qt::CaseInsensitive)
+                    || u.contains(QLatin1String("/reel/"), Qt::CaseInsensitive)
+                    || u.contains(QLatin1String("watch?v="), Qt::CaseInsensitive));
+            if (!isPostUrl || !publication.publishDate.isValid())
             {
                 continue;
             }

@@ -33,7 +33,21 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-PROFILE_DIR = os.path.expanduser("~/.cache/quantumsocial/tiktok-profile")
+CACHE_ROOT = os.path.expanduser("~/.cache/quantumsocial")
+
+
+def _resolve_profile_dir(video_url):
+    m = re.search(r"/@([A-Za-z0-9._-]+)", video_url or "")
+    if m:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", m.group(1).lower())
+        cand = os.path.join(CACHE_ROOT, f"publish-tiktok-{safe}")
+        if os.path.isdir(cand):
+            return cand
+    if os.path.isdir(CACHE_ROOT):
+        for name in sorted(os.listdir(CACHE_ROOT)):
+            if name.startswith("publish-tiktok-"):
+                return os.path.join(CACHE_ROOT, name)
+    return os.path.join(CACHE_ROOT, "tiktok-profile")
 
 LOGGED_OUT_MARKERS = ("Log in", "Se connecter")
 LOGIN_WAIT_TIMEOUT_S = 300
@@ -125,10 +139,18 @@ def _fetch_analytics(playwright, url):
     analytics_url = ("https://www.tiktok.com/tiktokstudio/analytics/video/"
                      + video_id_m.group(1))
 
-    os.makedirs(PROFILE_DIR, exist_ok=True)
-    context = playwright.chromium.launch_persistent_context(
-        PROFILE_DIR, headless=False, user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 900})
+    profile_dir = _resolve_profile_dir(url)
+    os.makedirs(profile_dir, exist_ok=True)
+    try:
+        context = playwright.chromium.launch_persistent_context(
+            profile_dir, channel="chrome", headless=False, user_agent=USER_AGENT,
+            ignore_default_args=["--enable-automation"],
+            args=["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"],
+            viewport={"width": 1280, "height": 900})
+    except Exception:
+        context = playwright.chromium.launch_persistent_context(
+            profile_dir, headless=False, user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900})
     try:
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(analytics_url, wait_until="domcontentloaded", timeout=30000)

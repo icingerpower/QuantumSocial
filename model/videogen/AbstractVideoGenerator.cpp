@@ -66,8 +66,21 @@ void AbstractVideoGenerator::stopAllWorkers()
 }
 
 AbstractVideoGenerator::Recorder::Recorder(AbstractVideoGenerator *generator)
+    : m_id(generator ? generator->getId() : QString{})
+    , m_generator(generator)
 {
-    getGenerators().insert(generator->getId(), generator);
+    if (m_generator)
+    {
+        getGenerators().insert(m_id, m_generator);
+    }
+}
+
+AbstractVideoGenerator::Recorder::~Recorder()
+{
+    if (!m_id.isEmpty() && getGenerators().value(m_id) == m_generator)
+    {
+        getGenerators().remove(m_id);
+    }
 }
 
 const QMap<QString, AbstractVideoGenerator *> &AbstractVideoGenerator::ALL_VIDEO_GENERATORS()

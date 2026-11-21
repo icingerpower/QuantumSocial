@@ -130,7 +130,9 @@ public:
                                   const QList<AbstractCli *> &availableClis,
                                   SavedPrompts *savedPrompts,
                                   const QString &videoFormatLabel,
-                                  QWidget *parent = nullptr);
+                                  QWidget *parent = nullptr,
+                                  const QStringList &initialStrategyPrompts = {},
+                                  bool preferVideoOnly = false);
     ~DialogGenerationPlan();
 
     // Every ticked option's prompt AND the A/B-test values confirmed for IT
@@ -212,7 +214,8 @@ private:
 
     OptionSection _makeSection(const QString &title,
                                const QList<QList<PlanProperty>> &propertiesPerStrategy,
-                               bool checked);
+                               bool checked,
+                               const QStringList &initialPrompts = {});
     // Repopulates every tracked saved-prompt combo from m_savedPrompts,
     // preserving each combo's current text selection where it still exists.
     void _refreshSavedPromptCombos();

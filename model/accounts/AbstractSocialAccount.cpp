@@ -7,6 +7,7 @@
 
 #include <QCoro/QCoroTimer>
 #include <chrono>
+#include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFileInfo>
@@ -14,8 +15,10 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QTemporaryFile>
 #include <QTimeZone>
 
 #ifndef SOCIAL_STATS_SCRIPT_DIR
@@ -133,6 +136,61 @@ AbstractSocialAccount::fetchAccountVideoStatistics(
     co_return result;
 }
 
+bool AbstractSocialAccount::supportsSpyScrollAndSave() const
+{
+    return false;
+}
+
+QString AbstractSocialAccount::defaultSpySearchUrl(const QString &query) const
+{
+    Q_UNUSED(query);
+    return QString{};
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::spyScrollAndSave(
+    const QString &queryOrUrl,
+    const QString &downloadDir,
+    int maxPosts,
+    bool autoScroll,
+    int minEngagement,
+    const QStringList &excludeUrls,
+    int maxDaysOld) const
+{
+    Q_UNUSED(queryOrUrl);
+    Q_UNUSED(downloadDir);
+    Q_UNUSED(maxPosts);
+    Q_UNUSED(autoScroll);
+    Q_UNUSED(minEngagement);
+    Q_UNUSED(excludeUrls);
+    Q_UNUSED(maxDaysOld);
+    SpyResult result;
+    result.notSupported = true;
+    result.errorMessage = QObject::tr("Scroll & save for %1 is not supported yet.")
+        .arg(getName());
+    co_return result;
+}
+
+bool AbstractSocialAccount::supportsAutoPublish() const
+{
+    return false;
+}
+
+QCoro::Task<AbstractSocialAccount::PublishResult> AbstractSocialAccount::publishCreative(
+    const PublishRequest &request,
+    const std::function<void(const QString &)> &onLog,
+    std::shared_ptr<bool> cancelFlag) const
+{
+    Q_UNUSED(request);
+    Q_UNUSED(onLog);
+    Q_UNUSED(cancelFlag);
+    PublishResult result;
+    result.notSupported = true;
+    result.fatal = true;
+    result.errorMessage = QObject::tr("Auto-publish for %1 is not supported yet.")
+        .arg(getName());
+    co_return result;
+}
+
 QString AbstractSocialAccount::extractShortCode(const QString &text)
 {
     static const QRegularExpression pattern(
@@ -161,7 +219,10 @@ AbstractSocialAccount::StatSource AbstractSocialAccount::statSourceFromKey(const
 }
 
 QCoro::Task<QJsonObject> AbstractSocialAccount::_runJsonScript(
-    const QString &scriptFileName, const QStringList &args) const
+    const QString &scriptFileName,
+    const QStringList &args,
+    qint64 timeoutMs,
+    const QString &excludeFilePath) const
 {
     const auto errorObject = [](const QString &message) {
         return QJsonObject{{QStringLiteral("error"), message}};
@@ -182,6 +243,12 @@ QCoro::Task<QJsonObject> AbstractSocialAccount::_runJsonScript(
     }
 
     QProcess process;
+    if (!excludeFilePath.isEmpty())
+    {
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("QS_SPY_EXCLUDE_FILE"), excludeFilePath);
+        process.setProcessEnvironment(env);
+    }
     process.start(python, QStringList{scriptPath} + args);
 
     // Observe the process on timer ticks, outside its signal delivery. A
@@ -202,12 +269,13 @@ QCoro::Task<QJsonObject> AbstractSocialAccount::_runJsonScript(
             .arg(process.errorString()));
     }
 
-    // Generous timeout: most scripts finish in a few seconds, but some (e.g.
-    // Pinterest, or any analytics fetch) may open a visible browser and wait
-    // several minutes for the user to log in interactively before they can
-    // proceed.
+    // Generous timeout for background stats scripts (default 6 min), or
+    // unbounded (timeoutMs <= 0) for interactive Scroll & save sessions that
+    // pause until a human completes login or CAPTCHA in the visible browser.
     timer.restart();
-    while (process.state() != QProcess::NotRunning && timer.elapsed() < 360'000)
+    while (process.state() != QProcess::NotRunning
+        && !QCoreApplication::closingDown()
+        && (timeoutMs <= 0 || timer.elapsed() < timeoutMs))
     {
         co_await QCoro::sleepFor(std::chrono::milliseconds(100));
     }
@@ -215,7 +283,9 @@ QCoro::Task<QJsonObject> AbstractSocialAccount::_runJsonScript(
     {
         process.kill();
         process.waitForFinished(5'000);
-        co_return errorObject(QObject::tr("The statistics fetcher timed out."));
+        co_return errorObject(QCoreApplication::closingDown()
+            ? QObject::tr("Application is closing.")
+            : QObject::tr("The statistics fetcher timed out."));
     }
 
     const QByteArray output = process.readAllStandardOutput().trimmed();
@@ -302,5 +372,224 @@ AbstractSocialAccount::runAccountVideosScript(
         result.posts << post;
     }
 
+    co_return result;
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::runSpyScript(
+    const QString &scriptFileName,
+    const QString &queryOrUrl,
+    const QString &downloadDir,
+    int maxPosts,
+    bool autoScroll,
+    int minEngagement,
+    const QStringList &excludeUrls,
+    int maxDaysOld) const
+{
+    const QString mode = autoScroll ? QStringLiteral("auto") : QStringLiteral("manual");
+    const QStringList args{
+        queryOrUrl,
+        downloadDir,
+        QString::number(qMax(1, maxPosts)),
+        mode,
+        QString::number(qMax(0, minEngagement)),
+        QString::number(qMax(0, maxDaysOld))
+    };
+
+    QTemporaryFile excludeFile;
+    QString excludeFilePath;
+    if (!excludeUrls.isEmpty() && excludeFile.open())
+    {
+        const QByteArray payload = QJsonDocument(QJsonArray::fromStringList(excludeUrls)).toJson(QJsonDocument::Compact);
+        excludeFile.write(payload);
+        excludeFile.flush();
+        excludeFilePath = excludeFile.fileName();
+    }
+
+    const qint64 timeoutMs = qEnvironmentVariableIntValue("QS_SPY_HEADLESS") == 1 ? 60'000 : 0;
+    QJsonObject object;
+    object = co_await _runJsonScript(scriptFileName, args, timeoutMs, excludeFilePath);
+
+    SpyResult result;
+    result.errorMessage = object.value(QStringLiteral("error")).toString();
+    result.minEngagement = object.value(QStringLiteral("min_score")).toInt(qMax(0, minEngagement));
+    result.maxDaysOld = object.value(QStringLiteral("max_days_old")).toInt(qMax(0, maxDaysOld));
+    result.browsedCount = object.value(QStringLiteral("browsed_count")).toInt(0);
+    result.savedCount = object.value(QStringLiteral("saved_count")).toInt(0);
+    result.rejectedCount = object.value(QStringLiteral("rejected_count")).toInt(0);
+
+    for (const QJsonValue &postValue : object.value(QStringLiteral("posts")).toArray())
+    {
+        if (!postValue.isObject())
+        {
+            continue;
+        }
+        const QJsonObject postObj = postValue.toObject();
+        SpyPost post;
+        post.postUrl = postObj.value(QStringLiteral("url")).toString().trimmed();
+        post.title = postObj.value(QStringLiteral("title")).toString().trimmed();
+        post.mediaUrl = postObj.value(QStringLiteral("media_url")).toString().trimmed();
+        post.localMediaPath = postObj.value(QStringLiteral("local_media")).toString().trimmed();
+        post.author = postObj.value(QStringLiteral("author")).toString().trimmed();
+        post.publishedAt = postObj.value(QStringLiteral("published_at")).toString().trimmed();
+        post.views = jsonStat(postObj, QStringLiteral("views"));
+        post.likes = jsonStat(postObj, QStringLiteral("likes"));
+        post.comments = jsonStat(postObj, QStringLiteral("comments"));
+        post.shares = jsonStat(postObj, QStringLiteral("shares"));
+        post.isAd = postObj.value(QStringLiteral("is_ad")).toBool(false);
+        if (!post.postUrl.isEmpty() || !post.localMediaPath.isEmpty())
+        {
+            result.posts << post;
+        }
+    }
+
+    if (result.savedCount <= 0 && !result.posts.isEmpty())
+    {
+        result.savedCount = result.posts.size();
+    }
+    if (result.browsedCount < result.savedCount + result.rejectedCount)
+    {
+        result.browsedCount = result.savedCount + result.rejectedCount;
+    }
+
+    co_return result;
+}
+
+QCoro::Task<AbstractSocialAccount::PublishResult> AbstractSocialAccount::runPublishScript(
+    const QString &scriptFileName,
+    const PublishRequest &request,
+    std::function<void(const QString &)> onLog,
+    std::shared_ptr<bool> cancelFlag) const
+{
+    PublishResult result;
+    const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
+    if (python.isEmpty())
+    {
+        result.fatal = true;
+        result.errorMessage = QObject::tr("python3 was not found on PATH.");
+        co_return result;
+    }
+
+    const QString scriptPath = QDir(QString::fromUtf8(SOCIAL_STATS_SCRIPT_DIR))
+        .filePath(scriptFileName);
+    if (!QFileInfo::exists(scriptPath))
+    {
+        result.fatal = true;
+        result.errorMessage = QObject::tr("Publish script not found at %1.").arg(scriptPath);
+        co_return result;
+    }
+
+    QTemporaryFile reqFile;
+    if (!reqFile.open())
+    {
+        result.fatal = true;
+        result.errorMessage = QObject::tr("Could not create temporary publish request file.");
+        co_return result;
+    }
+    const QJsonObject reqObj{
+        {QStringLiteral("accountUrl"), request.accountUrl},
+        {QStringLiteral("mediaPaths"), QJsonArray::fromStringList(request.mediaPaths)},
+        {QStringLiteral("caption"), request.caption},
+        {QStringLiteral("shortCode"), request.shortCode},
+        {QStringLiteral("useSystemChromeProfile"), request.useSystemChromeProfile},
+        {QStringLiteral("muteOriginalAudio"), request.muteOriginalAudio},
+        {QStringLiteral("useSuggestedSound"), request.useSuggestedSound},
+        {QStringLiteral("dryRun"), request.dryRun},
+        {QStringLiteral("uploadUrlOverride"), request.uploadUrlOverride}
+    };
+    reqFile.write(QJsonDocument(reqObj).toJson(QJsonDocument::Compact));
+    reqFile.flush();
+
+    QProcess process;
+    process.start(python, {scriptPath, reqFile.fileName()});
+
+    QByteArray stderrBuffer;
+    const auto flushStderrLines = [&]() {
+        stderrBuffer += process.readAllStandardError();
+        while (true)
+        {
+            const qsizetype nl = stderrBuffer.indexOf('\n');
+            if (nl < 0)
+            {
+                break;
+            }
+            const QString line = QString::fromUtf8(stderrBuffer.left(nl)).trimmed();
+            stderrBuffer.remove(0, nl + 1);
+            if (!line.isEmpty() && onLog)
+            {
+                onLog(line);
+            }
+        }
+    };
+
+    QElapsedTimer timer;
+    timer.start();
+    while (process.state() == QProcess::Starting && timer.elapsed() < 30'000)
+    {
+        co_await QCoro::sleepFor(std::chrono::milliseconds(100));
+    }
+    if (process.state() == QProcess::Starting || process.error() == QProcess::FailedToStart)
+    {
+        process.kill();
+        process.waitForFinished(3'000);
+        result.fatal = true;
+        result.errorMessage = QObject::tr("Could not start publish worker (%1).")
+            .arg(process.errorString());
+        co_return result;
+    }
+
+    const qint64 timeoutMs = qEnvironmentVariableIntValue("QS_PUBLISH_HEADLESS") == 1 ? 60'000 : 0;
+    timer.restart();
+    while (process.state() != QProcess::NotRunning
+           && !QCoreApplication::closingDown()
+           && !(cancelFlag && *cancelFlag)
+           && (timeoutMs <= 0 || timer.elapsed() < timeoutMs))
+    {
+        flushStderrLines();
+        co_await QCoro::sleepFor(std::chrono::milliseconds(100));
+    }
+    flushStderrLines();
+
+    if (process.state() != QProcess::NotRunning)
+    {
+        process.terminate();
+        if (!process.waitForFinished(2'500))
+        {
+            process.kill();
+            process.waitForFinished(2'000);
+        }
+        result.fatal = true;
+        result.errorMessage = (cancelFlag && *cancelFlag)
+            ? QObject::tr("Publish job stopped by user.")
+            : QObject::tr("Publish worker timed out.");
+        co_return result;
+    }
+
+    if (!stderrBuffer.trimmed().isEmpty() && onLog)
+    {
+        onLog(QString::fromUtf8(stderrBuffer).trimmed());
+    }
+
+    const QByteArray stdoutBytes = process.readAllStandardOutput().trimmed();
+    const qsizetype lastNl = stdoutBytes.lastIndexOf('\n');
+    const QByteArray jsonLine = lastNl >= 0 ? stdoutBytes.mid(lastNl + 1).trimmed() : stdoutBytes;
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(jsonLine, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+    {
+        result.fatal = true;
+        result.errorMessage = QObject::tr("Unexpected output from publish worker: %1")
+            .arg(QString::fromUtf8(stdoutBytes).left(240));
+        co_return result;
+    }
+
+    const QJsonObject obj = doc.object();
+    result.published = obj.value(QStringLiteral("published")).toBool(false);
+    result.dryRun = obj.value(QStringLiteral("dry_run")).toBool(false);
+    result.fatal = obj.value(QStringLiteral("fatal")).toBool(false);
+    result.postUrl = obj.value(QStringLiteral("post_url")).toString().trimmed();
+    result.soundTitle = obj.value(QStringLiteral("sound_title")).toString().trimmed();
+    result.logFilePath = obj.value(QStringLiteral("log_file")).toString().trimmed();
+    result.screenshotPath = obj.value(QStringLiteral("screenshot")).toString().trimmed();
+    result.errorMessage = obj.value(QStringLiteral("error")).toString().trimmed();
     co_return result;
 }

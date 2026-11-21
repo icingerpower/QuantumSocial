@@ -3,6 +3,9 @@
 #include "panes/PaneAccounts.h"
 #include "panes/PaneGeneration.h"
 #include "panes/PaneInspiration.h"
+#include "panes/PanePublishing.h"
+#include "panes/PaneResearch.h"
+#include "model/research/ResearchStore.h"
 #include "panes/PaneProperties.h"
 #include "panes/PaneSettings.h"
 #include "panes/PaneStatistics.h"
@@ -89,6 +92,10 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     ui->tabWidget->addTab(new PaneAccounts(m_accounts, this), tr("Accounts"));
+    auto *researchStore = new ResearchStore(workingDir.absolutePath());
+    auto *research = new PaneResearch(m_accounts, researchStore, m_availableClis, this);
+    researchStore->setParent(research);
+    ui->tabWidget->addTab(research, tr("Research"));
     ui->tabWidget->addTab(new PaneInspiration(m_hashtags, m_favoriteHooks,
                                               m_favoriteVideoPrompts,
                                               m_availableCliTable, this),
@@ -99,10 +106,29 @@ MainWindow::MainWindow(QWidget *parent)
                                               m_favoriteVideoPrompts, m_savedPrompts, this);
     paneGeneration->setAvailableClis(m_availableClis);
     ui->tabWidget->addTab(paneGeneration, tr("Generation"));
+    auto *panePublishing = new PanePublishing(m_accounts, paneGeneration->projectsModel(),
+                                              m_videos, m_availableClis, this,
+                                              m_hashtags, m_favoriteHooks);
+    ui->tabWidget->addTab(panePublishing, tr("Publishing"));
+    connect(paneGeneration, &PaneGeneration::autoPublishRequested, this,
+            [this, panePublishing]() {
+        ui->tabWidget->setCurrentWidget(panePublishing);
+        panePublishing->openAutoPublishDialog();
+    });
+    connect(research, &PaneResearch::createProjectRequested, this,
+            [this, paneGeneration](const QJsonObject &context, const QString &image) {
+        if (paneGeneration->createResearchProject(context, image)) ui->tabWidget->setCurrentWidget(paneGeneration);
+    });
+    connect(research, &PaneResearch::autoBatchRequested, this,
+            [this, paneGeneration](const QJsonObject &batchSpec) {
+        ui->tabWidget->setCurrentWidget(paneGeneration);
+        paneGeneration->startAutoBatch(batchSpec);
+    });
     ui->tabWidget->addTab(new PaneProperties(m_properties, m_archive, m_videos, m_accounts, this),
                           tr("Properties"));
     ui->tabWidget->addTab(new PaneStatistics(m_videos, m_scheduler, m_accounts,
-                                             paneGeneration->projectsModel(), this),
+                                             paneGeneration->projectsModel(), this,
+                                             m_hashtags, m_favoriteHooks),
                           tr("Statistics"));
     ui->tabWidget->addTab(new PaneSettings(m_generationSettings, m_availableCliTable,
                                           this),

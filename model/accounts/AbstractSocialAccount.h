@@ -7,6 +7,10 @@
 #include <QMap>
 #include <QSet>
 #include <QString>
+#include <QStringList>
+
+#include <functional>
+#include <memory>
 
 #include <QCoro/QCoroTask>
 
@@ -84,6 +88,62 @@ public:
         QString errorMessage;
     };
 
+    // One candidate reference post discovered by the "Scroll & save" (spy)
+    // browser method when scrolling a search query, hashtag, or feed URL.
+    struct SpyPost
+    {
+        QString postUrl;
+        QString title;
+        QString mediaUrl;
+        QString localMediaPath;
+        QString author;
+        QString publishedAt;
+        qint64 views = -1;
+        qint64 likes = -1;
+        qint64 comments = -1;
+        qint64 shares = -1;
+        bool isAd = false;
+    };
+
+    // Result of a "Scroll & save" (spy) session on a platform.
+    struct SpyResult
+    {
+        QList<SpyPost> posts;
+        int browsedCount = 0;
+        int savedCount = 0;
+        int rejectedCount = 0;
+        int minEngagement = 0;
+        int maxDaysOld = 0;
+        bool notSupported = false;
+        QString errorMessage;
+    };
+
+    struct PublishRequest
+    {
+        QString accountUrl;
+        QStringList mediaPaths;
+        QString caption;
+        QString shortCode;
+        bool useSystemChromeProfile = true;
+        bool muteOriginalAudio = true;
+        bool useSuggestedSound = true;
+        bool dryRun = false;
+        QString uploadUrlOverride;
+    };
+
+    struct PublishResult
+    {
+        bool published = false;
+        bool dryRun = false;
+        bool fatal = false;
+        bool notSupported = false;
+        QString postUrl;
+        QString soundTitle;
+        QString logFilePath;
+        QString screenshotPath;
+        QString errorMessage;
+    };
+
     virtual ~AbstractSocialAccount() = default;
 
     // Unique id identifying the platform (e.g. "tiktok").
@@ -121,6 +181,37 @@ public:
     virtual QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(
         const QString &profileUrl,
         const QStringList &knownShortCodes = {}) const;
+
+    // Whether this platform supports the "Scroll & save" (spy) browser method
+    // for discovering candidate reference posts and downloading their media.
+    virtual bool supportsSpyScrollAndSave() const;
+
+    // Builds the default search/discovery URL on this platform for a plain
+    // keyword query (e.g. "red stiletto heels outfit").
+    virtual QString defaultSpySearchUrl(const QString &query) const;
+
+    // Opens a visible browser window on the given search query or URL, scrolls
+    // (automatically or waiting for the user to scroll manually until closing
+    // the browser window), downloads discovered post media into downloadDir,
+    // and returns the harvested candidate posts.
+    virtual QCoro::Task<SpyResult> spyScrollAndSave(
+        const QString &queryOrUrl,
+        const QString &downloadDir,
+        int maxPosts = 24,
+        bool autoScroll = true,
+        int minEngagement = 0,
+        const QStringList &excludeUrls = {},
+        int maxDaysOld = 0) const;
+
+    // Whether this platform supports browser-driven self-publishing of videos / image sets.
+    virtual bool supportsAutoPublish() const;
+
+    // Publishes one video or image carousel to the platform, streaming live
+    // diagnostic lines via onLog and aborting cleanly if cancelFlag becomes true.
+    virtual QCoro::Task<PublishResult> publishCreative(
+        const PublishRequest &request,
+        const std::function<void(const QString &)> &onLog = {},
+        std::shared_ptr<bool> cancelFlag = {}) const;
 
     // Extracts the first short-code tag (e.g. "qs0001", "#qs0001" or "QS-0001") from
     // a post caption/description, returning the normalized code ("QS-0001")
@@ -179,6 +270,31 @@ protected:
         const QString &scriptFileName, const QString &profileUrl,
         const QStringList &knownShortCodes = {}) const;
 
+    // Same infrastructure for the "Scroll & save" (spy) browser method:
+    // launches `<script> <queryOrUrl> <downloadDir> <maxPosts> <auto|manual>`
+    // and parses its stdout as one JSON line:
+    //     {"posts": [{"url": <string>, "title": <string|null>,
+    //                 "media_url": <string|null>, "local_media": <string|null>,
+    //                 "author": <string|null>, "views": <int|null>,
+    //                 "likes": <int|null>, "comments": <int|null>,
+    //                 "shares": <int|null>}],
+    //      "error": <string|null>}
+    QCoro::Task<SpyResult> runSpyScript(
+        const QString &scriptFileName,
+        const QString &queryOrUrl,
+        const QString &downloadDir,
+        int maxPosts,
+        bool autoScroll,
+        int minEngagement = 0,
+        const QStringList &excludeUrls = {},
+        int maxDaysOld = 0) const;
+
+    QCoro::Task<PublishResult> runPublishScript(
+        const QString &scriptFileName,
+        const PublishRequest &request,
+        std::function<void(const QString &)> onLog = {},
+        std::shared_ptr<bool> cancelFlag = {}) const;
+
 private:
     // Runs `python3 <script> <args...>` and parses its stdout as one JSON
     // object. Infrastructure failures (python missing, timeout, bad output)
@@ -187,7 +303,10 @@ private:
     // result struct also sidesteps a GCC 13 ICE on aggregate copy-init from
     // co_await expressions.)
     QCoro::Task<QJsonObject> _runJsonScript(
-        const QString &scriptFileName, const QStringList &args) const;
+        const QString &scriptFileName,
+        const QStringList &args,
+        qint64 timeoutMs = 360'000,
+        const QString &excludeFilePath = {}) const;
 
     static QMap<QString, AbstractSocialAccount *> &getSocialAccounts();
 };

@@ -1,6 +1,7 @@
 #include <QDir>
 #include <QFile>
 #include <QTextStream>
+#include <QSaveFile>
 
 #include "accounts/AbstractSocialAccount.h"
 
@@ -26,7 +27,7 @@ TableAccounts::TableAccounts(const QString &workingDirectory, QObject *parent)
 
 QVariant TableAccounts::headerData(int section, Qt::Orientation orientation, int role) const
 {
-    if (role == Qt::DisplayRole && orientation == Qt::Horizontal)
+    if (role == Qt::DisplayRole && orientation == Qt::Horizontal && section >= 0 && section < HEADER.size())
     {
         return HEADER[section];
     }
@@ -47,7 +48,8 @@ int TableAccounts::columnCount(const QModelIndex &parent) const
 
 QVariant TableAccounts::data(const QModelIndex &index, int role) const
 {
-    if (role == Qt::DisplayRole || role == Qt::EditRole)
+    if (index.isValid() && index.row() < rowCount() && index.column() < columnCount()
+        && (role == Qt::DisplayRole || role == Qt::EditRole))
     {
         return m_listOfVariantList[index.row()][index.column()];
     }
@@ -56,11 +58,19 @@ QVariant TableAccounts::data(const QModelIndex &index, int role) const
 
 bool TableAccounts::setData(const QModelIndex &index, const QVariant &value, int role)
 {
-    if (role == Qt::EditRole)
+    if (index.isValid() && index.row() < rowCount() && index.column() < columnCount()
+        && role == Qt::EditRole)
     {
+        const QVariant previous = m_listOfVariantList[index.row()][index.column()];
+        if (index.column() <= IND_URL && (value.toString().contains(',') || value.toString().contains('\n') || value.toString().contains('\r')))
+            return false;
         m_listOfVariantList[index.row()][index.column()] = value;
-        _saveInFile();
-        emit dataChanged(index, index, {role});
+        if (!_saveInFile())
+        {
+            m_listOfVariantList[index.row()][index.column()] = previous;
+            return false;
+        }
+        emit dataChanged(index, index, {Qt::DisplayRole, Qt::EditRole});
         return true;
     }
     return false;
@@ -81,8 +91,15 @@ void TableAccounts::addAccount()
     const int row = m_listOfVariantList.size();
     beginInsertRows(QModelIndex{}, row, row);
     m_listOfVariantList << QVariantList{defaultType, QString{}, 0, 0, 0};
+    m_accountIds << QUuid::createUuid();
     endInsertRows();
-    _saveInFile();
+    if (!_saveInFile())
+    {
+        beginRemoveRows({}, row, row);
+        m_listOfVariantList.removeLast();
+        m_accountIds.removeLast();
+        endRemoveRows();
+    }
 }
 
 void TableAccounts::removeAccount(int row)
@@ -91,10 +108,29 @@ void TableAccounts::removeAccount(int row)
     {
         return;
     }
+    const auto previous = m_listOfVariantList[row];
+    const auto id = m_accountIds[row];
     beginRemoveRows(QModelIndex{}, row, row);
     m_listOfVariantList.removeAt(row);
+    m_accountIds.removeAt(row);
     endRemoveRows();
-    _saveInFile();
+    if (!_saveInFile())
+    {
+        beginInsertRows({}, row, row);
+        m_listOfVariantList.insert(row, previous);
+        m_accountIds.insert(row, id);
+        endInsertRows();
+    }
+}
+
+QUuid TableAccounts::accountId(int row) const
+{
+    return row >= 0 && row < m_accountIds.size() ? m_accountIds[row] : QUuid{};
+}
+
+int TableAccounts::rowOfId(const QUuid &id) const
+{
+    return m_accountIds.indexOf(id);
 }
 
 void TableAccounts::_loadFromFile()
@@ -102,6 +138,7 @@ void TableAccounts::_loadFromFile()
     QFile file{m_filePath};
     if (!file.open(QFile::ReadOnly))
     {
+        if (file.exists()) { m_readOnly = true; m_lastError = file.errorString(); }
         return;
     }
 
@@ -109,7 +146,8 @@ void TableAccounts::_loadFromFile()
     const auto &lines = stream.readAll().split(QStringLiteral("\n"));
     file.close();
 
-    // First line is the header, skip it.
+    bool needsIds = false;
+    // The optional trailing Id preserves the existing five visible columns.
     for (int i = 1; i < lines.size(); ++i)
     {
         if (lines[i].trimmed().isEmpty())
@@ -119,39 +157,61 @@ void TableAccounts::_loadFromFile()
         const auto &elements = lines[i].split(COL_SEP);
         if (elements.size() <= IND_FOLLOWERS)
         {
-            continue;
+            m_readOnly = true;
+            m_lastError = tr("Account file contains an incomplete row. It has been left untouched.");
+            return;
         }
         // Files saved before the "Likes" column existed only have 4 columns;
         // default the missing one to 0 instead of dropping the row.
-        const int likes = elements.size() > IND_LIKES ? elements[IND_LIKES].toInt() : 0;
+        const qint64 likes = elements.size() > IND_LIKES ? elements[IND_LIKES].toLongLong() : 0;
         m_listOfVariantList << QVariantList{
             elements[IND_TYPE]
             , elements[IND_URL]
-            , elements[IND_VIEW].toInt()
-            , elements[IND_FOLLOWERS].toInt()
+            , elements[IND_VIEW].toLongLong()
+            , elements[IND_FOLLOWERS].toLongLong()
             , likes
         };
+        QUuid id(elements.value(5));
+        if (id.isNull() || m_accountIds.contains(id))
+        {
+            id = QUuid::createUuid();
+            needsIds = true;
+        }
+        m_accountIds << id;
     }
+    if (needsIds) _saveInFile();
 }
 
-void TableAccounts::_saveInFile()
+bool TableAccounts::_saveInFile()
 {
-    QFile file{m_filePath};
+    if (m_readOnly) { emit persistenceError(m_lastError); return false; }
+    QSaveFile file{m_filePath};
     if (!file.open(QFile::WriteOnly))
     {
-        return;
+        m_lastError = file.errorString();
+        emit persistenceError(m_lastError);
+        return false;
     }
 
     QTextStream stream{&file};
-    stream << HEADER.join(COL_SEP);
-    for (const auto &variantList : m_listOfVariantList)
+    stream << HEADER.join(COL_SEP) << ",Id";
+    for (int row = 0; row < m_listOfVariantList.size(); ++row)
     {
         QStringList elements;
-        for (const auto &value : variantList)
+        for (const auto &value : m_listOfVariantList[row])
         {
             elements << value.toString();
         }
+        elements << m_accountIds[row].toString(QUuid::WithoutBraces);
         stream << "\n" + elements.join(COL_SEP);
     }
-    file.close();
+    stream.flush();
+    if (stream.status() != QTextStream::Ok || !file.commit())
+    {
+        m_lastError = file.errorString();
+        emit persistenceError(m_lastError);
+        return false;
+    }
+    m_lastError.clear();
+    return true;
 }

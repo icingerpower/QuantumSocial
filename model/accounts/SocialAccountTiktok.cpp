@@ -1,5 +1,7 @@
 #include "SocialAccountTiktok.h"
 
+#include <QUrl>
+
 QString SocialAccountTiktok::getId() const
 {
     return QStringLiteral("tiktok");
@@ -41,6 +43,51 @@ SocialAccountTiktok::fetchAccountVideoStatistics(
 {
     return runAccountVideosScript(
         QStringLiteral("fetch_account_videos_tiktok.py"), profileUrl, knownShortCodes);
+}
+
+bool SocialAccountTiktok::supportsSpyScrollAndSave() const
+{
+    return true;
+}
+
+QString SocialAccountTiktok::defaultSpySearchUrl(const QString &query) const
+{
+    return QStringLiteral("https://www.tiktok.com/search?q=%1")
+        .arg(QString::fromUtf8(QUrl::toPercentEncoding(query.trimmed())));
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountTiktok::spyScrollAndSave(
+    const QString &queryOrUrl,
+    const QString &downloadDir,
+    int maxPosts,
+    bool autoScroll,
+    int minEngagement,
+    const QStringList &excludeUrls,
+    int maxDaysOld) const
+{
+    return runSpyScript(
+        QStringLiteral("spy_scroll_tiktok.py"),
+        queryOrUrl,
+        downloadDir,
+        maxPosts,
+        autoScroll,
+        minEngagement,
+        excludeUrls,
+        maxDaysOld);
+}
+
+bool SocialAccountTiktok::supportsAutoPublish() const
+{
+    return true;
+}
+
+QCoro::Task<AbstractSocialAccount::PublishResult> SocialAccountTiktok::publishCreative(
+    const PublishRequest &request,
+    const std::function<void(const QString &)> &onLog,
+    std::shared_ptr<bool> cancelFlag) const
+{
+    return runPublishScript(
+        QStringLiteral("publish_tiktok.py"), request, onLog, std::move(cancelFlag));
 }
 
 DECLARE_SOCIAL_ACCOUNT(SocialAccountTiktok)

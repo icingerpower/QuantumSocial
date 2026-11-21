@@ -12,10 +12,13 @@ include("${REPO}/../common/gui/progress/progress.cmake")
 include("${REPO}/../common/workingdirectory/workingdirectory.cmake")
 include("${REPO}/gui/gui.cmake")
 include("${REPO}/model/model.cmake")
-add_executable(generation_checks generation_checks.cpp ${GUI_FILES} ${MODEL_FILES}
+add_executable(generation_checks generation_checks.cpp research_checks.cpp ${GUI_FILES} ${MODEL_FILES}
     ${AICLI_FILES} ${PROGRESS_DIALOG_FILES} ${WORKING_DIR_FILES})
 target_include_directories(generation_checks PRIVATE "${REPO}"
     "${REPO}/../common/aicli" "${REPO}/../common/gui/progress")
+target_compile_definitions(generation_checks PRIVATE
+    SOCIAL_STATS_SCRIPT_DIR="${REPO}/model/accounts"
+    VIDEO_GEN_SCRIPT_DIR="${REPO}/model/videogen")
 target_link_libraries(generation_checks PRIVATE Qt6::Widgets Qt6::Multimedia
     Qt6::MultimediaWidgets QCoro::Core)
 enable_testing()

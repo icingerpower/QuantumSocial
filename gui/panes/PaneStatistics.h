@@ -9,6 +9,8 @@ QT_BEGIN_NAMESPACE
 namespace Ui { class PaneStatistics; }
 QT_END_NAMESPACE
 
+class FavoriteHooks;
+class PreferredHashtags;
 class StatisticsScheduler;
 class TableAccounts;
 class TableProjects;
@@ -24,7 +26,9 @@ public:
                             QWidget *parent = nullptr);
     explicit PaneStatistics(TableVideos *videos, StatisticsScheduler *scheduler,
                             TableAccounts *accounts, TableProjects *projects = nullptr,
-                            QWidget *parent = nullptr);
+                            QWidget *parent = nullptr,
+                            PreferredHashtags *hashtags = nullptr,
+                            FavoriteHooks *favoriteHooks = nullptr);
     ~PaneStatistics();
 
     TableVideoStatistics *statisticsModel() const;
@@ -35,10 +39,13 @@ private:
     StatisticsScheduler *m_scheduler;
     TableAccounts *m_accounts;
     TableProjects *m_projects;
+    PreferredHashtags *m_hashtags = nullptr;
+    FavoriteHooks *m_favoriteHooks = nullptr;
     TableVideoStatistics *m_model;
     QCoro::Task<void> m_retrieveStatisticsTask;
 
     QCoro::Task<void> _retrieveStatistics();
+    void _openSelectedPostInBrowser();
 };
 
 #endif // PANESTATISTICS_H

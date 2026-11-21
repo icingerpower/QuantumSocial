@@ -2,6 +2,7 @@
 #define TABLEACCOUNTS_H
 
 #include <QAbstractTableModel>
+#include <QUuid>
 
 class TableAccounts : public QAbstractTableModel
 {
@@ -31,14 +32,23 @@ public:
 
     void addAccount();
     void removeAccount(int row);
+    QUuid accountId(int row) const;
+    int rowOfId(const QUuid &id) const;
+    QString lastError() const { return m_lastError; }
+
+signals:
+    void persistenceError(const QString &message);
 
 private:
     static const QStringList HEADER;
     QString m_filePath;
     QList<QVariantList> m_listOfVariantList;
+    QList<QUuid> m_accountIds;
+    QString m_lastError;
+    bool m_readOnly = false;
 
     void _loadFromFile();
-    void _saveInFile();
+    bool _saveInFile();
 };
 
 #endif // TABLEACCOUNTS_H

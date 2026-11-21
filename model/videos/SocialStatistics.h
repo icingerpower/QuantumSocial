@@ -9,6 +9,8 @@
 
 #include "TableVideos.h"
 
+class FavoriteHooks;
+class PreferredHashtags;
 class QHeaderView;
 class QWidget;
 class TableAccounts;
@@ -56,7 +58,9 @@ public:
 
     static QCoro::Task<void> retrieveFromAccounts(TableAccounts *accounts,
                                                   TableVideos *videos,
-                                                  QWidget *parentWidget = nullptr);
+                                                  QWidget *parentWidget = nullptr,
+                                                  PreferredHashtags *hashtags = nullptr,
+                                                  FavoriteHooks *favoriteHooks = nullptr);
 };
 
 #endif // SOCIALSTATISTICS_H

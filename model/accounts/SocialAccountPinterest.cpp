@@ -1,5 +1,7 @@
 #include "SocialAccountPinterest.h"
 
+#include <QUrl>
+
 QString SocialAccountPinterest::getId() const
 {
     return QStringLiteral("pinterest");
@@ -29,6 +31,37 @@ QCoro::Task<AbstractSocialAccount::VideoStatistics> SocialAccountPinterest::fetc
     const QString &postUrl, StatSource source) const
 {
     return runVideoStatsScript(QStringLiteral("fetch_video_stats_pinterest.py"), postUrl, source);
+}
+
+bool SocialAccountPinterest::supportsSpyScrollAndSave() const
+{
+    return true;
+}
+
+QString SocialAccountPinterest::defaultSpySearchUrl(const QString &query) const
+{
+    return QStringLiteral("https://www.pinterest.com/search/pins/?q=%1")
+        .arg(QString::fromUtf8(QUrl::toPercentEncoding(query.trimmed())));
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountPinterest::spyScrollAndSave(
+    const QString &queryOrUrl,
+    const QString &downloadDir,
+    int maxPosts,
+    bool autoScroll,
+    int minEngagement,
+    const QStringList &excludeUrls,
+    int maxDaysOld) const
+{
+    return runSpyScript(
+        QStringLiteral("spy_scroll_pinterest.py"),
+        queryOrUrl,
+        downloadDir,
+        maxPosts,
+        autoScroll,
+        minEngagement,
+        excludeUrls,
+        maxDaysOld);
 }
 
 DECLARE_SOCIAL_ACCOUNT(SocialAccountPinterest)

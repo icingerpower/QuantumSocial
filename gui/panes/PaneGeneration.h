@@ -3,6 +3,7 @@
 
 #include <QCoro/QCoroTask>
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -88,6 +89,8 @@ public:
     void setAvailableClis(const QList<AbstractCli *> &clis);
 
     TableProjects *projectsModel() const { return m_projects; }
+    bool createResearchProject(const QJsonObject &context, const QString &imagePath);
+    bool startAutoBatch(const QJsonObject &batchSpec);
 
     struct GenerationPromptEntry
     {
@@ -107,6 +110,9 @@ public:
         int row, const TableVideos::VideoRecord *record) const;
 
     static QString appendExtraPromptPhrase(const QString &basePrompt, const QString &extraPhrase);
+
+signals:
+    void autoPublishRequested();
 
 private slots:
     void _addProject();
@@ -225,6 +231,8 @@ private:
     // browsing it here, instead of retyping it in Settings — enabled only
     // when the selected generation actually has a chosen hook.
     QPushButton *m_buttonFavoriteHook = nullptr;
+    QPushButton *m_buttonCopyHook = nullptr;
+    QPushButton *m_buttonCopyDescription = nullptr;
     // Same idea for video prompts — enabled only when the selected
     // generation is a video with its generation_prompt.txt still on disk.
     QPushButton *m_buttonFavoriteVideoPrompt = nullptr;
@@ -262,6 +270,10 @@ private:
     // AND a slideshow), each needing its own recipe tag, never a shared one.
     QList<QPair<QDir, QString>> m_runGenerations;
     QString m_runVideoFormatLabel;
+    QString m_runSwapInstruction;
+    QString m_runReferenceSceneFile;
+    QStringList m_runReferenceMotionFrames;
+    bool m_runPreferVideoAnimation = false;
 
     // One ticked option from the plan dialog = one independent job. Jobs
     // are grouped by the external resource they'd contend for — a specific
@@ -297,6 +309,7 @@ private:
     // not QHash: QCoro::Task is move-only and QHash's rehash path requires
     // copyable values.
     std::unordered_map<std::string, QCoro::Task<void>> m_imageJobTasks;
+    std::unique_ptr<QCoro::Task<void>> m_autoBatchTask;
     // Snapshot of the staging folder's contents taken ONCE, right before any
     // job starts — every job gets an ISOLATED copy of this (see
     // _prepareJobStaging), so concurrent jobs never see each other's
@@ -365,6 +378,13 @@ private:
     // location from before this layout existed) — used by "reuse previous".
     QString _latestGeneratedImage(int row) const;
     QString _latestGeneratedImage2(int row) const;
+    QString _researchReferenceMediaPath(int row, QJsonObject *outContext = nullptr) const;
+    QString _ensureResearchReferencePreview(int row) const;
+    QStringList _stageResearchReferenceFrames(int row, const QDir &staging, QString *outSceneFileName) const;
+    int _reviewSwappedImageDialog(const QString &referenceScenePath,
+                                  const QString &myProductPath,
+                                  const QString &generatedImagePath,
+                                  QString *inOutTweakInstruction);
     // On a successful generation: creates the VideoRecord, moves this job's
     // isolated staging folder into its final generations/<shortCode>/ home
     // (every path in outputPaths to the top level, everything else to its
@@ -412,6 +432,13 @@ private:
     static QString _jobLabel(const GenerationJob &job);
     QCoro::Task<void> _runImageGenerationJob(int row, QUuid projectId, QString groupKey,
                                              GenerationJob job, QDir jobStaging);
+    int _findOrCreateAutoBatchProject(const QString &accountId,
+                                      const QString &accountLabel,
+                                      const QJsonObject &profile,
+                                      const QJsonObject &product,
+                                      const QJsonObject &primaryReference,
+                                      const QString &primaryRefMediaPath);
+    QCoro::Task<void> _runAutoBatch(QJsonObject batchSpec);
 };
 
 #endif // PANEGENERATION_H

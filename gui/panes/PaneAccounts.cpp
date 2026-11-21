@@ -34,6 +34,10 @@ PaneAccounts::PaneAccounts(TableAccounts *accounts, QWidget *parent)
             WorkingDirectoryManager::instance()->workingDir().absolutePath(), this);
     }
     ui->tableViewSocialAccount->setModel(m_model);
+    ui->tableViewSocialAccount->setSelectionBehavior(QAbstractItemView::SelectRows);
+    connect(m_model, &TableAccounts::persistenceError, this, [this](const QString &error) {
+        QMessageBox::warning(this, tr("Could not save accounts"), error);
+    });
     ui->tableViewSocialAccount->horizontalHeader()->setStretchLastSection(true);
     ui->tableViewSocialAccount->horizontalHeader()->resizeSection(TableAccounts::IND_URL, 300);
 
