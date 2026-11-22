@@ -3,6 +3,7 @@
 #pragma GCC optimize("O1")
 
 #include "SocialStatistics.h"
+#include "model/research/InspirationAdaptationMethod.h"
 
 #include <QDateTime>
 #include <QDebug>
@@ -292,8 +293,20 @@ QJsonObject SocialStatistics::VideoTextExperimentSummary::toJson() const
         winnersArr.append(QJsonObject{
             {QStringLiteral("shortCode"), w.shortCode},
             {QStringLiteral("text"), w.text},
+            {QStringLiteral("style"), w.styleId},
             {QStringLiteral("views"), w.views},
             {QStringLiteral("likes"), w.likes}
+        });
+    }
+    QJsonArray stylesArr;
+    for (const auto &st : styleBreakdown)
+    {
+        stylesArr.append(QJsonObject{
+            {QStringLiteral("style"), st.styleId},
+            {QStringLiteral("count"), st.count},
+            {QStringLiteral("avgViews"), st.avgViews},
+            {QStringLiteral("avgEngagementPct"), st.avgEngagementPct},
+            {QStringLiteral("bestViews"), st.bestViews}
         });
     }
     return QJsonObject{
@@ -306,6 +319,8 @@ QJsonObject SocialStatistics::VideoTextExperimentSummary::toJson() const
         {QStringLiteral("withoutTextAvgEngagementPct"), withoutTextAvgEngagementPct},
         {QStringLiteral("withoutTextBestViews"), withoutTextBestViews},
         {QStringLiteral("recommendation"), recommendation},
+        {QStringLiteral("winningStyle"), winningStyle},
+        {QStringLiteral("styleBreakdown"), stylesArr},
         {QStringLiteral("winningTexts"), winnersArr}
     };
 }
@@ -314,7 +329,7 @@ QString SocialStatistics::VideoTextExperimentSummary::humanSummary() const
 {
     if (withTextCount == 0 && withoutTextCount == 0)
     {
-        return QObject::tr("Video Text A/B: 0 measured videos yet — exploring ~50/50 With vs Without native TikTok text to learn what works best.");
+        return QObject::tr("Video Text A/B: 0 measured videos yet — exploring ~50/50 With vs Without native TikTok text and rotating 4 curated styles.");
     }
     QString verdict;
     if (recommendation == QLatin1String("prefer_text"))
@@ -333,14 +348,19 @@ QString SocialStatistics::VideoTextExperimentSummary::humanSummary() const
     {
         verdict = QObject::tr("Gathering baseline A/B sample -> alternating ~50/50");
     }
-    return QObject::tr("Video Text A/B: With text=%1 video(s) (avg %2 views, %3% eng) vs Clean=%4 video(s) (avg %5 views, %6% eng) — %7.")
+    const QString styleNote = !winningStyle.isEmpty()
+        ? QObject::tr(" | Top style: %1").arg(winningStyle)
+        : (!styleBreakdown.isEmpty()
+               ? QObject::tr(" | Styles tested: %1").arg(styleBreakdown.size())
+               : QString{});
+    return QObject::tr("Video Text A/B: With text=%1 video(s) (avg %2 views, %3% eng) vs Clean=%4 video(s) (avg %5 views, %6% eng)%8 — %7.")
         .arg(withTextCount)
         .arg(qRound64(withTextAvgViews))
         .arg(QString::number(withTextAvgEngagementPct, 'f', 1))
         .arg(withoutTextCount)
         .arg(qRound64(withoutTextAvgViews))
         .arg(QString::number(withoutTextAvgEngagementPct, 'f', 1))
-        .arg(verdict);
+        .arg(verdict, styleNote);
 }
 
 QString SocialStatistics::VideoTextExperimentSummary::plannerPromptAddendum() const
@@ -357,14 +377,43 @@ QString SocialStatistics::VideoTextExperimentSummary::plannerPromptAddendum() co
         .arg(withoutTextBestViews)
         .arg(QString::number(withoutTextAvgEngagementPct, 'f', 2));
 
+    out += QStringLiteral("- Available curated fashion-safe \"videoTextStyle\" options (choose the best visual fit + A/B test over time):\n"
+                          "  1. \"classic_black_pill\"   — Bold white Classic text on rounded black pill (high contrast, great on bright marble/daylight)\n"
+                          "  2. \"classic_white_pill\"   — Bold black Classic text on crisp white pill (trendy OOTD/fashion creator look, great on dark evening scenes)\n"
+                          "  3. \"elegance_serif\"       — Editorial Serif white text with subtle dark stroke+shadow, no box (luxury Vogue vibe)\n"
+                          "  4. \"classic_clean_stroke\" — Bold white Classic text with clean dark outline, no box (minimal footprint over dress/heels)\n");
+
+    if (!styleBreakdown.isEmpty())
+    {
+        out += QStringLiteral("- Measured performance by videoTextStyle so far:\n");
+        for (const auto &st : styleBreakdown)
+        {
+            out += QStringLiteral("  * %1: %2 video(s) | avg views=%3 | best=%4 | eng=%5%\n")
+                .arg(st.styleId)
+                .arg(st.count)
+                .arg(qRound64(st.avgViews))
+                .arg(st.bestViews)
+                .arg(QString::number(st.avgEngagementPct, 'f', 2));
+        }
+        if (!winningStyle.isEmpty())
+        {
+            out += QStringLiteral("  -> Leading style: \"%1\" (use ~60-70% of the time when adding text, while rotating the other 3 styles ~30-40% to keep testing).\n")
+                .arg(winningStyle);
+        }
+        else
+        {
+            out += QStringLiteral("  -> Rotate across all 4 styles based on scene brightness/mood so each style accumulates measured data.\n");
+        }
+    }
+
     if (!winningTexts.isEmpty())
     {
         out += QStringLiteral("- Highest-performing video overlay texts measured so far (imitate their brevity/curiosity style, never copy verbatim):\n");
         for (int i = 0; i < qMin<int>(5, winningTexts.size()); ++i)
         {
             const auto &w = winningTexts[i];
-            out += QStringLiteral("  * \"%1\" (%2 views, %3 likes)\n")
-                .arg(w.text).arg(w.views).arg(w.likes);
+            out += QStringLiteral("  * \"%1\" [style=%2] (%3 views, %4 likes)\n")
+                .arg(w.text, w.styleId).arg(w.views).arg(w.likes);
         }
     }
 
@@ -442,6 +491,15 @@ SocialStatistics::VideoTextExperimentSummary SocialStatistics::summarizeVideoTex
         }
     }
 
+    struct StyleAccum
+    {
+        int count = 0;
+        double viewsSum = 0.0;
+        double engSum = 0.0;
+        qint64 bestViews = 0;
+    };
+    QHash<QString, StyleAccum> styleAccums;
+
     double withViewsSum = 0.0;
     double withEngSum = 0.0;
     double withoutViewsSum = 0.0;
@@ -493,12 +551,18 @@ SocialStatistics::VideoTextExperimentSummary SocialStatistics::summarizeVideoTex
 
         bool hasVideoText = false;
         QString overlayText;
+        QString overlayStyle;
         QFile dnaFile{gDir.filePath(QStringLiteral("creative_dna.json"))};
         if (dnaFile.open(QIODevice::ReadOnly))
         {
             const QJsonObject dna = QJsonDocument::fromJson(dnaFile.readAll()).object();
             hasVideoText = dna.value(QStringLiteral("tiktokVideoTextAdded")).toBool(false);
             overlayText = dna.value(QStringLiteral("tiktokVideoText")).toString().trimmed();
+            overlayStyle = dna.value(QStringLiteral("tiktokVideoTextStyle")).toString().trimmed();
+        }
+        if (hasVideoText && overlayStyle.isEmpty())
+        {
+            overlayStyle = QStringLiteral("classic_black_pill");
         }
 
         const double engPct = bestViews > 0
@@ -511,10 +575,17 @@ SocialStatistics::VideoTextExperimentSummary SocialStatistics::summarizeVideoTex
             withViewsSum += double(bestViews);
             withEngSum += engPct;
             summary.withTextBestViews = qMax(summary.withTextBestViews, bestViews);
+
+            auto &sa = styleAccums[overlayStyle];
+            ++sa.count;
+            sa.viewsSum += double(bestViews);
+            sa.engSum += engPct;
+            sa.bestViews = qMax(sa.bestViews, bestViews);
+
             if (!overlayText.isEmpty())
             {
                 summary.winningTexts.append(WinningVideoTextEntry{
-                    rec->shortCode, overlayText, bestViews, bestLikes
+                    rec->shortCode, overlayText, overlayStyle, bestViews, bestLikes
                 });
             }
         }
@@ -525,6 +596,33 @@ SocialStatistics::VideoTextExperimentSummary SocialStatistics::summarizeVideoTex
             withoutEngSum += engPct;
             summary.withoutTextBestViews = qMax(summary.withoutTextBestViews, bestViews);
         }
+    }
+
+    for (auto it = styleAccums.constBegin(); it != styleAccums.constEnd(); ++it)
+    {
+        const StyleAccum &sa = it.value();
+        if (sa.count <= 0)
+        {
+            continue;
+        }
+        summary.styleBreakdown.append(VideoTextStyleStats{
+            it.key(),
+            sa.count,
+            sa.viewsSum / double(sa.count),
+            sa.engSum / double(sa.count),
+            sa.bestViews
+        });
+    }
+    std::sort(summary.styleBreakdown.begin(), summary.styleBreakdown.end(),
+              [](const VideoTextStyleStats &a, const VideoTextStyleStats &b) {
+                  if (a.avgViews != b.avgViews) return a.avgViews > b.avgViews;
+                  return a.bestViews > b.bestViews;
+              });
+    if (summary.styleBreakdown.size() >= 2
+        && summary.styleBreakdown[0].count >= 1
+        && summary.styleBreakdown[0].avgViews >= summary.styleBreakdown[1].avgViews * 1.10)
+    {
+        summary.winningStyle = summary.styleBreakdown[0].styleId;
     }
 
     if (summary.withTextCount > 0)
@@ -579,6 +677,387 @@ SocialStatistics::VideoTextExperimentSummary SocialStatistics::summarizeVideoTex
             }
         }
     }
+
+    return summary;
+}
+
+namespace
+{
+double medianOfDoubles(QList<double> vals)
+{
+    if (vals.isEmpty())
+    {
+        return 0.0;
+    }
+    std::sort(vals.begin(), vals.end());
+    const int n = vals.size();
+    return (n % 2 == 1) ? vals[n / 2] : 0.5 * (vals[n / 2 - 1] + vals[n / 2]);
+}
+
+QHash<QString, QString> indexAllGenerationDirsInWorkingDir()
+{
+    QHash<QString, QString> genDirByCode;
+    const auto indexGenerationsInDir = [&](const QDir &gensDir) {
+        if (!gensDir.exists())
+        {
+            return;
+        }
+        const QStringList genEntries = gensDir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString &ge : genEntries)
+        {
+            const QString fullPath = gensDir.filePath(ge);
+            const QString extracted = AbstractSocialAccount::extractShortCode(ge);
+            if (!extracted.isEmpty())
+            {
+                genDirByCode.insert(extracted.toUpper(), fullPath);
+            }
+            else
+            {
+                genDirByCode.insert(ge.toUpper(), fullPath);
+            }
+        }
+    };
+
+    const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+    const QDir projectsRoot{wd.filePath(QStringLiteral("projects"))};
+    if (projectsRoot.exists())
+    {
+        const QDir currentGensRoot{projectsRoot.filePath(QStringLiteral("generations"))};
+        if (currentGensRoot.exists())
+        {
+            const QStringList projGenFolders = currentGensRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+            for (const QString &pgf : projGenFolders)
+            {
+                indexGenerationsInDir(QDir{currentGensRoot.filePath(pgf)});
+            }
+        }
+        const QStringList projDirs = projectsRoot.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+        for (const QString &pd : projDirs)
+        {
+            if (pd == QLatin1String("generations"))
+            {
+                continue;
+            }
+            indexGenerationsInDir(QDir{projectsRoot.filePath(pd + QStringLiteral("/generations"))});
+        }
+    }
+    return genDirByCode;
+}
+} // namespace
+
+QJsonObject SocialStatistics::ReferenceExperimentSummary::toJson() const
+{
+    QJsonArray stratArr;
+    for (const auto &s : strategyBreakdown)
+    {
+        stratArr.append(QJsonObject{
+            {QStringLiteral("strategyId"), s.strategyId},
+            {QStringLiteral("count"), s.count},
+            {QStringLiteral("medianScore"), s.medianScore},
+            {QStringLiteral("avgViews"), s.avgViews},
+            {QStringLiteral("avgEngagementPct"), s.avgEngagementPct},
+            {QStringLiteral("bestViews"), s.bestViews}
+        });
+    }
+    QJsonArray refArr;
+    for (const auto &r : references)
+    {
+        refArr.append(QJsonObject{
+            {QStringLiteral("referenceId"), r.referenceId},
+            {QStringLiteral("referenceUrl"), r.referenceUrl},
+            {QStringLiteral("publishedCount"), r.publishedCount},
+            {QStringLiteral("medianScore"), r.medianScore},
+            {QStringLiteral("avgViews"), r.avgViews},
+            {QStringLiteral("bestViews"), r.bestViews},
+            {QStringLiteral("swapCount"), r.swapCount},
+            {QStringLiteral("swapMedianScore"), r.swapMedianScore},
+            {QStringLiteral("variantCount"), r.variantCount},
+            {QStringLiteral("variantMedianScore"), r.variantMedianScore},
+            {QStringLiteral("bestStrategy"), r.bestStrategy},
+            {QStringLiteral("isWinner"), r.isWinner}
+        });
+    }
+    return QJsonObject{
+        {QStringLiteral("totalMeasuredPosts"), totalMeasuredPosts},
+        {QStringLiteral("accountMedianScore"), accountMedianScore},
+        {QStringLiteral("winningStrategy"), winningStrategy},
+        {QStringLiteral("strategyBreakdown"), stratArr},
+        {QStringLiteral("references"), refArr}
+    };
+}
+
+QString SocialStatistics::ReferenceExperimentSummary::humanSummary() const
+{
+    if (totalMeasuredPosts <= 0)
+    {
+        return QStringLiteral("Reference & Variant A/B: 0 measured posts yet (will compare strict product swap vs scene/style variants).");
+    }
+    QStringList parts;
+    for (const auto &s : strategyBreakdown)
+    {
+        parts << QStringLiteral("%1=%2 avg views (n=%3)")
+                     .arg(s.strategyId)
+                     .arg(qRound64(s.avgViews))
+                     .arg(s.count);
+    }
+    int winnersCount = 0;
+    for (const auto &r : references)
+    {
+        if (r.isWinner) ++winnersCount;
+    }
+    return QStringLiteral("Reference & Variant A/B (%1 measured): %2 · %3 winning source reference(s)%4.")
+        .arg(totalMeasuredPosts)
+        .arg(parts.join(QStringLiteral(", ")))
+        .arg(winnersCount)
+        .arg(winningStrategy.isEmpty() ? QString{} : QStringLiteral(" · leader=%1").arg(winningStrategy));
+}
+
+QString SocialStatistics::ReferenceExperimentSummary::plannerPromptAddendum() const
+{
+    if (totalMeasuredPosts <= 0)
+    {
+        return QString{};
+    }
+    QString out = QStringLiteral(
+        "\nSOURCE VIDEO & ADAPTATION MODE LEARNING (%1 measured published post(s)):\n")
+        .arg(totalMeasuredPosts);
+    for (const auto &s : strategyBreakdown)
+    {
+        const auto *method = InspirationAdaptationMethod::all().value(s.strategyId, nullptr);
+        const QString label = method
+            ? QStringLiteral("%1 (%2)").arg(s.strategyId, method->name())
+            : s.strategyId;
+        out += QStringLiteral("  - %1: n=%2, avg views=%3, best views=%4, avg engagement=%5%\n")
+            .arg(label)
+            .arg(s.count)
+            .arg(qRound64(s.avgViews))
+            .arg(s.bestViews)
+            .arg(QString::number(s.avgEngagementPct, 'f', 1));
+    }
+    if (!winningStrategy.isEmpty())
+    {
+        out += QStringLiteral("  - Winning adaptation strategy so far: %1 (favor this ~70% while continuing ~30% variant exploration).\n")
+            .arg(winningStrategy);
+    }
+    int listed = 0;
+    for (const auto &r : references)
+    {
+        if (!r.isWinner || listed >= 5)
+        {
+            continue;
+        }
+        ++listed;
+        out += QStringLiteral("  - Proven winning source video %1: avg views=%2 (n=%3, best mode=%4)\n")
+            .arg(r.referenceUrl.isEmpty() ? r.referenceId : r.referenceUrl)
+            .arg(qRound64(r.avgViews))
+            .arg(r.publishedCount)
+            .arg(r.bestStrategy.isEmpty() ? QStringLiteral("reference_swap") : r.bestStrategy);
+    }
+    return out;
+}
+
+SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenceExperiment(
+    const TableVideos *videos)
+{
+    ReferenceExperimentSummary summary;
+    if (!videos)
+    {
+        return summary;
+    }
+
+    const QHash<QString, QString> genDirByCode = indexAllGenerationDirsInWorkingDir();
+
+    struct StratAccum
+    {
+        QList<double> scores;
+        double viewsSum = 0.0;
+        double engPctSum = 0.0;
+        qint64 bestViews = 0;
+    };
+    struct RefAccum
+    {
+        QString referenceUrl;
+        QList<double> allScores;
+        QHash<QString, QList<double>> scoresByMethod;
+        double viewsSum = 0.0;
+        qint64 bestViews = 0;
+    };
+
+    QHash<QString, StratAccum> stratMap;
+    QHash<QString, RefAccum> refMap;
+    QList<double> allAccountScores;
+
+    for (int r = 0; r < videos->rowCount(); ++r)
+    {
+        const auto *rec = videos->recordAt(r);
+        if (!rec || (!rec->published && rec->publications.isEmpty()))
+        {
+            continue;
+        }
+
+        double bestNormScore = -1.0;
+        qint64 bestViews = -1;
+        qint64 bestLikes = 0;
+        qint64 bestComments = 0;
+        qint64 bestShares = 0;
+        for (const auto &pub : rec->publications)
+        {
+            for (const auto &snap : pub.snapshots)
+            {
+                if (snap.stats.views < 0)
+                {
+                    continue;
+                }
+                const double views = qMax<qint64>(0, snap.stats.views);
+                const double savesShares = qMax<qint64>(0, snap.stats.shares);
+                const double likesComments = qMax<qint64>(0, snap.stats.likes)
+                    + qMax<qint64>(0, snap.stats.comments);
+                const double denom = pub.followersAtPublish > 0
+                    ? double(pub.followersAtPublish)
+                    : 1000.0;
+                const double score = (0.45 * views + 2.5 * savesShares + 1.0 * likesComments) / denom;
+                if (score > bestNormScore)
+                {
+                    bestNormScore = score;
+                }
+                if (snap.stats.views >= bestViews)
+                {
+                    bestViews = snap.stats.views;
+                    bestLikes = qMax<qint64>(0, snap.stats.likes);
+                    bestComments = qMax<qint64>(0, snap.stats.comments);
+                    bestShares = qMax<qint64>(0, snap.stats.shares);
+                }
+            }
+        }
+        if (bestNormScore < 0.0 || bestViews < 0)
+        {
+            continue;
+        }
+
+        const QString gPath = genDirByCode.value(rec->shortCode.toUpper());
+        if (gPath.isEmpty())
+        {
+            continue;
+        }
+        QFile dnaFile{QDir{gPath}.filePath(QStringLiteral("creative_dna.json"))};
+        if (!dnaFile.open(QIODevice::ReadOnly))
+        {
+            continue;
+        }
+        const QJsonObject dna = QJsonDocument::fromJson(dnaFile.readAll()).object();
+        const QString refId = dna.value(QStringLiteral("referenceId")).toString().trimmed();
+        const QString refUrl = dna.value(QStringLiteral("referenceUrl")).toString().trimmed();
+        QString strategy = dna.value(QStringLiteral("strategy")).toString().trimmed();
+        if (strategy.isEmpty())
+        {
+            strategy = refId.isEmpty() ? QStringLiteral("editorial_ab") : QStringLiteral("reference_swap");
+        }
+
+        const double engPct = bestViews > 0
+            ? (100.0 * double(bestLikes + bestComments + bestShares) / double(bestViews))
+            : 0.0;
+
+        ++summary.totalMeasuredPosts;
+        allAccountScores.append(bestNormScore);
+
+        auto &sa = stratMap[strategy];
+        sa.scores.append(bestNormScore);
+        sa.viewsSum += double(bestViews);
+        sa.engPctSum += engPct;
+        sa.bestViews = qMax(sa.bestViews, bestViews);
+
+        if (!refId.isEmpty())
+        {
+            auto &ra = refMap[refId];
+            if (ra.referenceUrl.isEmpty() && !refUrl.isEmpty())
+            {
+                ra.referenceUrl = refUrl;
+            }
+            ra.allScores.append(bestNormScore);
+            ra.scoresByMethod[strategy].append(bestNormScore);
+            ra.viewsSum += double(bestViews);
+            ra.bestViews = qMax(ra.bestViews, bestViews);
+        }
+    }
+
+    summary.accountMedianScore = medianOfDoubles(allAccountScores);
+
+    for (auto it = stratMap.cbegin(); it != stratMap.cend(); ++it)
+    {
+        const auto &sa = it.value();
+        if (sa.scores.isEmpty()) continue;
+        AdaptationStrategyStats st;
+        st.strategyId = it.key();
+        st.count = sa.scores.size();
+        st.medianScore = medianOfDoubles(sa.scores);
+        st.avgViews = sa.viewsSum / double(st.count);
+        st.avgEngagementPct = sa.engPctSum / double(st.count);
+        st.bestViews = sa.bestViews;
+        summary.strategyBreakdown.append(st);
+    }
+    std::sort(summary.strategyBreakdown.begin(), summary.strategyBreakdown.end(),
+              [](const AdaptationStrategyStats &a, const AdaptationStrategyStats &b) {
+                  if (a.medianScore != b.medianScore)
+                  {
+                      return a.medianScore > b.medianScore;
+                  }
+                  return a.avgViews > b.avgViews;
+              });
+
+    if (summary.strategyBreakdown.size() >= 2
+        && summary.strategyBreakdown[0].count >= 2
+        && summary.strategyBreakdown[0].medianScore >= summary.strategyBreakdown[1].medianScore * 1.15)
+    {
+        summary.winningStrategy = summary.strategyBreakdown[0].strategyId;
+    }
+
+    for (auto it = refMap.cbegin(); it != refMap.cend(); ++it)
+    {
+        const auto &ra = it.value();
+        if (ra.allScores.isEmpty()) continue;
+        ReferencePerformance rp;
+        rp.referenceId = it.key();
+        rp.referenceUrl = ra.referenceUrl;
+        rp.publishedCount = ra.allScores.size();
+        rp.medianScore = medianOfDoubles(ra.allScores);
+        rp.avgViews = ra.viewsSum / double(rp.publishedCount);
+        rp.bestViews = ra.bestViews;
+        const QList<double> swapList = ra.scoresByMethod.value(QStringLiteral("reference_swap"));
+        rp.swapCount = swapList.size();
+        rp.swapMedianScore = swapList.isEmpty() ? -1.0 : medianOfDoubles(swapList);
+
+        QList<double> nonSwapScores;
+        double topModeScore = -1.0;
+        for (auto mit = ra.scoresByMethod.cbegin(); mit != ra.scoresByMethod.cend(); ++mit)
+        {
+            if (mit.value().isEmpty())
+            {
+                continue;
+            }
+            const double med = medianOfDoubles(mit.value());
+            if (med > topModeScore)
+            {
+                topModeScore = med;
+                rp.bestStrategy = mit.key();
+            }
+            if (mit.key() != QLatin1String("reference_swap"))
+            {
+                nonSwapScores.append(mit.value());
+            }
+        }
+        rp.variantCount = nonSwapScores.size();
+        rp.variantMedianScore = nonSwapScores.isEmpty() ? -1.0 : medianOfDoubles(nonSwapScores);
+        rp.isWinner = (rp.medianScore > 0.0 && rp.medianScore >= summary.accountMedianScore);
+        summary.references.append(rp);
+    }
+    std::sort(summary.references.begin(), summary.references.end(),
+              [](const ReferencePerformance &a, const ReferencePerformance &b) {
+                  if (a.medianScore != b.medianScore)
+                  {
+                      return a.medianScore > b.medianScore;
+                  }
+                  return a.bestViews > b.bestViews;
+              });
 
     return summary;
 }
@@ -976,8 +1455,13 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
 
     const VideoTextExperimentSummary videoTextExp = summarizeVideoTextExperiment(videos, favoriteHooks);
     appendRetrieveStatsLog(videoTextExp.humanSummary());
+    const ReferenceExperimentSummary refExp = summarizeReferenceExperiment(videos);
+    appendRetrieveStatsLog(refExp.humanSummary());
 
-    if (!discoveredTopPostsByUrl.isEmpty() || videoTextExp.withTextCount > 0 || videoTextExp.withoutTextCount > 0)
+    if (!discoveredTopPostsByUrl.isEmpty()
+        || videoTextExp.withTextCount > 0
+        || videoTextExp.withoutTextCount > 0
+        || refExp.totalMeasuredPosts > 0)
     {
         QList<QJsonObject> sortedPosts = discoveredTopPostsByUrl.values();
         std::sort(sortedPosts.begin(), sortedPosts.end(),
@@ -999,7 +1483,8 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
                 sf.write(QJsonDocument{QJsonObject{
                     {QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
                     {QStringLiteral("posts"), outArr},
-                    {QStringLiteral("videoTextExperiment"), videoTextExp.toJson()}
+                    {QStringLiteral("videoTextExperiment"), videoTextExp.toJson()},
+                    {QStringLiteral("referenceExperiment"), refExp.toJson()}
                 }}.toJson(QJsonDocument::Indented));
                 sf.commit();
             }

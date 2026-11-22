@@ -4,7 +4,9 @@
 #pragma GCC optimize("O1")
 
 #include "PaneGeneration.h"
+#include "model/research/InspirationAdaptationMethod.h"
 #include "model/research/ResearchProject.h"
+#include "model/videos/SocialStatistics.h"
 #include "ui_PaneGeneration.h"
 
 #include <algorithm>
@@ -336,6 +338,80 @@ QString imageStepPrompt(DialogGenerationOptions::ImageMode mode, const QString &
         "Save the result in the current working directory as exactly '%2'.\n"
         "Do not modify the original file. Reply with just the output file name.")
         .arg(imageRef, outputFileName, videoFormatLabel);
+}
+
+QString referenceVariantStepPrompt(const QString &imageRef,
+                                   const QString &videoFormatLabel,
+                                   const QString &outputFileName,
+                                   const QString &referenceSceneFile,
+                                   const QString &productSummary,
+                                   const QString &adaptationNotes,
+                                   const QString &variantDirection,
+                                   const QString &swapInstruction = QString{})
+{
+    const QString marker = QString::fromLatin1(RASTER_IMAGE_PROMPT_MARKER) + QStringLiteral("\n");
+    if (!referenceSceneFile.isEmpty())
+    {
+        QString prompt = marker + QStringLiteral(
+            "You are given TWO image files in the current working directory:\n"
+            "1. '%1' — the REFERENCE SCENE (captured from a winning social-media video/pin).\n"
+            "2. '%2' — OUR REAL PRODUCT%3. This is the EXACT product that must appear in the generated image.\n\n"
+            "Generate a NEW high-quality starting frame for a %4 social-media video by keeping the core "
+            "winning visual hook of '%1' while introducing a tasteful sibling variation:\n"
+            "- Keep from '%1': the flattering camera angle, body/leg framing, pose energy, and prominent "
+            "visual focus on the featured product.\n"
+            "- Controlled variation (change 'a little more' than just the product): introduce a fresh "
+            "complementary backdrop/setting, lighting mood, or outfit color palette so this feels like a "
+            "distinct sibling creative rather than a duplicate of '%1'%5.\n"
+            "- Product accuracy (NON-NEGOTIABLE): completely replace the reference shoes/product with "
+            "OUR EXACT REAL PRODUCT from '%2' — matching its exact silhouette, heel shape/height, straps, "
+            "print/pattern, color, material, and hardware.\n"
+            "- Clean starting frame for video animation: full %4 canvas, zero social UI icons, watermarks, "
+            "logos, or overlaid text.\n")
+            .arg(referenceSceneFile,
+                 imageRef,
+                 productSummary.isEmpty() ? QString{} : QStringLiteral(" (%1)").arg(productSummary),
+                 videoFormatLabel,
+                 variantDirection.trimmed().isEmpty()
+                     ? QString{}
+                     : QStringLiteral(" (%1)").arg(variantDirection.trimmed()));
+        if (!adaptationNotes.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Adaptation notes: %1\n").arg(adaptationNotes.trimmed());
+        }
+        if (!swapInstruction.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Refinement adjustment: %1\n").arg(swapInstruction.trimmed());
+        }
+        prompt += QStringLiteral(
+            "Save the result in the current working directory as exactly '%1'.\n"
+            "Do not modify the input files. Reply with just the output file name.")
+            .arg(outputFileName);
+        return prompt;
+    }
+
+    QString prompt = marker + QStringLiteral(
+        "You are given '%1' — OUR REAL PRODUCT%2 — in the current working directory.\n"
+        "Generate a scroll-stopping %3 fashion-editorial starting frame for a social-media video "
+        "showcasing our exact product in a realistic lifestyle scene%4:\n"
+        "- Product accuracy (NON-NEGOTIABLE): match '%1' exactly (silhouette, heel shape/height, "
+        "straps, print/pattern, color, material).\n"
+        "- Clean starting frame: full %3 canvas, zero watermarks, social icons, or text.\n")
+        .arg(imageRef,
+             productSummary.isEmpty() ? QString{} : QStringLiteral(" (%1)").arg(productSummary),
+             videoFormatLabel,
+             variantDirection.trimmed().isEmpty()
+                 ? QString{}
+                 : QStringLiteral(" (%1)").arg(variantDirection.trimmed()));
+    if (!swapInstruction.trimmed().isEmpty())
+    {
+        prompt += QStringLiteral("- Refinement adjustment: %1\n").arg(swapInstruction.trimmed());
+    }
+    prompt += QStringLiteral(
+        "Save the result in the current working directory as exactly '%1'.\n"
+        "Do not modify the original file. Reply with just the output file name.")
+        .arg(outputFileName);
+    return prompt;
 }
 
 QString seoKeywordForAutoProduct(const QJsonObject &product)
@@ -4736,6 +4812,13 @@ void PaneGeneration::_openProgress()
     // Parented to the main window, not the pane: the pane is disabled while
     // a CLI runs, which would disable a child dialog's Copy/Cancel buttons.
     m_progressDlg = makeProgressDlg(window(), tr("Generation"), &m_progress);
+    m_progressDlg->setMaximumWidth(1600);
+    m_progressDlg->resize(760, 480);
+    if (m_progress.status)
+    {
+        m_progress.status->setWordWrap(true);
+        m_progress.status->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    }
     if (m_progress.cancelBtn)
     {
         connect(m_progress.cancelBtn, &QPushButton::clicked, m_progressDlg, [this]() {
@@ -4760,7 +4843,9 @@ void PaneGeneration::_logProgress(const QString &message)
     }
     if (m_progress.status)
     {
-        m_progress.status->setText(message);
+        const QString compact = message.simplified();
+        m_progress.status->setText(
+            compact.size() > 180 ? (compact.left(179) + QStringLiteral("…")) : compact);
     }
 }
 
@@ -5482,55 +5567,14 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         co_return;
     }
 
-    // Score approved references using real published post statistics from TableVideos
-    // when available (closing the feedback loop across batches), falling back to their
-    // incoming Pinterest/social velocity order.
-    QHash<QString, QList<double>> refMeasuredScores;
-    for (int r = 0; r < m_projects->rowCount(); ++r)
+    // Score approved references AND adaptation modes ("reference_swap" = strict product swap vs
+    // "reference_variant" = product + subtle scene/style variation vs "reference_reimagine")
+    // using real published post statistics from SocialStatistics across both current & legacy directories.
+    const auto refExp = SocialStatistics::summarizeReferenceExperiment(m_videos);
+    QHash<QString, SocialStatistics::ReferencePerformance> refPerfById;
+    for (const auto &rp : refExp.references)
     {
-        const QUuid pid = m_projects->projectId(r);
-        for (const auto *rec : m_videos->recordsForProject(pid))
-        {
-            if (rec->publications.isEmpty())
-            {
-                continue;
-            }
-            const QDir gDir = m_projects->generationDir(r, rec->shortCode, false);
-            QFile dnaFile{gDir.filePath(QStringLiteral("creative_dna.json"))};
-            if (!dnaFile.open(QIODevice::ReadOnly))
-            {
-                continue;
-            }
-            const QJsonObject dna = QJsonDocument::fromJson(dnaFile.readAll()).object();
-            const QString refId = dna.value(QStringLiteral("referenceId")).toString();
-            if (refId.isEmpty())
-            {
-                continue;
-            }
-            double bestScore = -1.0;
-            for (const auto &pub : rec->publications)
-            {
-                for (const auto &snap : pub.snapshots)
-                {
-                    const double views = qMax<qint64>(0, snap.stats.views);
-                    const double savesShares = qMax<qint64>(0, snap.stats.shares);
-                    const double likesComments = qMax<qint64>(0, snap.stats.likes)
-                        + qMax<qint64>(0, snap.stats.comments);
-                    const double denom = pub.followersAtPublish > 0
-                        ? double(pub.followersAtPublish)
-                        : 1000.0;
-                    const double score = (0.45 * views + 2.5 * savesShares + 1.0 * likesComments) / denom;
-                    if (score > bestScore)
-                    {
-                        bestScore = score;
-                    }
-                }
-            }
-            if (bestScore >= 0.0)
-            {
-                refMeasuredScores[refId].append(bestScore);
-            }
-        }
+        refPerfById.insert(rp.referenceId, rp);
     }
 
     struct RankedRef
@@ -5538,6 +5582,10 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         QJsonObject reference;
         QString mediaPath;
         double measuredMedian = -1.0;
+        bool isMeasuredWinner = false;
+        QString bestStrategy;
+        int swapCount = 0;
+        int variantCount = 0;
         int originalRank = 0;
     };
     QList<RankedRef> rankedRefs;
@@ -5546,32 +5594,55 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         const QJsonObject item = rawApprovedRefs[i].toObject();
         const QJsonObject ref = item.value(QStringLiteral("reference")).toObject();
         const QString refId = ref.value(QStringLiteral("id")).toString();
-        double med = -1.0;
-        if (refMeasuredScores.contains(refId))
+        RankedRef rr;
+        rr.reference = ref;
+        rr.mediaPath = item.value(QStringLiteral("mediaPath")).toString();
+        rr.originalRank = i;
+        if (refPerfById.contains(refId))
         {
-            QList<double> vals = refMeasuredScores.value(refId);
-            std::sort(vals.begin(), vals.end());
-            med = vals[vals.size() / 2];
+            const auto &rp = refPerfById[refId];
+            rr.measuredMedian = rp.medianScore;
+            rr.isMeasuredWinner = rp.isWinner;
+            rr.bestStrategy = rp.bestStrategy;
+            rr.swapCount = rp.swapCount;
+            rr.variantCount = rp.variantCount;
         }
-        rankedRefs.append(RankedRef{
-            ref,
-            item.value(QStringLiteral("mediaPath")).toString(),
-            med,
-            i
-        });
+        rankedRefs.append(rr);
     }
     std::stable_sort(rankedRefs.begin(), rankedRefs.end(),
                      [](const RankedRef &a, const RankedRef &b) {
-                         if ((a.measuredMedian >= 0.0) != (b.measuredMedian >= 0.0))
+                         if (a.isMeasuredWinner != b.isMeasuredWinner)
                          {
-                             return a.measuredMedian >= 0.0;
+                             return a.isMeasuredWinner;
                          }
-                         if (a.measuredMedian != b.measuredMedian)
+                         if (a.isMeasuredWinner && a.measuredMedian != b.measuredMedian)
                          {
                              return a.measuredMedian > b.measuredMedian;
                          }
+                         if ((a.measuredMedian < 0.0) != (b.measuredMedian < 0.0))
+                         {
+                             // Untested high-velocity approved refs come ahead of proven below-median refs
+                             return a.measuredMedian < 0.0;
+                         }
                          return a.originalRank < b.originalRank;
                      });
+
+    QList<int> winnerRefIndices;
+    QList<int> freshPoolIndices;
+    for (int i = 0; i < rankedRefs.size(); ++i)
+    {
+        if (rankedRefs[i].isMeasuredWinner)
+        {
+            winnerRefIndices.append(i);
+        }
+        else
+        {
+            freshPoolIndices.append(i);
+        }
+    }
+    int winnerCursor = 0;
+    int freshCursor = 0;
+    QHash<QString, int> globalRefUseCounts;
 
     const int totalCreatives = products.size() * generationsPerProduct;
     int completedCreatives = 0;
@@ -5669,6 +5740,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         {
             GenerationJob::Kind kind = GenerationJob::Video;
             QString formatName;
+            const InspirationAdaptationMethod *method = nullptr;
             QString strategy;
             bool isExploration = false;
             QJsonObject reference;
@@ -5697,24 +5769,42 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                        ? QStringLiteral("carousel")
                        : QStringLiteral("image"));
             slot.isExploration = (s >= exploitCount);
-            slot.sampledProps = sampledVariants.value(s);
-            for (const auto &sp : slot.sampledProps)
-            {
-                slot.keptValueIds << sp.id;
-            }
+
+            bool hasRefMedia = false;
+            int totalPriorForRef = 0;
+            QString refBestMethodId;
 
             if (!rankedRefs.isEmpty())
             {
                 int chosenRefIdx = 0;
                 if (!slot.isExploration)
                 {
-                    const int poolCap = qMax(1, qMin(int(rankedRefs.size()), qMax(3, exploitCount)));
-                    chosenRefIdx = s % poolCap;
+                    if (!winnerRefIndices.isEmpty() && (freshPoolIndices.isEmpty() || (s % 2 == 0)))
+                    {
+                        chosenRefIdx = winnerRefIndices[winnerCursor % winnerRefIndices.size()];
+                        ++winnerCursor;
+                    }
+                    else if (!freshPoolIndices.isEmpty())
+                    {
+                        chosenRefIdx = freshPoolIndices[freshCursor % freshPoolIndices.size()];
+                        ++freshCursor;
+                    }
+                    else
+                    {
+                        chosenRefIdx = s % rankedRefs.size();
+                    }
                 }
                 else
                 {
-                    // Exploration prefers untested / lower-ranked approved references
-                    chosenRefIdx = int(rankedRefs.size()) - 1 - ((s - exploitCount) % rankedRefs.size());
+                    if (!freshPoolIndices.isEmpty())
+                    {
+                        chosenRefIdx = freshPoolIndices[freshCursor % freshPoolIndices.size()];
+                        ++freshCursor;
+                    }
+                    else
+                    {
+                        chosenRefIdx = int(rankedRefs.size()) - 1 - ((s - exploitCount) % rankedRefs.size());
+                    }
                 }
                 const RankedRef &picked = rankedRefs[chosenRefIdx];
                 slot.reference = picked.reference;
@@ -5722,25 +5812,18 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 const QString rid = picked.reference.value(QStringLiteral("id")).toString();
                 const int priorUses = refUseCounts.value(rid, 0);
                 refUseCounts[rid] = priorUses + 1;
+                const int globalUses = globalRefUseCounts.value(rid, 0);
+                globalRefUseCounts[rid] = globalUses + 1;
 
-                const bool hasRefMedia = !slot.referenceMediaPath.isEmpty()
+                hasRefMedia = !slot.referenceMediaPath.isEmpty()
                     && QFileInfo::exists(slot.referenceMediaPath);
-                if (hasRefMedia && priorUses == 0 && !slot.isExploration)
+                totalPriorForRef = picked.swapCount + picked.variantCount + globalUses;
+                if (picked.isMeasuredWinner)
                 {
-                    slot.strategy = QStringLiteral("reference_swap");
-                }
-                else if (hasRefMedia)
-                {
-                    slot.strategy = (priorUses % 2 == 0)
-                        ? QStringLiteral("reference_swap")
-                        : QStringLiteral("reference_reimagine");
-                }
-                else
-                {
-                    slot.strategy = QStringLiteral("reference_reimagine");
+                    refBestMethodId = picked.bestStrategy;
                 }
 
-                if (hasRefMedia && cachedPlanFramesByRefId.size() < 6 && !cachedPlanFramesByRefId.contains(rid))
+                if (hasRefMedia && cachedPlanFramesByRefId.size() < 8 && !cachedPlanFramesByRefId.contains(rid))
                 {
                     QString openName;
                     const QString prefix = QStringLiteral("ref_%1").arg(cachedPlanFramesByRefId.size() + 1);
@@ -5750,9 +5833,23 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 }
                 slot.stagedPlanRefFrames = cachedPlanFramesByRefId.value(rid);
             }
-            else
+
+            slot.method = InspirationAdaptationMethod::selectForSlot(
+                hasRefMedia,
+                s,
+                totalPriorForRef,
+                slot.isExploration,
+                refBestMethodId,
+                refExp.winningStrategy);
+            slot.strategy = slot.method ? slot.method->id() : QStringLiteral("editorial_ab");
+
+            if (!slot.method || slot.method->usesSceneProperties())
             {
-                slot.strategy = QStringLiteral("editorial_ab");
+                slot.sampledProps = sampledVariants.value(s);
+                for (const auto &sp : slot.sampledProps)
+                {
+                    slot.keptValueIds << sp.id;
+                }
             }
             slotsForProduct << slot;
         }
@@ -5789,18 +5886,30 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
             }
             const QString refTitle = sl.reference.value(QStringLiteral("title")).toString();
             const QString refNotes = sl.reference.value(QStringLiteral("notes")).toString();
+            InspirationAdaptationMethod::PromptContext planCtx;
+            planCtx.productImageFile = planProdFile;
+            planCtx.productSummary = productSummary;
+            planCtx.referenceFrames = sl.stagedPlanRefFrames;
+            planCtx.referenceTitle = refTitle;
+            planCtx.adaptationNotes = refNotes;
+            planCtx.videoFormatLabel = videoFormatLabel;
+
             planPrompt += QStringLiteral(
-                "- Slot %1: format=%2 | mode=%3 (%4)%5%6%7\n")
+                "- Slot %1: format=%2 | method=%3 (%4)%5%6%7\n")
                 .arg(s)
                 .arg(sl.formatName,
                      sl.strategy,
-                     sl.isExploration ? QStringLiteral("explore new angle") : QStringLiteral("proven winner style"),
+                     sl.method ? sl.method->name() : QStringLiteral("Editorial"),
                      refTitle.isEmpty() ? QString{} : QStringLiteral(" | reference=\"%1\"").arg(refTitle),
                      refNotes.isEmpty() ? QString{} : QStringLiteral(" | notes=\"%1\"").arg(refNotes),
                      sl.stagedPlanRefFrames.isEmpty()
                          ? QString{}
                          : QStringLiteral(" | reference frames: %1").arg(sl.stagedPlanRefFrames.join(QStringLiteral(", "))));
-            if (!propFrags.isEmpty())
+            if (sl.method)
+            {
+                planPrompt += QStringLiteral("  Method rule: %1\n").arg(sl.method->plannerSlotInstruction(planCtx));
+            }
+            if (!propFrags.isEmpty() && (!sl.method || sl.method->usesSceneProperties()))
             {
                 planPrompt += QStringLiteral("  A/B properties: %1\n").arg(propFrags.join(QStringLiteral("; ")));
             }
@@ -5818,6 +5927,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
             planPrompt += m_favoriteVideoPrompts->asPromptSection();
         }
         planPrompt += buildMeasuredWinnersPromptSection(m_projects, m_videos);
+        planPrompt += refExp.plannerPromptAddendum();
         planPrompt += QStringLiteral(
             "VIRAL HOOK GUIDELINES (Maximize 3-Second Retention):\n"
             "Write 10 short, punchy hooks (< 8 words each) covering distinct psychological triggers:\n"
@@ -5923,6 +6033,10 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 {
                     for (int s = 0; s < slotsForProduct.size(); ++s)
                     {
+                        if (slotsForProduct[s].method && !slotsForProduct[s].method->usesSceneProperties())
+                        {
+                            continue;
+                        }
                         const int pick = s % addedValIds.size();
                         slotsForProduct[s].keptValueIds << addedValIds[pick];
                         PropertySampler::SampledValue sv;
@@ -5998,22 +6112,50 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                         .arg(productSummary);
                 }
             }
-            QStringList fullParts;
-            if (!basePrompt.endsWith(QLatin1Char('.')))
+            QStringList slotPropFragments;
+            if (!sl.method || sl.method->usesSceneProperties())
             {
-                basePrompt += QLatin1Char('.');
+                for (const auto &sp : sl.sampledProps)
+                {
+                    const QString frag = sp.promptFragment.trimmed();
+                    if (!frag.isEmpty())
+                    {
+                        slotPropFragments << frag;
+                    }
+                }
             }
-            fullParts << basePrompt;
-            for (const auto &sp : sl.sampledProps)
+            InspirationAdaptationMethod::PromptContext finalizeCtx;
+            finalizeCtx.productImageFile = planProdFile;
+            finalizeCtx.productSummary = productSummary;
+            finalizeCtx.referenceFrames = sl.stagedPlanRefFrames;
+            finalizeCtx.referenceTitle = sl.reference.value(QStringLiteral("title")).toString();
+            finalizeCtx.adaptationNotes = sl.reference.value(QStringLiteral("notes")).toString();
+            finalizeCtx.videoFormatLabel = videoFormatLabel;
+            finalizeCtx.propertyFragments = slotPropFragments.join(QStringLiteral(". "));
+
+            if (sl.kind == GenerationJob::Video && sl.method)
             {
-                QString frag = sp.promptFragment.trimmed();
-                if (!frag.isEmpty())
+                sl.prompt = sl.method->finalizeVideoAnimationPrompt(basePrompt, finalizeCtx);
+            }
+            else if (sl.method && sl.method->appendsPropertiesToVideoPrompt())
+            {
+                QStringList fullParts;
+                if (!basePrompt.endsWith(QLatin1Char('.')))
+                {
+                    basePrompt += QLatin1Char('.');
+                }
+                fullParts << basePrompt;
+                for (QString frag : slotPropFragments)
                 {
                     if (!frag.endsWith(QLatin1Char('.'))) frag += QLatin1Char('.');
                     fullParts << frag;
                 }
+                sl.prompt = fullParts.join(QStringLiteral(" "));
             }
-            sl.prompt = fullParts.join(QStringLiteral(" "));
+            else
+            {
+                sl.prompt = basePrompt;
+            }
 
             sl.hook = so.value(QStringLiteral("hook")).toString().trimmed();
             sl.description = so.value(QStringLiteral("description")).toString().trimmed();
@@ -6118,16 +6260,32 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 QString swapFixNote;
                 bool haveStartingFrame = false;
 
-                const bool doRefSwap = !refSceneName.isEmpty() && sl.strategy == QLatin1String("reference_swap");
-                const int maxFidelityRounds = doRefSwap ? 2 : 1;
+                const int maxFidelityRounds = 2;
+                const InspirationAdaptationMethod *slotMethod = sl.method
+                    ? sl.method
+                    : InspirationAdaptationMethod::all().value(
+                          refSceneName.isEmpty() ? QStringLiteral("editorial_ab") : QStringLiteral("reference_swap"),
+                          nullptr);
+
+                QStringList variantPropHints;
+                if (!slotMethod || slotMethod->usesSceneProperties())
+                {
+                    for (const auto &sp : sl.sampledProps)
+                    {
+                        if (!sp.promptFragment.trimmed().isEmpty())
+                        {
+                            variantPropHints << sp.promptFragment.trimmed();
+                        }
+                    }
+                }
+                const QString variantDirection = variantPropHints.join(QStringLiteral("; "));
 
                 for (int round = 1; round <= maxFidelityRounds && !m_batchCancelled; ++round)
                 {
-                    _logProgress(doRefSwap
-                        ? tr("[%1] Step 1/2 — Generating product-swapped starting frame (round %2/%3)...")
-                            .arg(slotTag).arg(round).arg(maxFidelityRounds)
-                        : tr("[%1] Step 1/2 — Bootstrapping editorial starting frame...")
-                            .arg(slotTag));
+                    _logProgress(tr("[%1] Step 1/2 — Generating starting frame via %2 (round %3/%4)...")
+                        .arg(slotTag, slotMethod ? slotMethod->name() : sl.strategy)
+                        .arg(round)
+                        .arg(maxFidelityRounds));
 
                     if (QFileInfo::exists(swappedTarget))
                     {
@@ -6135,12 +6293,20 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                         QFile::rename(swappedTarget, swappedBackup);
                     }
 
-                    const QString stepPrompt = doRefSwap
-                        ? imageStepPrompt(DialogGenerationOptions::ImageMode::ReplaceReferenceProduct,
-                                          stagedProdName, videoFormatLabel, false,
-                                          GENERATED_IMAGE_NAME, refSceneName, productSummary,
-                                          sl.reference.value(QStringLiteral("notes")).toString(),
-                                          swapFixNote)
+                    InspirationAdaptationMethod::PromptContext stepCtx;
+                    stepCtx.productImageFile = stagedProdName;
+                    stepCtx.productSummary = productSummary;
+                    stepCtx.referenceSceneFile = refSceneName;
+                    stepCtx.referenceFrames = sl.stagedPlanRefFrames;
+                    stepCtx.referenceTitle = sl.reference.value(QStringLiteral("title")).toString();
+                    stepCtx.adaptationNotes = sl.reference.value(QStringLiteral("notes")).toString();
+                    stepCtx.videoFormatLabel = videoFormatLabel;
+                    stepCtx.outputImageFile = GENERATED_IMAGE_NAME;
+                    stepCtx.propertyFragments = variantDirection;
+                    stepCtx.refinementFixNote = swapFixNote;
+
+                    const QString stepPrompt = slotMethod
+                        ? slotMethod->buildVideoStartingFramePrompt(stepCtx)
                         : imageStepPrompt(DialogGenerationOptions::ImageMode::BootstrapImage,
                                           stagedProdName, videoFormatLabel, false,
                                           GENERATED_IMAGE_NAME);
@@ -6181,18 +6347,18 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                     QFile::remove(swappedBackup);
                     haveStartingFrame = true;
 
-                    if (!doRefSwap || round >= maxFidelityRounds)
+                    if (round >= maxFidelityRounds)
                     {
                         break;
                     }
 
-                    // Automatic AI vision check: verify our product accurately replaced the reference product
+                    // Automatic AI vision check across ALL video modes: verify our exact product design & clean frame
                     const QString verifyPrompt = QStringLiteral(
                         "Inspect '%1' (generated starting frame) against '%2' (our real product: %3) "
                         "in the current working directory.\n"
-                        "Check: (1) Did our exact product design (silhouette, heel shape/height, straps, "
-                        "color/pattern) cleanly replace the old reference product? "
-                        "(2) Is the frame free of watermarks, social icons, and garbled artifacts?\n"
+                        "Check: (1) Does the featured product accurately match our exact real product "
+                        "(silhouette, heel shape/height, straps, color/pattern)? "
+                        "(2) Is the frame crisp and free of watermarks, social icons, text, and garbled anatomy?\n"
                         "Reply with STRICT JSON only:\n"
                         "{\"ok\": true|false, \"fix\": \"<concise fix instruction if ok is false>\"}")
                         .arg(GENERATED_IMAGE_NAME, stagedProdName, productSummary);
@@ -6285,14 +6451,35 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 }
                 QStringList refImages{stagedProdPath};
                 QString effectiveImgPrompt = sl.prompt;
-                if (!refSceneName.isEmpty() && sl.strategy == QLatin1String("reference_swap"))
+                if (sl.method)
                 {
-                    refImages << slotStaging.absoluteFilePath(refSceneName);
-                    effectiveImgPrompt = QStringLiteral(
-                        "Recreate the scene composition, pose, lighting, and setting of '%1', "
-                        "completely replacing its featured product with our exact real product "
-                        "shown in '%2' (%3). %4")
-                        .arg(refSceneName, stagedProdName, productSummary, sl.prompt);
+                    QStringList slotPropFrags;
+                    if (sl.method->usesSceneProperties())
+                    {
+                        for (const auto &sp : sl.sampledProps)
+                        {
+                            if (!sp.promptFragment.trimmed().isEmpty())
+                            {
+                                slotPropFrags << sp.promptFragment.trimmed();
+                            }
+                        }
+                    }
+                    InspirationAdaptationMethod::PromptContext imgCtx;
+                    imgCtx.productImageFile = stagedProdName;
+                    imgCtx.productSummary = productSummary;
+                    imgCtx.referenceSceneFile = refSceneName;
+                    imgCtx.referenceFrames = sl.stagedPlanRefFrames;
+                    imgCtx.referenceTitle = sl.reference.value(QStringLiteral("title")).toString();
+                    imgCtx.adaptationNotes = sl.reference.value(QStringLiteral("notes")).toString();
+                    imgCtx.videoFormatLabel = videoFormatLabel;
+                    imgCtx.propertyFragments = slotPropFrags.join(QStringLiteral(". "));
+
+                    bool attachRef = false;
+                    effectiveImgPrompt = sl.method->buildStillOrCarouselPrompt(sl.prompt, imgCtx, &attachRef);
+                    if (attachRef && !refSceneName.isEmpty())
+                    {
+                        refImages << slotStaging.absoluteFilePath(refSceneName);
+                    }
                 }
 
                 const int slideCount = (sl.kind == GenerationJob::Slideshow) ? 4 : 1;
@@ -6402,6 +6589,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 {QStringLiteral("referenceUrl"), sl.reference.value(QStringLiteral("url")).toString()},
                 {QStringLiteral("format"), sl.formatName},
                 {QStringLiteral("strategy"), sl.strategy},
+                {QStringLiteral("usedSceneProperties"), !sl.method || sl.method->usesSceneProperties()},
                 {QStringLiteral("isExploration"), sl.isExploration},
                 {QStringLiteral("hookCategory"), sl.hookCategory},
                 {QStringLiteral("hook"), sl.hook},

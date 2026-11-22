@@ -45,6 +45,7 @@ DialogGenerationPlan::DialogGenerationPlan(const QList<QList<PlanProperty>> &pro
     , m_savedPrompts(savedPrompts)
 {
     ui->setupUi(this);
+    setMaximumWidth(1600);
     if (!videoFormatLabel.isEmpty())
     {
         setWindowTitle(tr("Generation plan — %1").arg(videoFormatLabel));

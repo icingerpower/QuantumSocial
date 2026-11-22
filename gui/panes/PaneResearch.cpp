@@ -10,6 +10,7 @@
 #include "model/research/ResearchStore.h"
 #include "model/research/ReferenceAssessor.h"
 
+#include <QApplication>
 #include <QAudioOutput>
 #include <algorithm>
 #include <QButtonGroup>
@@ -43,6 +44,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
 #include <QShortcut>
 #include <QSignalBlocker>
@@ -64,6 +66,18 @@
 #endif
 
 namespace {
+class StableCardsScrollArea : public QScrollArea
+{
+public:
+    using QScrollArea::QScrollArea;
+
+protected:
+    bool focusNextPrevChild(bool next) override
+    {
+        return QWidget::focusNextPrevChild(next);
+    }
+};
+
 QPushButton *button(QHBoxLayout *layout, const QString &text, const QString &name = {})
 {
     auto *b = new QPushButton(text);
@@ -678,16 +692,31 @@ QWidget *PaneResearch::buildReferences()
     m_splitters << split;
     layout->addWidget(split, 1);
 
-    auto *scroll = new QScrollArea;
-    scroll->setWidgetResizable(true);
+    m_cardsScroll = new StableCardsScrollArea;
+    m_cardsScroll->setObjectName("referenceScrollArea");
+    m_cardsScroll->setWidgetResizable(true);
     m_cards = new QWidget;
     m_cards->setObjectName("referenceCards");
     m_cardsLayout = new QGridLayout(m_cards);
     m_cardsLayout->setAlignment(Qt::AlignTop);
     m_cardsLayout->setColumnStretch(0, 1);
     m_cardsLayout->setColumnStretch(1, 1);
-    scroll->setWidget(m_cards);
-    split->addWidget(scroll);
+    m_cardsScroll->setWidget(m_cards);
+    connect(m_cardsScroll->verticalScrollBar(), &QAbstractSlider::rangeChanged, this, [this](int, int max) {
+        if (m_pendingScrollRestoreY >= 0 && max > 0)
+        {
+            const int target = qMin(m_pendingScrollRestoreY, max);
+            QTimer::singleShot(0, this, [this, target]() {
+                if (m_cardsScroll && m_cardsScroll->verticalScrollBar())
+                {
+                    auto *vb = m_cardsScroll->verticalScrollBar();
+                    vb->setValue(qMin(target, vb->maximum()));
+                }
+                m_pendingScrollRestoreY = -1;
+            });
+        }
+    });
+    split->addWidget(m_cardsScroll);
 
     auto *detail = new QWidget;
     auto *details = new QVBoxLayout(detail);
@@ -831,8 +860,18 @@ QWidget *PaneResearch::buildReferences()
         assessNext();
     });
 
-    connect(m_sortReferences, &QComboBox::currentIndexChanged, this, [this] { m_visibleCards = 24; refreshReferences(); });
-    connect(m_referenceSearch, &QLineEdit::textChanged, this, [this] { m_visibleCards = 24; refreshReferences(); });
+    connect(m_sortReferences, &QComboBox::currentIndexChanged, this, [this] {
+        m_visibleCards = 24;
+        m_pendingScrollRestoreY = 0;
+        if (m_cardsScroll && m_cardsScroll->verticalScrollBar()) m_cardsScroll->verticalScrollBar()->setValue(0);
+        refreshReferences();
+    });
+    connect(m_referenceSearch, &QLineEdit::textChanged, this, [this] {
+        m_visibleCards = 24;
+        m_pendingScrollRestoreY = 0;
+        if (m_cardsScroll && m_cardsScroll->verticalScrollBar()) m_cardsScroll->verticalScrollBar()->setValue(0);
+        refreshReferences();
+    });
     auto *approveShortcut = new QShortcut(QKeySequence("Ctrl+Return"), page);
     approveShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(approveShortcut, &QShortcut::activated, this, [this] { review("approved"); });
@@ -863,6 +902,11 @@ void PaneResearch::setFilter(const QString &filter)
         it.value()->setChecked(it.key() == m_activeFilter);
     }
     m_visibleCards = 24;
+    m_pendingScrollRestoreY = 0;
+    if (m_cardsScroll && m_cardsScroll->verticalScrollBar())
+    {
+        m_cardsScroll->verticalScrollBar()->setValue(0);
+    }
     refreshReferences();
 }
 
@@ -1041,10 +1085,32 @@ void PaneResearch::showProduct()
 
 void PaneResearch::refreshReferences()
 {
+    const int targetScrollY = (m_pendingScrollRestoreY >= 0)
+        ? m_pendingScrollRestoreY
+        : ((m_cardsScroll && m_cardsScroll->verticalScrollBar())
+               ? m_cardsScroll->verticalScrollBar()->value()
+               : 0);
+
+    // Move focus onto m_cardsScroll (outside m_cards) BEFORE hiding/deleting cards:
+    // QWidget::hide() checks window()->focusWidget(), and if focus is inside m_cards,
+    // focusNextPrevChild hops across cards and triggers QScrollArea::ensureWidgetVisible!
+    QWidget *fw = window() ? window()->focusWidget() : QApplication::focusWidget();
+    if (fw && m_cards && m_cards->isAncestorOf(fw) && m_cardsScroll)
+    {
+        m_cardsScroll->setFocus(Qt::OtherFocusReason);
+    }
+
+    const int prevCardsH = m_cards ? m_cards->height() : 0;
+    if (m_cards && prevCardsH > 0 && targetScrollY > 0)
+    {
+        m_cards->setMinimumHeight(prevCardsH);
+    }
+
     QStringList selected;
     for (auto it = m_cardChecks.cbegin(); it != m_cardChecks.cend(); ++it)
         if (it.value()->isChecked()) selected << it.key();
     m_cardChecks.clear();
+    m_displayedRefIds.clear();
     while (auto *item = m_cardsLayout->takeAt(0))
     {
         if (item->widget()) { item->widget()->hide(); item->widget()->deleteLater(); }
@@ -1280,6 +1346,7 @@ void PaneResearch::refreshReferences()
             reviewIds({id}, "approved");
         });
         auto *reject = button(actions, st == QLatin1String("rejected") ? tr("✕ Rejected") : tr("✕ Reject"));
+        reject->setObjectName("rejectReference_" + id);
         if (st == QLatin1String("rejected"))
         {
             reject->setStyleSheet(QStringLiteral("color: #e89774; font-weight: 600;"));
@@ -1287,6 +1354,7 @@ void PaneResearch::refreshReferences()
         connect(reject, &QPushButton::clicked, this, [this, id] {
             reviewIds({id}, "rejected");
         });
+        m_displayedRefIds.append(id);
         m_cardsLayout->addWidget(card, (count - 1) / 2, (count - 1) % 2);
     }
     if (count == 0)
@@ -1300,6 +1368,29 @@ void PaneResearch::refreshReferences()
         auto *more = new QPushButton(tr("Show more (%1 remaining)").arg(count - m_visibleCards));
         m_cardsLayout->addWidget(more, (m_visibleCards + 1) / 2, 0, 1, 2);
         connect(more, &QPushButton::clicked, this, [this] { m_visibleCards += 24; refreshReferences(); });
+    }
+
+    m_pendingScrollRestoreY = targetScrollY;
+    if (m_cards)
+    {
+        m_cards->setMinimumHeight(0);
+        m_cardsLayout->activate();
+    }
+    if (m_cardsScroll && m_cardsScroll->verticalScrollBar())
+    {
+        auto *vbar = m_cardsScroll->verticalScrollBar();
+        if (vbar->maximum() > 0 || targetScrollY == 0)
+        {
+            vbar->setValue(qMin(targetScrollY, vbar->maximum()));
+        }
+        QTimer::singleShot(30, this, [this]() {
+            if (m_pendingScrollRestoreY >= 0 && m_cardsScroll && m_cardsScroll->verticalScrollBar())
+            {
+                auto *vb = m_cardsScroll->verticalScrollBar();
+                vb->setValue(qMin(m_pendingScrollRestoreY, vb->maximum()));
+                m_pendingScrollRestoreY = -1;
+            }
+        });
     }
     // Refresh evidence without replacing unsaved text or restarting playback.
     const auto current = m_store->reference(m_referenceId);
@@ -2296,6 +2387,11 @@ void PaneResearch::addFiles()
 bool PaneResearch::saveReference()
 {
     if (m_referenceId.isEmpty()) return true;
+    const QJsonObject cur = m_store->reference(m_referenceId);
+    if (cur.isEmpty() || (text(cur, "title") == m_title->text() && text(cur, "notes") == m_notes->toPlainText()))
+    {
+        return true;
+    }
     const bool ok = m_store->updateReference(m_referenceId, {{"title", m_title->text()}, {"notes", m_notes->toPlainText()}});
     if (!ok) report(false);
     return ok;
@@ -2439,22 +2535,78 @@ void PaneResearch::review(const QString &status)
 void PaneResearch::reviewIds(const QStringList &ids, const QString &status)
 {
     if (!saveReference()) return;
-    const bool ok = m_store->review(ids, status, {});
-    report(ok, tr("%1 reference(s) marked %2.").arg(ids.size()).arg(status));
-    if (!ok) return;
-    if (m_nextAfterReview->isChecked() && status != "pending" && m_activeFilter == "pending")
+
+    const bool advanceNext = m_nextAfterReview->isChecked()
+        && status != QLatin1String("pending")
+        && m_activeFilter == QLatin1String("pending");
+
+    QString nextCandidateId;
+    if (advanceNext)
     {
-        for (const auto &v : m_store->references())
+        int anchorIdx = -1;
+        for (const QString &rid : ids)
         {
-            const auto r = v.toObject();
-            const QString id = text(r, "id");
-            if (text(r, "accountId") == accountId() && text(r, "status") == "pending" && m_cardChecks.contains(id))
-            { selectReference(id); return; }
+            const int idx = m_displayedRefIds.indexOf(rid);
+            if (idx >= 0 && (anchorIdx < 0 || idx < anchorIdx))
+            {
+                anchorIdx = idx;
+            }
         }
-        m_referenceId.clear(); showReference();
+        if (anchorIdx < 0)
+        {
+            anchorIdx = 0;
+        }
+        for (int i = anchorIdx; i < m_displayedRefIds.size(); ++i)
+        {
+            if (!ids.contains(m_displayedRefIds[i]))
+            {
+                nextCandidateId = m_displayedRefIds[i];
+                break;
+            }
+        }
+        if (nextCandidateId.isEmpty())
+        {
+            for (int i = anchorIdx - 1; i >= 0; --i)
+            {
+                if (!ids.contains(m_displayedRefIds[i]))
+                {
+                    nextCandidateId = m_displayedRefIds[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    m_refreshing = true;
+    const bool ok = m_store->review(ids, status, {});
+    m_refreshing = false;
+    report(ok, tr("%1 reference(s) marked %2.").arg(ids.size()).arg(status));
+    if (!ok)
+    {
+        refreshReferences();
+        return;
+    }
+
+    if (advanceNext)
+    {
+        m_referenceId = nextCandidateId;
+        showReference();
+        refreshReferences();
+        if (m_referenceId.isEmpty() && !m_displayedRefIds.isEmpty())
+        {
+            selectReference(m_displayedRefIds.first());
+        }
     }
     else
     {
+        if (status != QLatin1String("pending")
+            && m_activeFilter == QLatin1String("pending")
+            && ids.contains(m_referenceId))
+        {
+            m_referenceId.clear();
+            showReference();
+        }
+        refreshReferences();
         updateCreateProjectButton();
     }
 }
@@ -2736,6 +2888,7 @@ void PaneResearch::openAutoBatchDialog()
     QDialog dlg(this);
     dlg.setObjectName(QStringLiteral("dialogAutoBatch"));
     dlg.setWindowTitle(tr("Auto-Generate Creative Batch"));
+    dlg.setMaximumWidth(1600);
     dlg.resize(780, 580);
     auto *layout = new QVBoxLayout(&dlg);
 

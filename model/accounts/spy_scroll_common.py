@@ -164,10 +164,27 @@ def normalize_publish_date(raw: Optional[Any]) -> str:
     if text.isdigit():
         return normalize_publish_date(int(text))
 
-    # Direct YYYY-MM-DD prefix (covers ISO-8601 "2026-10-01T08:32:17Z")
-    m_iso = re.match(r"^(\d{4}-\d{2}-\d{2})(?:[T\s]|$)", text)
+    # Direct YYYY-M-D or YYYY-MM-DD prefix (covers ISO-8601 "2026-10-01T08:32:17Z")
+    m_iso = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s]|$)", text)
     if m_iso:
-        return m_iso.group(1)
+        try:
+            dt_iso = datetime.date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
+            return dt_iso.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # TikTok current-year month-day badge ("3-2", "11-18")
+    m_md = re.match(r"^(\d{1,2})-(\d{1,2})$", text)
+    if m_md:
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        month, day = int(m_md.group(1)), int(m_md.group(2))
+        for year in (today.year, today.year - 1):
+            try:
+                cand_date = datetime.date(year, month, day)
+                if cand_date <= today + datetime.timedelta(days=1):
+                    return cand_date.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
 
     # RFC-2822 (Pinterest Relay createdAt: "Thu, 01 Oct 2026 08:32:17 +0000")
     try:
@@ -177,7 +194,7 @@ def normalize_publish_date(raw: Optional[Any]) -> str:
     except Exception:
         pass
 
-    # Relative age ("3 days ago", "2 weeks ago", "5 months ago", "1 year ago", French "il y a 2 semaines")
+    # Relative age ("3 days ago", "2w ago", "5h ago", "1y ago", French "il y a 2 semaines")
     lower = text.lower()
     rel = re.search(
         r"(\d+)\s*(hour|hr|heure|day|jour|week|semaine|month|mois|year|an)",
@@ -194,6 +211,20 @@ def normalize_publish_date(raw: Optional[Any]) -> str:
         elif unit.startswith(("month", "mois")):
             days = qty * 30
         elif unit.startswith(("year", "an")):
+            days = qty * 365
+        approx = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+        return approx.strftime("%Y-%m-%d")
+
+    rel_compact = re.match(r"^(\d+)\s*([smhdwyj])(?:\s*ago)?$", lower)
+    if rel_compact:
+        qty = int(rel_compact.group(1))
+        unit_ch = rel_compact.group(2)
+        days = 0
+        if unit_ch in ("d", "j"):
+            days = qty
+        elif unit_ch == "w":
+            days = qty * 7
+        elif unit_ch == "y":
             days = qty * 365
         approx = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
         return approx.strftime("%Y-%m-%d")
@@ -316,6 +347,8 @@ def download_media_file(
     download_dir: str,
     index: int,
     platform_id: str,
+    cookie_header: str = "",
+    fallback_media_url: str = "",
 ) -> str:
     if not media_url or not download_dir:
         return ""
@@ -338,7 +371,7 @@ def download_media_file(
                 return _write_qt_compatible_media(sf.read(), dest_prefix, ext, platform_id)
             return ""
 
-        accept_hdr = "image/jpeg,image/png,*/*;q=0.8"
+        accept_hdr = "video/mp4,image/jpeg,image/png,*/*;q=0.8"
 
         # Try Playwright's authenticated request context first when available.
         if context is not None and media_url.startswith(("http://", "https://")):
@@ -350,7 +383,7 @@ def download_media_file(
                         "User-Agent": USER_AGENT,
                         "Accept": accept_hdr,
                     },
-                    timeout=15_000,
+                    timeout=20_000,
                 )
                 if resp.ok:
                     body = resp.body()
@@ -362,15 +395,15 @@ def download_media_file(
                 log(platform_id, f"context.request.get failed for {media_url}: {exc}")
 
         if media_url.startswith(("http://", "https://")):
-            req = urllib.request.Request(
-                media_url,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Referer": referer_url,
-                    "Accept": accept_hdr,
-                },
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            headers = {
+                "User-Agent": USER_AGENT,
+                "Referer": referer_url,
+                "Accept": accept_hdr,
+            }
+            if cookie_header:
+                headers["Cookie"] = cookie_header
+            req = urllib.request.Request(media_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 body = resp.read()
                 if body and len(body) > 128:
                     ct = resp.headers.get("Content-Type", "")
@@ -378,6 +411,18 @@ def download_media_file(
                     return _write_qt_compatible_media(body, dest_prefix, ext, platform_id)
     except Exception as exc:
         log(platform_id, f"download_media_file failed for {media_url}: {exc}")
+
+    if fallback_media_url and fallback_media_url != media_url:
+        return download_media_file(
+            context,
+            fallback_media_url,
+            referer_url,
+            download_dir,
+            index,
+            platform_id,
+            cookie_header=cookie_header,
+            fallback_media_url="",
+        )
     return ""
 
 
@@ -1075,15 +1120,28 @@ def run_spy_worker(
                         last_badge_state=badge_state_cache,
                     )
 
+                cached_cookie_header = ""
+
                 def harvest_current_page() -> int:
                     """Extracts visible posts, enriches stats, applies quality filter.
 
                     Returns the number of NEW unique candidate URLs browsed on this pass.
                     """
-                    nonlocal page
+                    nonlocal page, cached_cookie_header
                     page = _resolve_active_page(context, page)
                     if page is None:
                         return 0
+                    if not cached_cookie_header:
+                        try:
+                            cookies = context.cookies() or []
+                            if cookies:
+                                cached_cookie_header = "; ".join(
+                                    f"{c.get('name')}={c.get('value')}"
+                                    for c in cookies
+                                    if c.get("name") and c.get("value") is not None
+                                )
+                        except Exception:
+                            pass
                     try:
                         raw_items = page.evaluate(extract_js) or []
                     except PlaywrightError as exc:
@@ -1112,6 +1170,7 @@ def run_spy_worker(
                             "url": post_url,
                             "title": str(item.get("title") or "").strip(),
                             "media_url": media_url,
+                            "fallback_media_url": str(item.get("fallback_media_url") or "").strip(),
                             "local_media": "",
                             "author": str(item.get("author") or "").strip(),
                             "published_at": normalize_publish_date(item.get("published_at")),
@@ -1329,7 +1388,26 @@ def run_spy_worker(
 
                         try:
                             page.evaluate(
-                                "window.scrollBy(0, Math.max(700, Math.floor(window.innerHeight * 0.85)));"
+                                """() => {
+                                    const delta = Math.max(700, Math.floor(window.innerHeight * 0.85));
+                                    const beforeY = window.scrollY;
+                                    window.scrollBy(0, delta);
+                                    if (Math.abs(window.scrollY - beforeY) >= 10) return;
+                                    const scrollables = Array.from(
+                                        document.querySelectorAll('main, [id*="main"], section, div')
+                                    ).filter(el => {
+                                        if (el.id === '__qs_spy_badge') return false;
+                                        const st = window.getComputedStyle(el);
+                                        return (st.overflowY === 'auto' || st.overflowY === 'scroll')
+                                            && el.scrollHeight > el.clientHeight + 80;
+                                    });
+                                    scrollables.sort(
+                                        (a, b) => (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight)
+                                    );
+                                    if (scrollables.length > 0) {
+                                        scrollables[0].scrollBy(0, delta);
+                                    }
+                                }"""
                             )
                         except PlaywrightError as exc:
                             if _is_navigation_error(exc):
@@ -1399,9 +1477,21 @@ def run_spy_worker(
             posts_list.sort(key=lambda item: int(item.get("_score") or 0), reverse=True)
 
             active_context = context if _resolve_active_page(context, None) is not None else None
+            if active_context is not None:
+                try:
+                    cookies = active_context.cookies() or []
+                    if cookies:
+                        cached_cookie_header = "; ".join(
+                            f"{c.get('name')}={c.get('value')}"
+                            for c in cookies
+                            if c.get("name") and c.get("value") is not None
+                        )
+                except Exception:
+                    pass
             for idx, post in enumerate(posts_list, start=1):
                 post.pop("_score", None)
                 post.pop("is_promoted", None)
+                fallback_url = str(post.pop("fallback_media_url", "") or "").strip()
                 media_url = post.get("media_url") or ""
                 if media_url and not post.get("local_media"):
                     local_path = download_media_file(
@@ -1411,6 +1501,8 @@ def run_spy_worker(
                         download_dir,
                         idx,
                         platform_id,
+                        cookie_header=cached_cookie_header,
+                        fallback_media_url=fallback_url,
                     )
                     post["local_media"] = local_path
 
@@ -1436,6 +1528,7 @@ def run_spy_worker(
             for post in posts_list:
                 post.pop("_score", None)
                 post.pop("is_promoted", None)
+                post.pop("fallback_media_url", None)
             result["posts"] = posts_list
             result["browsed_count"] = len(browsed_urls)
             result["saved_count"] = len(posts_list)

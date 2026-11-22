@@ -38,12 +38,21 @@ public:
         qint64 followers = -1;
     };
 
+    enum class SpacingMode
+    {
+        DaytimeSpread12h, // 12h active daytime spread (720 / postsPerDay min) + ~12h overnight pause
+        EvenSpread24h,    // Even 24h spread (1440 / postsPerDay min around the clock)
+        FixedInterval     // Fixed interval in minutes between posts for the same account (e.g. 60 min)
+    };
+
     struct PublishJobConfig
     {
         QList<AccountTarget> targets;
         int maxDaysOld = 10; // 0 = no limit; >0 = created at most maxDaysOld days ago (<= maxDaysOld)
         int postsPerDay = 3;
         int totalPosts = 6;
+        SpacingMode spacingMode = SpacingMode::DaytimeSpread12h;
+        int fixedIntervalMinutes = 60;
         bool useSystemChromeProfile = true;
         bool muteOriginalAudio = true;
         bool useSuggestedSound = true;
@@ -88,6 +97,8 @@ private:
         QString hook;
         QString caption;
         QString hookCategory;
+        QString strategy;
+        QString referenceUrl;
         QString dnaAccountId;
     };
 
@@ -100,6 +111,7 @@ private:
         bool addVideoText = false;
         bool aiSuggestedVideoText = false;
         QString videoOverlayText;
+        QString videoTextStyle;
         QString aiReason;
         QString status; // "Queued", "Uploading", "Published", "Dry-run OK", "Failed", "Stopped"
     };

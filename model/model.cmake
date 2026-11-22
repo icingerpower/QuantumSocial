@@ -13,6 +13,8 @@ SET(MODEL_FILES
     ${CMAKE_CURRENT_LIST_DIR}/research/ResearchStore.cpp
     ${CMAKE_CURRENT_LIST_DIR}/research/ReferenceAssessor.h
     ${CMAKE_CURRENT_LIST_DIR}/research/ReferenceAssessor.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/research/InspirationAdaptationMethod.h
+    ${CMAKE_CURRENT_LIST_DIR}/research/InspirationAdaptationMethod.cpp
     ${CMAKE_CURRENT_LIST_DIR}/research/ResearchProject.h
     ${CMAKE_CURRENT_LIST_DIR}/research/ResearchProject.cpp
     ${CMAKE_CURRENT_LIST_DIR}/TableAccounts.h

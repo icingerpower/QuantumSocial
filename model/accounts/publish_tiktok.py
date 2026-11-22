@@ -122,6 +122,7 @@ def _finish(
     post_url: str = "",
     sound_title: str = "",
     video_text_applied: bool = False,
+    video_text_style: str = "",
     log_file: str = "",
     screenshot: str = "",
     fatal: bool = False,
@@ -133,6 +134,7 @@ def _finish(
         "post_url": post_url,
         "sound_title": sound_title,
         "video_text_applied": video_text_applied,
+        "video_text_style": video_text_style,
         "log_file": log_file,
         "screenshot": screenshot,
         "fatal": fatal,
@@ -295,17 +297,67 @@ def _strip_video_audio_copy(video_path: str, logger: Logger) -> Optional[str]:
     return None
 
 
+VALID_VIDEO_TEXT_STYLES = {
+    "classic_black_pill",
+    "classic_white_pill",
+    "elegance_serif",
+    "classic_clean_stroke",
+}
+
+
+def _normalize_video_text_style(style_id: str) -> str:
+    s = (style_id or "").strip().lower()
+    return s if s in VALID_VIDEO_TEXT_STYLES else "classic_black_pill"
+
+
+def _pick_open_color_swatch(surface: Any, want_dark: bool) -> bool:
+    """Clicks either the darkest (black) or brightest (white) swatch in an open PropSettingColorPicker popup."""
+    try:
+        return bool(
+            surface.evaluate(
+                """(wantDark) => {
+                    const blocks = Array.from(document.querySelectorAll('[class*="PropSettingColorCard__presetItemBlock"]'));
+                    let best = null;
+                    let bestScore = wantDark ? 9999 : -1;
+                    for (const b of blocks) {
+                        const r = b.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        const bg = window.getComputedStyle(b).backgroundColor || '';
+                        const m = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                        if (!m) continue;
+                        const lum = parseInt(m[1], 10) + parseInt(m[2], 10) + parseInt(m[3], 10);
+                        if (wantDark && lum < bestScore) {
+                            bestScore = lum;
+                            best = b;
+                        } else if (!wantDark && lum > bestScore) {
+                            bestScore = lum;
+                            best = b;
+                        }
+                    }
+                    if (!best) return false;
+                    best.click();
+                    return true;
+                }""",
+                want_dark,
+            )
+        )
+    except Exception:
+        return False
+
+
 def _apply_video_text_inside_editor(
     surface: Any,
     page: Any,
     overlay_text: str,
+    style_id: str,
     headless: bool,
     logger: Logger,
-) -> bool:
+) -> Tuple[bool, str]:
     """Adds a native TikTok text track inside the open TikTok Studio video editor, styled and moved to the upper safe zone."""
+    effective_style = _normalize_video_text_style(style_id)
     wrapped_text = _wrap_tiktok_overlay_text(overlay_text, max_line_chars=24)
     if not wrapped_text:
-        return False
+        return False, ""
 
     # Switch to the 'Texte / Text' tab inside the open editor if 'Ajouter du texte' isn't already visible
     add_btn_loc = surface.locator('[class*="AddTextPanel__addTextBasicButton"]')
@@ -345,13 +397,13 @@ def _apply_video_text_inside_editor(
 
     if not add_ready:
         logger.emit_log("VIDEO-TEXT", "TikTok 'AddTextPanel__addTextBasicButton' did not appear; skipping video text track.")
-        return False
+        return False, ""
 
     try:
         add_btn_loc.first.click(timeout=4000)
     except Exception as exc:
         logger.emit_log("VIDEO-TEXT", f"Could not click 'Ajouter du texte': {exc}")
-        return False
+        return False, ""
 
     # Wait for the right-panel PropSettingTextArea__input to become visible (confirming the new text track is active!)
     ta_loc = surface.locator('textarea[class*="PropSettingTextArea__input"]')
@@ -368,7 +420,7 @@ def _apply_video_text_inside_editor(
 
     if not ta_ready:
         logger.emit_log("VIDEO-TEXT", "Text property textarea did not mount after clicking 'Ajouter du texte'.")
-        return False
+        return False, ""
 
     # 1. FIRST fill PropSettingTextArea__input so the text box expands to its full horizontal multi-word width!
     #    (Never drag BEFORE filling, because when the box only holds 'Text' its side resize handles sit right
@@ -380,7 +432,7 @@ def _apply_video_text_inside_editor(
         page.wait_for_timeout(500 if not headless else 60)
     except Exception as exc:
         logger.emit_log("VIDEO-TEXT", f"Failed filling video overlay text input: {exc}")
-        return False
+        return False, ""
 
     # 2. Compute the true interior center of the expanded text box from .moveable-line edges
     #    (guaranteed far inside the box, well away from left/right/corner resize handles!)
@@ -431,8 +483,27 @@ def _apply_video_text_inside_editor(
     except Exception as exc:
         logger.emit_log("VIDEO-TEXT", f"Note: could not reposition text box on stage ({exc}); keeping centered position.")
 
-    # 3. Enable Bold + clean dark background pill ('Arrière-plan') for crisp readability over any background
+    # 3. Apply the chosen curated fashion-safe TikTok text style:
+    #    - classic_black_pill:   Classic + Bold + White text + Black rounded pill ('Arrière-plan')
+    #    - classic_white_pill:   Classic + Bold + Dark text  + White rounded pill ('Arrière-plan')
+    #    - elegance_serif:       Elegance serif + Bold + White text + Stroke ('Trait') + Shadow ('Ombre')
+    #    - classic_clean_stroke: Classic + Bold + White text + Clean dark Stroke ('Trait'), no box
     try:
+        if effective_style == "elegance_serif":
+            trig = surface.locator('[class*="PropSettingTextFontFamily__trigger"]')
+            if trig.count() > 0 and trig.first.is_visible():
+                trig.first.click(timeout=2500)
+                page.wait_for_timeout(350 if not headless else 50)
+                surface.evaluate(
+                    """() => {
+                        const opts = Array.from(document.querySelectorAll('[role="option"], [class*="Select__option"], [class*="Popup"] div'));
+                        const el = opts.find(o => /^(elegance|serif|postcard)$/i.test((o.innerText || '').trim()));
+                        if (el) el.click();
+                    }"""
+                )
+                page.wait_for_timeout(250 if not headless else 40)
+                page.keyboard.press("Escape")
+
         surface.evaluate(
             """() => {
                 const fontStyleWrap = document.querySelector('[class*="PropSettingText__fontStyle"]');
@@ -440,18 +511,74 @@ def _apply_video_text_inside_editor(
                     const boldBtn = fontStyleWrap.querySelector('button, div[role="button"], span');
                     if (boldBtn) boldBtn.click();
                 }
-                const labelGroup = document.querySelector('[class*="PropSettingText__labelGroup"]');
-                if (labelGroup) {
+            }"""
+        )
+        page.wait_for_timeout(150 if not headless else 30)
+
+        if effective_style == "classic_white_pill":
+            fill_trig = surface.locator('[class*="PropSettingTextFontColor__wrap"] [class*="PropSettingColorPicker__trigger"]')
+            if fill_trig.count() > 0 and fill_trig.first.is_visible():
+                fill_trig.first.click(timeout=2500)
+                page.wait_for_timeout(300 if not headless else 40)
+                _pick_open_color_swatch(surface, want_dark=True)
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(150 if not headless else 30)
+            opened_bg = bool(
+                surface.evaluate(
+                    """() => {
+                        const labelGroup = document.querySelector('[class*="PropSettingText__labelGroup"]');
+                        if (!labelGroup) return false;
+                        const addBtns = labelGroup.querySelectorAll('[class*="PropSettingColorPopup__addBtn"]');
+                        if (addBtns.length >= 2) { addBtns[1].click(); return true; }
+                        return false;
+                    }"""
+                )
+            )
+            if opened_bg:
+                page.wait_for_timeout(300 if not headless else 40)
+                bg_triggers = surface.locator('[class*="PropSettingText__labelGroup"] [class*="PropSettingColorPicker__trigger"]')
+                if bg_triggers.count() >= 2 and bg_triggers.nth(1).is_visible():
+                    bg_triggers.nth(1).click(timeout=2500)
+                    page.wait_for_timeout(300 if not headless else 40)
+                _pick_open_color_swatch(surface, want_dark=False)
+                page.keyboard.press("Escape")
+        elif effective_style == "elegance_serif":
+            surface.evaluate(
+                """() => {
+                    const labelGroup = document.querySelector('[class*="PropSettingText__labelGroup"]');
+                    if (!labelGroup) return;
+                    const addBtns = labelGroup.querySelectorAll('[class*="PropSettingColorPopup__addBtn"]');
+                    if (addBtns.length >= 1) addBtns[0].click();
+                    if (addBtns.length >= 3) addBtns[2].click();
+                }"""
+            )
+            page.wait_for_timeout(200 if not headless else 40)
+            page.keyboard.press("Escape")
+        elif effective_style == "classic_clean_stroke":
+            surface.evaluate(
+                """() => {
+                    const labelGroup = document.querySelector('[class*="PropSettingText__labelGroup"]');
+                    if (!labelGroup) return;
+                    const addBtns = labelGroup.querySelectorAll('[class*="PropSettingColorPopup__addBtn"]');
+                    if (addBtns.length >= 1) addBtns[0].click();
+                }"""
+            )
+            page.wait_for_timeout(200 if not headless else 40)
+            page.keyboard.press("Escape")
+        else:
+            surface.evaluate(
+                """() => {
+                    const labelGroup = document.querySelector('[class*="PropSettingText__labelGroup"]');
+                    if (!labelGroup) return;
                     const addBtns = labelGroup.querySelectorAll('[class*="PropSettingColorPopup__addBtn"]');
                     if (addBtns.length >= 2) addBtns[1].click();
                     else if (addBtns.length >= 1) addBtns[0].click();
-                }
-            }"""
-        )
-        page.wait_for_timeout(250 if not headless else 40)
-        page.keyboard.press("Escape")
-    except Exception:
-        pass
+                }"""
+            )
+            page.wait_for_timeout(200 if not headless else 40)
+            page.keyboard.press("Escape")
+    except Exception as exc:
+        logger.emit_log("VIDEO-TEXT", f"Note: style customization warning ({effective_style}): {exc}")
 
     # 4. Guardrail: verify the text box was NOT squished into a narrow vertical column before saving!
     try:
@@ -481,13 +608,16 @@ def _apply_video_text_inside_editor(
         if squished:
             logger.emit_log("VIDEO-TEXT", "Detected narrow vertical text box anomaly — undoing text track rather than saving deformed text.")
             page.keyboard.press("Delete")
-            return False
+            return False, ""
     except Exception:
         pass
 
     single_line_log = wrapped_text.replace("\n", " / ")
-    logger.emit_log("VIDEO-TEXT", f"Added native TikTok video text track in upper safe zone: '{single_line_log}'")
-    return True
+    logger.emit_log(
+        "VIDEO-TEXT",
+        f"Added native TikTok video text track (style='{effective_style}') in upper safe zone: '{single_line_log}'",
+    )
+    return True, effective_style
 
 
 def _apply_video_editor_sound_and_text(
@@ -496,13 +626,14 @@ def _apply_video_editor_sound_and_text(
     mute_original: bool,
     use_suggested_sound: bool,
     video_overlay_text: str,
+    video_text_style: str,
     headless: bool,
     logger: Logger,
-) -> Tuple[str, bool]:
+) -> Tuple[str, bool, str]:
     """Opens TikTok Studio's video editor once, applies #1 suggested sound and/or native 'Aa Texte' overlay, and clicks Save once."""
     clean_overlay = (video_overlay_text or "").strip()
     if not use_suggested_sound and not clean_overlay:
-        return "", False
+        return "", False, ""
 
     target_btn_pattern = "^(sons|sounds)$" if use_suggested_sound else "^(texte|text)$"
     clicked_entry = False
@@ -527,11 +658,11 @@ def _apply_video_editor_sound_and_text(
         )
     except Exception as exc:
         logger.emit_log("SOUND", f"Could not click TikTok Studio video editor button: {exc}")
-        return "", False
+        return "", False, ""
 
     if not clicked_entry:
         logger.emit_log("SOUND", "No 'Sons / Texte' video editor button visible on this layout; skipping editor step.")
-        return "", False
+        return "", False, ""
 
     chosen_title = ""
     if use_suggested_sound:
@@ -594,11 +725,12 @@ def _apply_video_editor_sound_and_text(
             logger.emit_log("SOUND", "Suggested music list did not appear in time.")
 
     text_applied = False
+    applied_style = ""
     if clean_overlay:
         page.wait_for_timeout(800 if not headless else 80)
         _dismiss_studio_popups(surface, page, logger)
-        text_applied = _apply_video_text_inside_editor(
-            surface, page, clean_overlay, headless, logger
+        text_applied, applied_style = _apply_video_text_inside_editor(
+            surface, page, clean_overlay, video_text_style, headless, logger
         )
 
     if not chosen_title and not text_applied:
@@ -613,7 +745,7 @@ def _apply_video_editor_sound_and_text(
             )
         except Exception:
             pass
-        return "", False
+        return "", False, ""
 
     page.wait_for_timeout(2000 if not headless else 150)
     _dismiss_studio_popups(surface, page, logger)
@@ -649,11 +781,11 @@ def _apply_video_editor_sound_and_text(
         page.wait_for_timeout(1200 if not headless else 100)
         logger.emit_log(
             "SOUND",
-            f"Saved TikTok Studio video edits (sound='{chosen_title or 'none'}', videoText={text_applied}).",
+            f"Saved TikTok Studio video edits (sound='{chosen_title or 'none'}', videoText={text_applied}, style='{applied_style or 'none'}').",
         )
-        return chosen_title, text_applied
+        return chosen_title, text_applied, applied_style
 
-    return "", False
+    return "", False, ""
 
 
 def _apply_suggested_tiktok_sound(
@@ -663,8 +795,8 @@ def _apply_suggested_tiktok_sound(
     headless: bool,
     logger: Logger,
 ) -> str:
-    sound_title, _ = _apply_video_editor_sound_and_text(
-        surface, page, mute_original, True, "", headless, logger
+    sound_title, _, _ = _apply_video_editor_sound_and_text(
+        surface, page, mute_original, True, "", "", headless, logger
     )
     return sound_title
 
@@ -1141,6 +1273,7 @@ def main() -> int:
     media_paths = [str(p) for p in (req.get("mediaPaths") or []) if p]
     caption = str(req.get("caption") or "").strip()
     video_overlay_text = str(req.get("videoOverlayText") or "").strip()
+    video_text_style = _normalize_video_text_style(str(req.get("videoTextStyle") or ""))
     short_code = str(req.get("shortCode") or "QS").strip()
     use_system_profile = bool(req.get("useSystemChromeProfile", True))
     mute_original_audio = bool(req.get("muteOriginalAudio", True))
@@ -1355,14 +1488,16 @@ def main() -> int:
                 # Attach 1st suggested TikTok sound AND/OR native TikTok 'Aa Texte' video overlay BEFORE filling caption
                 applied_sound_title = ""
                 applied_video_text = False
+                applied_video_text_style = ""
                 if is_video_post and (use_suggested_sound or bool(video_overlay_text)):
                     _dismiss_studio_popups(surface, page, logger)
-                    applied_sound_title, applied_video_text = _apply_video_editor_sound_and_text(
+                    applied_sound_title, applied_video_text, applied_video_text_style = _apply_video_editor_sound_and_text(
                         surface,
                         page,
                         mute_original_audio,
                         use_suggested_sound,
                         video_overlay_text,
+                        video_text_style,
                         headless,
                         logger,
                     )
@@ -1491,6 +1626,7 @@ def main() -> int:
                         dry_run=True,
                         sound_title=applied_sound_title,
                         video_text_applied=applied_video_text,
+                        video_text_style=applied_video_text_style,
                         log_file=logger.log_file,
                         screenshot=ready_snap,
                         error=None,
@@ -1592,6 +1728,7 @@ def main() -> int:
                     post_url=placeholder_url,
                     sound_title=applied_sound_title,
                     video_text_applied=applied_video_text,
+                    video_text_style=applied_video_text_style,
                     log_file=logger.log_file,
                     screenshot=done_snap,
                     fatal=False,

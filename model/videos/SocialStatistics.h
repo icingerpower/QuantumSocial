@@ -61,8 +61,18 @@ public:
     {
         QString shortCode;
         QString text;
+        QString styleId;
         qint64 views = 0;
         qint64 likes = 0;
+    };
+
+    struct VideoTextStyleStats
+    {
+        QString styleId;
+        int count = 0;
+        double avgViews = 0.0;
+        double avgEngagementPct = 0.0;
+        qint64 bestViews = 0;
     };
 
     struct VideoTextExperimentSummary
@@ -78,6 +88,8 @@ public:
         qint64 withoutTextBestViews = 0;
 
         QString recommendation; // "explore", "prefer_text", "prefer_clean", "balanced"
+        QString winningStyle;   // Non-empty once >= 2 styles measured and a clear leader emerges
+        QList<VideoTextStyleStats> styleBreakdown;
         QList<WinningVideoTextEntry> winningTexts;
 
         QJsonObject toJson() const;
@@ -88,6 +100,48 @@ public:
     static VideoTextExperimentSummary summarizeVideoTextExperiment(
         const TableVideos *videos,
         FavoriteHooks *favoriteHooksToPromote = nullptr);
+
+    struct AdaptationStrategyStats
+    {
+        QString strategyId; // "reference_swap", "reference_variant", "reference_reimagine", "editorial_ab"
+        int count = 0;
+        double medianScore = 0.0;
+        double avgViews = 0.0;
+        double avgEngagementPct = 0.0;
+        qint64 bestViews = 0;
+    };
+
+    struct ReferencePerformance
+    {
+        QString referenceId;
+        QString referenceUrl;
+        int publishedCount = 0;
+        double medianScore = 0.0;
+        double avgViews = 0.0;
+        qint64 bestViews = 0;
+        int swapCount = 0;
+        double swapMedianScore = -1.0;
+        int variantCount = 0;
+        double variantMedianScore = -1.0;
+        QString bestStrategy; // "reference_swap", "reference_variant", or "reference_reimagine"
+        bool isWinner = false;
+    };
+
+    struct ReferenceExperimentSummary
+    {
+        int totalMeasuredPosts = 0;
+        double accountMedianScore = 0.0;
+        QString winningStrategy; // Non-empty once >= 2 strategies measured with >= 15% lead
+        QList<AdaptationStrategyStats> strategyBreakdown;
+        QList<ReferencePerformance> references; // Sorted by medianScore descending
+
+        QJsonObject toJson() const;
+        QString humanSummary() const;
+        QString plannerPromptAddendum() const;
+    };
+
+    static ReferenceExperimentSummary summarizeReferenceExperiment(
+        const TableVideos *videos);
 
     static QCoro::Task<void> retrieveFromAccounts(TableAccounts *accounts,
                                                   TableVideos *videos,

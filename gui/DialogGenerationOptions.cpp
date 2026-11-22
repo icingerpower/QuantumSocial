@@ -27,6 +27,7 @@ DialogGenerationOptions::DialogGenerationOptions(
     , m_hasResearchReference(hasResearchReference)
 {
     ui->setupUi(this);
+    setMaximumWidth(1600);
 
     // No input image: nothing to decide about it, only the format is asked
     // (imageMode() stays KeepInput through the hidden default radio).

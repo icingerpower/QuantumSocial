@@ -44,6 +44,7 @@
 #include <QPointer>
 #include <QProcess>
 #include <QPushButton>
+#include <QRadioButton>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSettings>
@@ -322,7 +323,52 @@ QString resolveCreativePreviewImagePath(const QDir &genDir,
         }
     }
 
-    // Check known starting-frame / cached preview candidates first
+    // For video creatives, prefer a cached or freshly extracted frame from the actual .mp4
+    // BEFORE falling back to generation_source.png, so the table row preview always matches the video!
+    if (format == QLatin1String("video"))
+    {
+        for (const QDir &dir : {tempDir, genDir})
+        {
+            if (!dir.exists()) continue;
+            for (const QString &thumbName : {QStringLiteral("preview_thumb.jpg"), QStringLiteral("preview_thumb.png")})
+            {
+                const QString cand = dir.filePath(thumbName);
+                if (QFileInfo::exists(cand) && !QImage{cand}.isNull())
+                {
+                    return cand;
+                }
+            }
+        }
+        if (allowFfmpegExtract && !mediaPaths.isEmpty())
+        {
+            const QString ffmpegExe = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+            if (!ffmpegExe.isEmpty())
+            {
+                QDir{}.mkpath(tempDir.absolutePath());
+                const QString thumbPath = tempDir.filePath(QStringLiteral("preview_thumb.jpg"));
+                for (const QString &seekSec : {QStringLiteral("0.20"), QStringLiteral("0.00")})
+                {
+                    QProcess proc;
+                    proc.start(ffmpegExe, {
+                        QStringLiteral("-hide_banner"),
+                        QStringLiteral("-loglevel"), QStringLiteral("error"),
+                        QStringLiteral("-y"),
+                        QStringLiteral("-ss"), seekSec,
+                        QStringLiteral("-i"), mediaPaths.first(),
+                        QStringLiteral("-frames:v"), QStringLiteral("1"),
+                        QStringLiteral("-vf"), QStringLiteral("scale=480:-2"),
+                        thumbPath
+                    });
+                    if (proc.waitForFinished(2500) && QFileInfo::exists(thumbPath) && !QImage{thumbPath}.isNull())
+                    {
+                        return thumbPath;
+                    }
+                }
+            }
+        }
+    }
+
+    // Check known starting-frame / cached preview candidates as fast fallback
     const QStringList priorityNames{
         QStringLiteral("preview_thumb.jpg"),
         QStringLiteral("preview_thumb.png"),
@@ -363,35 +409,53 @@ QString resolveCreativePreviewImagePath(const QDir &genDir,
             }
         }
     }
-
-    if (allowFfmpegExtract && format == QLatin1String("video") && !mediaPaths.isEmpty())
-    {
-        const QString ffmpegExe = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
-        if (!ffmpegExe.isEmpty())
-        {
-            QDir{}.mkpath(tempDir.absolutePath());
-            const QString thumbPath = tempDir.filePath(QStringLiteral("preview_thumb.jpg"));
-            for (const QString &seekSec : {QStringLiteral("0.20"), QStringLiteral("0.00")})
-            {
-                QProcess proc;
-                proc.start(ffmpegExe, {
-                    QStringLiteral("-hide_banner"),
-                    QStringLiteral("-loglevel"), QStringLiteral("error"),
-                    QStringLiteral("-y"),
-                    QStringLiteral("-ss"), seekSec,
-                    QStringLiteral("-i"), mediaPaths.first(),
-                    QStringLiteral("-frames:v"), QStringLiteral("1"),
-                    QStringLiteral("-vf"), QStringLiteral("scale=480:-2"),
-                    thumbPath
-                });
-                if (proc.waitForFinished(2500) && QFileInfo::exists(thumbPath) && !QImage{thumbPath}.isNull())
-                {
-                    return thumbPath;
-                }
-            }
-        }
-    }
     return QString{};
+}
+
+const QStringList &curatedVideoTextStyleIds()
+{
+    static const QStringList kIds{
+        QStringLiteral("classic_black_pill"),
+        QStringLiteral("classic_white_pill"),
+        QStringLiteral("elegance_serif"),
+        QStringLiteral("classic_clean_stroke")
+    };
+    return kIds;
+}
+
+QString normalizeVideoTextStyleId(const QString &raw)
+{
+    const QString s = raw.trimmed().toLower();
+    return curatedVideoTextStyleIds().contains(s)
+        ? s
+        : QStringLiteral("classic_black_pill");
+}
+
+QString videoTextStyleDisplayName(const QString &styleId)
+{
+    const QString s = normalizeVideoTextStyleId(styleId);
+    if (s == QLatin1String("classic_white_pill"))
+    {
+        return QObject::tr("Classic White Pill (Black on White)");
+    }
+    if (s == QLatin1String("elegance_serif"))
+    {
+        return QObject::tr("Elegance Editorial Serif (No Box)");
+    }
+    if (s == QLatin1String("classic_clean_stroke"))
+    {
+        return QObject::tr("Classic Outlined White (No Box)");
+    }
+    return QObject::tr("Classic Black Pill (White on Black)");
+}
+
+QString videoTextStyleShortTag(const QString &styleId)
+{
+    const QString s = normalizeVideoTextStyleId(styleId);
+    if (s == QLatin1String("classic_white_pill")) return QStringLiteral("White Pill");
+    if (s == QLatin1String("elegance_serif")) return QStringLiteral("Elegance Serif");
+    if (s == QLatin1String("classic_clean_stroke")) return QStringLiteral("Clean Outline");
+    return QStringLiteral("Black Pill");
 }
 
 QPixmap renderCreativeCardPixmap(const QString &imagePath,
@@ -400,7 +464,8 @@ QPixmap renderCreativeCardPixmap(const QString &imagePath,
                                  const QString &badgeText,
                                  const QColor &badgeColor,
                                  const QSize &targetSize,
-                                 const QString &overlayPreviewText = QString{})
+                                 const QString &overlayPreviewText = QString{},
+                                 const QString &overlayStyleId = QString{})
 {
     QImage canvas(targetSize, QImage::Format_ARGB32_Premultiplied);
     canvas.fill(Qt::transparent);
@@ -459,7 +524,13 @@ QPixmap renderCreativeCardPixmap(const QString &imagePath,
     const QString cleanOverlay = strategicWrapOverlayText(overlayPreviewText, 24);
     if (!cleanOverlay.isEmpty())
     {
+        const QString styleKey = normalizeVideoTextStyleId(overlayStyleId);
         QFont tf = p.font();
+        if (styleKey == QLatin1String("elegance_serif"))
+        {
+            tf.setFamily(QStringLiteral("Georgia"));
+            tf.setStyleHint(QFont::Serif);
+        }
         tf.setBold(true);
         tf.setPixelSize(qMax(8, qMin(14, targetSize.width() / 15)));
         p.setFont(tf);
@@ -477,13 +548,36 @@ QPixmap renderCreativeCardPixmap(const QString &imagePath,
                              qMax(24, int(targetSize.height() * 0.19)),
                              boxW,
                              boxH);
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(12, 14, 20, 215));
-        p.drawRoundedRect(pillRect, 6.0, 6.0);
-        p.setPen(Qt::white);
-        p.drawText(pillRect.adjusted(padX, padY, -padX, -padY),
-                   Qt::AlignCenter | Qt::TextWordWrap,
-                   cleanOverlay);
+        const QRect textRect = pillRect.adjusted(padX, padY, -padX, -padY);
+
+        if (styleKey == QLatin1String("classic_white_pill"))
+        {
+            p.setPen(QPen(QColor(0, 0, 0, 45), 1.0));
+            p.setBrush(QColor(250, 250, 252, 238));
+            p.drawRoundedRect(pillRect, 6.0, 6.0);
+            p.setPen(QColor(17, 24, 39));
+            p.drawText(textRect, Qt::AlignCenter | Qt::TextWordWrap, cleanOverlay);
+        }
+        else if (styleKey == QLatin1String("elegance_serif")
+                 || styleKey == QLatin1String("classic_clean_stroke"))
+        {
+            // Outlined / drop-shadowed white text with NO rectangular pill
+            p.setPen(QColor(10, 12, 18, 230));
+            for (const QPoint &off : {QPoint(-1, 0), QPoint(1, 0), QPoint(0, -1), QPoint(0, 1), QPoint(1, 2)})
+            {
+                p.drawText(textRect.translated(off), Qt::AlignCenter | Qt::TextWordWrap, cleanOverlay);
+            }
+            p.setPen(Qt::white);
+            p.drawText(textRect, Qt::AlignCenter | Qt::TextWordWrap, cleanOverlay);
+        }
+        else
+        {
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(12, 14, 20, 218));
+            p.drawRoundedRect(pillRect, 6.0, 6.0);
+            p.setPen(Qt::white);
+            p.drawText(textRect, Qt::AlignCenter | Qt::TextWordWrap, cleanOverlay);
+        }
     }
 
     p.setClipping(false);
@@ -1029,6 +1123,8 @@ QList<PanePublishing::EligibleCreative> PanePublishing::_collectEligibleCreative
                 ? QStringLiteral("%1 — %2").arg(pColor, pTitle)
                 : (!pTitle.isEmpty() ? pTitle : item.projectName);
             item.hookCategory = dna.value(QStringLiteral("hookCategory")).toString();
+            item.strategy = dna.value(QStringLiteral("strategy")).toString();
+            item.referenceUrl = dna.value(QStringLiteral("referenceUrl")).toString();
             item.dnaAccountId = dna.value(QStringLiteral("accountId")).toString();
         }
         else
@@ -1152,6 +1248,66 @@ void PanePublishing::openAutoPublishDialog()
     spinTotal->setValue(settings.value(QStringLiteral("publishing/totalPosts"), 6).toInt());
     form->addRow(tr("4. Total posts in this job:"), spinTotal);
 
+    auto *spacingBox = new QWidget;
+    auto *spacingLayout = new QVBoxLayout(spacingBox);
+    spacingLayout->setContentsMargins(0, 0, 0, 0);
+    spacingLayout->setSpacing(4);
+
+    auto *radioDaytime12h = new QRadioButton;
+    radioDaytime12h->setObjectName(QStringLiteral("radioSpacingDaytime12h"));
+    auto *radioEven24h = new QRadioButton;
+    radioEven24h->setObjectName(QStringLiteral("radioSpacingEven24h"));
+
+    auto *fixedRow = new QHBoxLayout;
+    fixedRow->setContentsMargins(0, 0, 0, 0);
+    auto *radioFixed = new QRadioButton(tr("Fixed interval per account:"));
+    radioFixed->setObjectName(QStringLiteral("radioSpacingFixed"));
+    auto *spinFixedMins = new QSpinBox;
+    spinFixedMins->setObjectName(QStringLiteral("spinPublishFixedMinutes"));
+    spinFixedMins->setRange(5, 1440);
+    spinFixedMins->setSingleStep(15);
+    spinFixedMins->setSuffix(tr(" min"));
+    spinFixedMins->setValue(settings.value(QStringLiteral("publishing/fixedIntervalMinutes"), 60).toInt());
+    fixedRow->addWidget(radioFixed);
+    fixedRow->addWidget(spinFixedMins);
+    fixedRow->addStretch();
+
+    const QString savedSpacingMode = settings.value(QStringLiteral("publishing/spacingMode"), QStringLiteral("daytime12h")).toString();
+    if (savedSpacingMode == QLatin1String("even24h"))
+    {
+        radioEven24h->setChecked(true);
+    }
+    else if (savedSpacingMode == QLatin1String("fixed"))
+    {
+        radioFixed->setChecked(true);
+    }
+    else
+    {
+        radioDaytime12h->setChecked(true);
+    }
+    spinFixedMins->setEnabled(radioFixed->isChecked());
+    connect(radioFixed, &QRadioButton::toggled, spinFixedMins, &QWidget::setEnabled);
+
+    const auto updateSpacingLabels = [spinPerDay, radioDaytime12h, radioEven24h]() {
+        const int n = qMax(1, spinPerDay->value());
+        const int dayMins = qMax(15, 720 / n);
+        const int evenMins = qMax(15, 1440 / n);
+        radioDaytime12h->setText(
+            QObject::tr("Active daytime spread (12h / %1 = ~%2 min apart + overnight pause)")
+                .arg(n).arg(dayMins));
+        const double evenHours = double(evenMins) / 60.0;
+        radioEven24h->setText(
+            QObject::tr("Even 24h spread (24h / %1 = %2 min / %3h apart)")
+                .arg(n).arg(evenMins).arg(QString::number(evenHours, 'f', (evenMins % 60 == 0) ? 0 : 1)));
+    };
+    connect(spinPerDay, &QSpinBox::valueChanged, &dlg, updateSpacingLabels);
+    updateSpacingLabels();
+
+    spacingLayout->addWidget(radioDaytime12h);
+    spacingLayout->addWidget(radioEven24h);
+    spacingLayout->addLayout(fixedRow);
+    form->addRow(tr("5. Wait between posts:"), spacingBox);
+
     auto *cliCombo = new QComboBox;
     cliCombo->setObjectName(QStringLiteral("comboPublishPlannerCli"));
     for (AbstractCli *cli : m_clis)
@@ -1168,7 +1324,7 @@ void PanePublishing::openAutoPublishDialog()
         int idx = cliCombo->findText(lastCli);
         if (idx >= 0) cliCombo->setCurrentIndex(idx);
     }
-    form->addRow(tr("5. AI schedule planner:"), cliCombo);
+    form->addRow(tr("6. AI schedule planner:"), cliCombo);
 
     auto *chkSound = new QCheckBox(
         tr("Mute original video audio & add 1st suggested TikTok sound (recommended for FYP reach)"));
@@ -1276,9 +1432,14 @@ void PanePublishing::openAutoPublishDialog()
         return;
     }
 
+    const QString chosenSpacingKey = radioEven24h->isChecked()
+        ? QStringLiteral("even24h")
+        : (radioFixed->isChecked() ? QStringLiteral("fixed") : QStringLiteral("daytime12h"));
     settings.setValue(QStringLiteral("publishing/maxGenerationAgeDays"), spinMaxDays->value());
     settings.setValue(QStringLiteral("publishing/postsPerDay"), spinPerDay->value());
     settings.setValue(QStringLiteral("publishing/totalPosts"), spinTotal->value());
+    settings.setValue(QStringLiteral("publishing/spacingMode"), chosenSpacingKey);
+    settings.setValue(QStringLiteral("publishing/fixedIntervalMinutes"), spinFixedMins->value());
     settings.setValue(QStringLiteral("publishing/useSuggestedSound"), chkSound->isChecked());
     settings.setValue(QStringLiteral("publishing/dryRun"), chkDryRun->isChecked());
     if (auto *cli = cliCombo->currentData().value<AbstractCli *>())
@@ -1294,6 +1455,10 @@ void PanePublishing::openAutoPublishDialog()
     cfg.maxDaysOld = spinMaxDays->value();
     cfg.postsPerDay = spinPerDay->value();
     cfg.totalPosts = spinTotal->value();
+    cfg.spacingMode = radioEven24h->isChecked()
+        ? SpacingMode::EvenSpread24h
+        : (radioFixed->isChecked() ? SpacingMode::FixedInterval : SpacingMode::DaytimeSpread12h);
+    cfg.fixedIntervalMinutes = spinFixedMins->value();
     cfg.muteOriginalAudio = chkSound->isChecked();
     cfg.useSuggestedSound = chkSound->isChecked();
     cfg.dryRun = chkDryRun->isChecked();
@@ -1459,12 +1624,14 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         .arg(config.dryRun ? QStringLiteral("true") : QStringLiteral("false")));
     m_statusLabel->setText(tr("Planning optimal publish order and timing with AI..."));
 
-    // Summarize measured TikTok native video text ('Aa Texte') A/B performance so AI suggestions improve over time!
+    // Summarize measured TikTok native video text ('Aa Texte') AND source-reference / adaptation-mode A/B performance!
     const auto videoTextExp = SocialStatistics::summarizeVideoTextExperiment(m_videos, m_favoriteHooks);
+    const auto refExp = SocialStatistics::summarizeReferenceExperiment(m_videos);
     _appendLog(QStringLiteral("[LEARNING] ") + videoTextExp.humanSummary());
-    if (videoTextExp.withTextCount > 0 || videoTextExp.withoutTextCount > 0)
+    _appendLog(QStringLiteral("[LEARNING] ") + refExp.humanSummary());
+    if (videoTextExp.withTextCount > 0 || videoTextExp.withoutTextCount > 0 || refExp.totalMeasuredPosts > 0)
     {
-        // Also persist updated videoTextExperiment into account_top_posts.json so Generation learns too
+        // Also persist updated experiment summaries into account_top_posts.json so Generation learns too
         const QDir wd = WorkingDirectoryManager::instance()->workingDir();
         if (wd.exists())
         {
@@ -1479,6 +1646,7 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
             }
             topRoot.insert(QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
             topRoot.insert(QStringLiteral("videoTextExperiment"), videoTextExp.toJson());
+            topRoot.insert(QStringLiteral("referenceExperiment"), refExp.toJson());
             QSaveFile sf{topPath};
             if (sf.open(QIODevice::WriteOnly))
             {
@@ -1500,8 +1668,34 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         return (videoOrdinal % 2) == 0; // ~50/50 A/B split
     };
 
-    // Default spacing between posts during a 12-hour active daytime window (720 mins / postsPerDay)
-    const int baseIntervalMins = qMax(30, 720 / qMax(1, config.postsPerDay));
+    const auto defaultVideoTextStyle = [&](int videoOrdinal) -> QString {
+        const auto &styles = curatedVideoTextStyleIds();
+        if (!videoTextExp.winningStyle.isEmpty() && (videoOrdinal % 3) != 2)
+        {
+            return normalizeVideoTextStyleId(videoTextExp.winningStyle);
+        }
+        return styles[videoOrdinal % styles.size()];
+    };
+
+    // Compute base interval from the selected radio-button SpacingMode
+    const int perDayCap = qMax(1, config.postsPerDay);
+    int baseIntervalMins = qMax(15, 720 / perDayCap);
+    QString spacingDesc;
+    if (config.spacingMode == SpacingMode::EvenSpread24h)
+    {
+        baseIntervalMins = qMax(15, 1440 / perDayCap);
+        spacingDesc = tr("Even 24h spread (%1 min apart)").arg(baseIntervalMins);
+    }
+    else if (config.spacingMode == SpacingMode::FixedInterval)
+    {
+        baseIntervalMins = qMax(5, config.fixedIntervalMinutes);
+        spacingDesc = tr("Fixed %1 min per account (max %2/day)").arg(baseIntervalMins).arg(perDayCap);
+    }
+    else
+    {
+        spacingDesc = tr("12h daytime spread (~%1 min apart + overnight pause)").arg(baseIntervalMins);
+    }
+    _appendLog(tr("[SCHEDULE] Spacing mode: %1").arg(spacingDesc));
 
     QJsonArray plannedJsonItems;
     if (config.plannerCli)
@@ -1510,17 +1704,18 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
             "You are scheduling an automated social-media publishing queue.\n"
             "Constraints:\n"
             "- Select exactly %1 creative(s) from the eligible unpublished candidates below.\n"
-            "- Max posts per day: %2 (space posts within the same day ~%3 minutes apart with "
-            "natural human jitter like 195, 248, 285 mins; add an overnight gap of ~720 mins "
-            "after every %2 posts).\n"
+            "- Max posts per day per account: %2 (%3).\n"
             "- Item 0 MUST have \"delayMinutes\": 0 so the first post publishes immediately.\n"
             "- Maximize variety: alternate different products/colors, formats (video vs carousel vs image), "
             "and hook categories so consecutive posts never look repetitive.\n")
             .arg(targetTotal)
             .arg(config.postsPerDay)
-            .arg(baseIntervalMins);
+            .arg(spacingDesc);
 
         prompt += videoTextExp.plannerPromptAddendum();
+        prompt += refExp.plannerPromptAddendum();
+        prompt += QStringLiteral(
+            "  - When two candidates derive from the same sourceRef, avoid placing them back-to-back on the same day.\n");
         prompt += QStringLiteral("\nTarget accounts:\n");
 
         for (int a = 0; a < config.targets.size(); ++a)
@@ -1532,15 +1727,21 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         for (const auto &c : candidates)
         {
             prompt += QStringLiteral(
-                "- code=%1 | age=%2d | format=%3 | product=\"%4\" | hookCat=%5 | hook=\"%6\"\n")
+                "- code=%1 | age=%2d | format=%3 | mode=%4 | sourceRef=%5 | product=\"%6\" | hookCat=%7 | hook=\"%8\"\n")
                 .arg(c.shortCode)
                 .arg(c.ageDays)
-                .arg(c.format, c.productSummary, c.hookCategory, c.hook.left(70));
+                .arg(c.format,
+                     c.strategy.isEmpty() ? QStringLiteral("editorial") : c.strategy,
+                     c.referenceUrl.isEmpty() ? QStringLiteral("none") : c.referenceUrl,
+                     c.productSummary,
+                     c.hookCategory,
+                     c.hook.left(70));
         }
         prompt += QStringLiteral(
             "\nReply with STRICT JSON only (no markdown fences):\n"
             "{\"plan\": [{\"shortCode\": \"QS-...\", \"accountIndex\": 0, "
             "\"delayMinutes\": 0, \"addVideoText\": true, "
+            "\"videoTextStyle\": \"classic_black_pill\", "
             "\"videoOverlayText\": \"Short 4-8 word curiosity hook\", \"reason\": \"...\"}]}");
 
         _appendLog(tr("[AI-PLANNER] Asking %1 to choose what to publish, in what order, spacing, and whether to add TikTok video text...")
@@ -1604,6 +1805,10 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
                 ? o.value(QStringLiteral("addVideoText")).toBool()
                 : defaultVideoTextFlag(plannedVideoOrdinal);
             item.aiSuggestedVideoText = item.addVideoText;
+            const QString aiStyle = o.value(QStringLiteral("videoTextStyle")).toString().trimmed();
+            item.videoTextStyle = !aiStyle.isEmpty()
+                ? normalizeVideoTextStyleId(aiStyle)
+                : defaultVideoTextStyle(plannedVideoOrdinal);
             const QString aiOverlay = o.value(QStringLiteral("videoOverlayText")).toString().trimmed();
             item.videoOverlayText = !aiOverlay.isEmpty()
                 ? cleanShortHookForOverlay(aiOverlay, item.creative.productSummary)
@@ -1668,6 +1873,7 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
             {
                 item.addVideoText = defaultVideoTextFlag(plannedVideoOrdinal);
                 item.aiSuggestedVideoText = item.addVideoText;
+                item.videoTextStyle = defaultVideoTextStyle(plannedVideoOrdinal);
                 item.videoOverlayText = cleanShortHookForOverlay(picked.hook, picked.productSummary);
                 ++plannedVideoOrdinal;
             }
@@ -1677,13 +1883,116 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
         }
     }
 
+    // Apply deterministic per-account timing according to config.spacingMode so the user's
+    // selected radio button (12h daytime spread, even 24h spread, or fixed N minutes per account)
+    // is honored strictly rather than left to LLM delay guesses.
+    {
+        const QDateTime batchStart = QDateTime::currentDateTime();
+        QHash<QString, int> accPostCount;
+        QHash<QString, QDateTime> accLastTime;
+        QHash<QString, QDateTime> accDayWindowStart;
+        QDateTime latestFirstPost = batchStart;
+        bool anyFirstAssigned = false;
+
+        for (int i = 0; i < m_queue.size(); ++i)
+        {
+            ScheduledItem &it = m_queue[i];
+            const QString accKey = QStringLiteral("%1|%2")
+                .arg(it.target.platformId, it.target.accountUrl.trimmed().toLower());
+            const int priorOnAcc = accPostCount.value(accKey, 0);
+
+            QDateTime slotTime;
+            if (priorOnAcc == 0)
+            {
+                if (!anyFirstAssigned)
+                {
+                    slotTime = batchStart;
+                    latestFirstPost = slotTime;
+                    anyFirstAssigned = true;
+                }
+                else
+                {
+                    // Stagger initial post of a second account by 2 min so browser sessions don't collide
+                    slotTime = latestFirstPost.addSecs(120);
+                    latestFirstPost = slotTime;
+                }
+                accDayWindowStart.insert(accKey, slotTime);
+            }
+            else
+            {
+                const QDateTime prevAccTime = accLastTime.value(accKey, batchStart);
+                const bool newDayForAcc = (priorOnAcc % perDayCap) == 0;
+                int waitMins = baseIntervalMins;
+
+                if (config.spacingMode == SpacingMode::EvenSpread24h)
+                {
+                    waitMins = baseIntervalMins;
+                    if (newDayForAcc)
+                    {
+                        accDayWindowStart.insert(accKey, prevAccTime.addSecs(qint64(waitMins) * 60));
+                    }
+                }
+                else if (config.spacingMode == SpacingMode::FixedInterval)
+                {
+                    if (newDayForAcc)
+                    {
+                        const QDateTime dayStart = accDayWindowStart.value(accKey, batchStart);
+                        const qint64 elapsedMins = qMax<qint64>(0, dayStart.secsTo(prevAccTime) / 60);
+                        waitMins = qMax(baseIntervalMins, int(1440 - elapsedMins));
+                        accDayWindowStart.insert(accKey, prevAccTime.addSecs(qint64(waitMins) * 60));
+                    }
+                    else
+                    {
+                        waitMins = baseIntervalMins;
+                    }
+                }
+                else
+                {
+                    // DaytimeSpread12h: spread across 12h with subtle natural jitter + ~12h overnight pause
+                    const int maxJitter = qMin(15, qMax(2, baseIntervalMins / 5));
+                    const int rawJitter = (((i * 37) % (2 * maxJitter + 1)) - maxJitter);
+                    waitMins = newDayForAcc
+                        ? (720 + qMax(0, rawJitter))
+                        : qMax(15, baseIntervalMins + rawJitter);
+                    if (newDayForAcc)
+                    {
+                        accDayWindowStart.insert(accKey, prevAccTime.addSecs(qint64(waitMins) * 60));
+                    }
+                }
+                slotTime = prevAccTime.addSecs(qint64(waitMins) * 60);
+            }
+
+            it.scheduledAt = slotTime;
+            accPostCount.insert(accKey, priorOnAcc + 1);
+            accLastTime.insert(accKey, slotTime);
+        }
+
+        std::stable_sort(m_queue.begin(), m_queue.end(),
+                         [](const ScheduledItem &a, const ScheduledItem &b) {
+                             return a.scheduledAt < b.scheduledAt;
+                         });
+        for (int i = 0; i < m_queue.size(); ++i)
+        {
+            if (i == 0)
+            {
+                m_queue[i].delayMinutesFromPrevious = 0;
+            }
+            else
+            {
+                const qint64 secs = m_queue[i - 1].scheduledAt.secsTo(m_queue[i].scheduledAt);
+                m_queue[i].delayMinutesFromPrevious = qMax(1, int((secs + 30) / 60));
+            }
+        }
+    }
+
     _appendLog(tr("[AI-PLANNER] Planned %1 publish slot(s):").arg(m_queue.size()));
     for (int i = 0; i < m_queue.size(); ++i)
     {
         const auto &it = m_queue[i];
         const QString textNote = (it.creative.format == QLatin1String("video"))
             ? (it.addVideoText
-                   ? tr(" [TikTok Text: \"%1\"]").arg(it.videoOverlayText)
+                   ? tr(" [TikTok Text (%1): \"%2\"]")
+                         .arg(videoTextStyleShortTag(it.videoTextStyle), it.videoOverlayText)
                    : tr(" [Clean Video: no text]"))
             : QString{};
         _appendLog(tr("  #%1 %2 (%3, %4d old)%9 → %5 at %6 (+%7m) — %8")
@@ -1762,6 +2071,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         bool addVideoText = false;
         bool aiSuggestedVideoText = false;
         QString videoOverlayText;
+        QString videoTextStyle;
         QString aiReason;
         int targetIndex = 0;
         int customDelayMinutes = 180; // Delay used whenever this item is NOT #1
@@ -1816,7 +2126,8 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
             badgeTxt,
             badgeCol,
             QSize(72, 112),
-            overlayPreview);
+            overlayPreview,
+            r.videoTextStyle);
     };
 
     QList<CandidateRowState> initialRows;
@@ -1841,6 +2152,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         row.aiInitialRank = i + 1;
         row.addVideoText = scheduled.addVideoText;
         row.aiSuggestedVideoText = scheduled.aiSuggestedVideoText;
+        row.videoTextStyle = normalizeVideoTextStyleId(scheduled.videoTextStyle);
         row.videoOverlayText = !scheduled.videoOverlayText.isEmpty()
             ? scheduled.videoOverlayText
             : cleanShortHookForOverlay(row.creative.hook, row.creative.productSummary);
@@ -1857,7 +2169,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         }
         row.customDelayMinutes = scheduled.delayMinutesFromPrevious > 0
             ? scheduled.delayMinutesFromPrevious
-            : qMax(15, baseIntervalMins);
+            : qMax(5, baseIntervalMins);
         row.rowThumb = makeRowThumb(row);
         initialRows.append(row);
     }
@@ -1881,12 +2193,22 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         {
             row.addVideoText = ((extraIdx % 2) == 0);
             row.aiSuggestedVideoText = row.addVideoText;
+            const auto &styles = curatedVideoTextStyleIds();
+            row.videoTextStyle = styles[extraIdx % styles.size()];
             row.videoOverlayText = cleanShortHookForOverlay(c.hook, c.productSummary);
         }
         row.aiReason = tr("Not picked by AI planner (available candidate)");
         row.targetIndex = (m_queue.size() + extraIdx) % config.targets.size();
-        const int jitter = (((m_queue.size() + extraIdx + 1) * 37) % 41) - 15;
-        row.customDelayMinutes = qMax(15, baseIntervalMins + jitter);
+        if (config.spacingMode == SpacingMode::DaytimeSpread12h)
+        {
+            const int maxJitter = qMin(15, qMax(2, baseIntervalMins / 5));
+            const int jitter = (((m_queue.size() + extraIdx + 1) * 37) % (2 * maxJitter + 1)) - maxJitter;
+            row.customDelayMinutes = qMax(15, baseIntervalMins + jitter);
+        }
+        else
+        {
+            row.customDelayMinutes = qMax(5, baseIntervalMins);
+        }
         ++extraIdx;
         row.rowThumb = makeRowThumb(row);
         initialRows.append(row);
@@ -1897,6 +2219,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
     QDialog dlg(this);
     dlg.setObjectName(QStringLiteral("dialogReviewPublishPlan"));
     dlg.setWindowTitle(tr("Review & Customize Publish Selection and Order"));
+    dlg.setMaximumWidth(1600);
     dlg.resize(1140, 750);
 
     auto *mainLayout = new QVBoxLayout(&dlg);
@@ -2087,6 +2410,15 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
     chkVideoText->setToolTip(tr("Uses TikTok Studio's native 'Aa Texte' track in the upper safe zone so TikTok indexes it for SEO while keeping the shoes unobstructed."));
     videoTextLayout->addWidget(chkVideoText);
 
+    auto *comboVideoStyle = new QComboBox;
+    comboVideoStyle->setObjectName(QStringLiteral("comboReviewVideoTextStyle"));
+    for (const QString &sid : curatedVideoTextStyleIds())
+    {
+        comboVideoStyle->addItem(videoTextStyleDisplayName(sid), sid);
+    }
+    comboVideoStyle->setToolTip(tr("Choose from 4 fashion-safe native TikTok Studio text styles (AI selects & A/B-tests performance over time)."));
+    videoTextLayout->addWidget(comboVideoStyle);
+
     auto *editVideoText = new QLineEdit;
     editVideoText->setObjectName(QStringLiteral("editReviewVideoOverlayText"));
     editVideoText->setMaxLength(80);
@@ -2257,7 +2589,8 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
             badgeTxt,
             badgeCol,
             QSize(228, 352),
-            liveOverlayPreview));
+            liveOverlayPreview,
+            st.videoTextStyle));
 
         if (c.format == QLatin1String("video") && !c.mediaPaths.isEmpty())
         {
@@ -2268,6 +2601,12 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
                 : tr(" (AI suggested: OFF)");
             chkVideoText->setText(tr("Add TikTok video text") + aiRecBadge);
             chkVideoText->setChecked(st.addVideoText);
+            const int styleIdx = comboVideoStyle->findData(normalizeVideoTextStyleId(st.videoTextStyle));
+            if (styleIdx >= 0)
+            {
+                comboVideoStyle->setCurrentIndex(styleIdx);
+            }
+            comboVideoStyle->setEnabled(st.addVideoText);
             if (editVideoText->text() != st.videoOverlayText)
             {
                 editVideoText->setText(st.videoOverlayText);
@@ -2449,7 +2788,8 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
             if (c.format == QLatin1String("video"))
             {
                 videoTextRowNote = st.addVideoText
-                    ? tr("\n📝 TikTok Text: \"%1\"").arg(st.videoOverlayText.left(64))
+                    ? tr("\n📝 TikTok Text [%1]: \"%2\"")
+                          .arg(videoTextStyleShortTag(st.videoTextStyle), st.videoOverlayText.left(60))
                     : tr("\n🎬 Clean Video (no TikTok text overlay)");
             }
             const QString detailsText = QStringLiteral("%1 · %2 · %3d old\n%4\nHook: %5%7\n%6")
@@ -2637,6 +2977,20 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         }
     });
 
+    connect(comboVideoStyle, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [&](int idx) {
+        if (updatingUi || idx < 0)
+        {
+            return;
+        }
+        const int r = table->currentRow();
+        if (r >= 0 && r < rows.size() && rows[r].creative.format == QLatin1String("video"))
+        {
+            rows[r].videoTextStyle = normalizeVideoTextStyleId(comboVideoStyle->itemData(idx).toString());
+            rows[r].rowThumb = makeRowThumb(rows[r]);
+            rebuildTable(r);
+        }
+    });
+
     connect(editVideoText, &QLineEdit::textEdited, &dlg, [&](const QString &txt) {
         if (updatingUi)
         {
@@ -2661,7 +3015,8 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
                 badgeTxt,
                 badgeCol,
                 QSize(228, 352),
-                rows[r].addVideoText ? rows[r].videoOverlayText : QString{}));
+                rows[r].addVideoText ? rows[r].videoOverlayText : QString{},
+                rows[r].videoTextStyle));
             // Also keep row text snippet updated
             const EligibleCreative &c = rows[r].creative;
             const QString hookSnippet = !c.hook.trimmed().isEmpty()
@@ -2671,7 +3026,8 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
                 ? tr("★ AI Pick #%1: %2").arg(rows[r].aiInitialRank).arg(rows[r].aiReason)
                 : rows[r].aiReason;
             const QString videoTextRowNote = rows[r].addVideoText
-                ? tr("\n📝 TikTok Text: \"%1\"").arg(rows[r].videoOverlayText.left(64))
+                ? tr("\n📝 TikTok Text [%1]: \"%2\"")
+                      .arg(videoTextStyleShortTag(rows[r].videoTextStyle), rows[r].videoOverlayText.left(60))
                 : tr("\n🎬 Clean Video (no TikTok text overlay)");
             if (auto *detCell = table->item(r, 2))
             {
@@ -2738,6 +3094,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         item.scheduledAt = cursorTime;
         item.addVideoText = (st.creative.format == QLatin1String("video")) && st.addVideoText;
         item.aiSuggestedVideoText = st.aiSuggestedVideoText;
+        item.videoTextStyle = normalizeVideoTextStyleId(st.videoTextStyle);
         item.videoOverlayText = st.videoOverlayText.trimmed();
         item.aiReason = st.aiInitialRank > 0
             ? st.aiReason
@@ -3163,6 +3520,7 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
         req.videoOverlayText = !item.videoOverlayText.trimmed().isEmpty()
             ? item.videoOverlayText.trimmed()
             : cleanShortHookForOverlay(m_queue[itemIndex].creative.hook, item.creative.productSummary);
+        req.videoTextStyle = normalizeVideoTextStyleId(item.videoTextStyle);
     }
     req.shortCode = item.creative.shortCode;
     req.useSystemChromeProfile = m_activeConfig.useSystemChromeProfile;
@@ -3228,6 +3586,10 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
             dna.insert(QStringLiteral("tiktokVideoTextAdded"), res.videoTextApplied);
             dna.insert(QStringLiteral("tiktokVideoText"),
                        res.videoTextApplied ? req.videoOverlayText : QString{});
+            dna.insert(QStringLiteral("tiktokVideoTextStyle"),
+                       res.videoTextApplied
+                           ? (!res.videoTextStyle.isEmpty() ? res.videoTextStyle : req.videoTextStyle)
+                           : QString{});
             dna.insert(QStringLiteral("aiSuggestedVideoText"), item.aiSuggestedVideoText);
         }
         if (!res.soundTitle.isEmpty())

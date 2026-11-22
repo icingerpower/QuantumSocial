@@ -1,5 +1,6 @@
 #include "model/TableAccounts.h"
 #include "model/TableProjects.h"
+#include "model/research/InspirationAdaptationMethod.h"
 #include "model/research/ProductSource.h"
 #include "model/research/ResearchStore.h"
 #include "model/research/ResearchProject.h"
@@ -38,6 +39,9 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPushButton>
+#include <QRadioButton>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QSettings>
@@ -968,6 +972,181 @@ void checkResearch(const QDir &callerWorkingDir)
                         && emittedVideoProjectCtx.value("referenceMediaPath").toString().endsWith(".mp4", Qt::CaseInsensitive),
                     "Create generation project passes Pinterest .mp4 video into Generation");
 
+    // Verify TikTok Search Scroll & save: outer card traversal (DivItemContainerV2 wrapping search_top-item +
+    // sibling search-card-desc), JSON hydration stats (playCount/diggCount/createTime), inner #grid-main
+    // container scrolling when body is non-scrollable, min_score=1000 + maxDaysOld=365 filtering, and .mp4 capture.
+    const qint64 recentUnixTs = QDateTime::currentDateTimeUtc().addDays(-12).toSecsSinceEpoch();
+    const QString tiktokSearchHtmlPath = root.filePath("spy_fixture/tiktok_search.html");
+    writeResearch(tiktokSearchHtmlPath, QStringLiteral(
+        "<!doctype html><html><body style='margin:0;height:100vh;overflow:hidden'>"
+        "<script id='__UNIVERSAL_DATA_FOR_REHYDRATION__' type='application/json'>"
+        "{\"__DEFAULT_SCOPE__\":{\"webapp.search\":{\"data\":["
+        "  {\"id\":\"7610000000000000001\",\"desc\":\"Rainbow stiletto runway walk #heels\",\"createTime\":%3,"
+        "   \"author\":{\"uniqueId\":\"kerina.wang\"},\"stats\":{\"playCount\":64400,\"diggCount\":2065,\"commentCount\":12,\"shareCount\":240,\"collectCount\":716}},"
+        "  {\"id\":\"7610000000000000002\",\"desc\":\"Low view heel clip\",\"createTime\":%3,"
+        "   \"author\":{\"uniqueId\":\"tinyacct\"},\"stats\":{\"playCount\":120,\"diggCount\":5,\"commentCount\":0,\"shareCount\":0,\"collectCount\":0}},"
+        "  {\"id\":\"7610000000000000003\",\"desc\":\"Scrolled marble stairs heel transition\",\"createTime\":%3,"
+        "   \"author\":{\"uniqueId\":\"heelsobsession\"},\"stats\":{\"playCount\":88200,\"diggCount\":4100,\"commentCount\":34,\"shareCount\":510,\"collectCount\":900}}"
+        "]}}}"
+        "</script>"
+        "<main id='grid-main' style='height:520px;overflow-y:auto'>"
+        "  <div class='DivThreeColumnContainer' style='min-height:1500px'>"
+        "    <div class='DivItemContainerV2'>"
+        "      <div data-e2e='search_top-item'><div class='DivWrapper'>"
+        "        <a href='https://www.tiktok.com/@kerina.wang/video/7610000000000000001'>"
+        "          <img src='file://%1'/></a>"
+        "      </div></div>"
+        "      <div data-e2e='search-card-desc'>"
+        "        <span data-e2e='search-card-video-caption'>Rainbow stiletto runway walk #heels</span>"
+        "      </div>"
+        "    </div>"
+        "    <div class='DivItemContainerV2'>"
+        "      <div data-e2e='search_top-item'><div class='DivWrapper'>"
+        "        <a href='https://www.tiktok.com/@tinyacct/video/7610000000000000002'>"
+        "          <img src='file://%1'/></a>"
+        "      </div></div>"
+        "      <div data-e2e='search-card-desc'>"
+        "        <span data-e2e='search-card-video-caption'>Low view heel clip</span>"
+        "      </div>"
+        "    </div>"
+        "    <div id='tiktok-scrolled-slot' style='margin-top:750px'></div>"
+        "  </div>"
+        "</main>"
+        "<script>"
+        "const gm = document.getElementById('grid-main');"
+        "let injected = false;"
+        "gm.addEventListener('scroll', () => {"
+        "  if (!injected && gm.scrollTop > 100) {"
+        "    injected = true;"
+        "    document.getElementById('tiktok-scrolled-slot').innerHTML ="
+        "      \"<div class='DivItemContainerV2' data-video-url='file://%2'>\""
+        "      + \"<div data-e2e='search_top-item'><div class='DivWrapper'>\""
+        "      + \"<a href='https://www.tiktok.com/@heelsobsession/video/7610000000000000003'>\""
+        "      + \"<img src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'/></a>\""
+        "      + \"</div></div><div data-e2e='search-card-desc'>\""
+        "      + \"<span data-e2e='search-card-video-caption'>Scrolled marble stairs heel transition</span></div></div>\";"
+        "  }"
+        "});"
+        "</script></body></html>").arg(spyImgPath, pinVideoPath).arg(recentUnixTs).toUtf8());
+    {
+        QEventLoop ttLoop;
+        QTimer ttTimeout;
+        ttTimeout.setSingleShot(true);
+        QObject::connect(&ttTimeout, &QTimer::timeout, &ttLoop, &QEventLoop::quit);
+        ttTimeout.start(30000);
+        QCoro::connect(
+            pane.runScrollAndSave("tiktok", "file://" + tiktokSearchHtmlPath, 5, true, {}, 1000, 365),
+            &ttLoop,
+            [&ttLoop]() { ttLoop.quit(); });
+        ttLoop.exec();
+    }
+    const QJsonObject ttSpySession = store.lastSpySession(accountId);
+    requireResearch(ttSpySession.value("platformId").toString() == "tiktok"
+                        && ttSpySession.value("browsedCount").toInt() == 3
+                        && ttSpySession.value("savedCount").toInt() == 2
+                        && ttSpySession.value("rejectedCount").toInt() == 1,
+                    "TikTok Search Scroll & save scrolls inner #grid-main, enriches stats, saves >=1000 views, and rejects low-view posts");
+    bool foundTikTokScrolledMp4 = false;
+    bool foundTikTokHydratedStats = false;
+    for (const auto &v : store.references())
+    {
+        const auto r = v.toObject();
+        const QString u = r.value("url").toString();
+        if (u.contains("7610000000000000001"))
+        {
+            const QJsonObject st = r.value("stats").toObject();
+            foundTikTokHydratedStats = (st.value("views").toInt() == 64400
+                                        && st.value("likes").toInt() == 2065
+                                        && st.value("shares").toInt() == 956);
+        }
+        if (u.contains("7610000000000000003"))
+        {
+            foundTikTokScrolledMp4 = store.mediaPath(r).endsWith(".mp4", Qt::CaseInsensitive);
+        }
+    }
+    requireResearch(foundTikTokHydratedStats && foundTikTokScrolledMp4,
+                    "TikTok Search Scroll & save captures exact playCount/diggCount/shares+collects and .mp4 video stream");
+
+    // Verify clicking "✕ Reject" on a card never scrolls down to the bottom (Qt focus-cascade bug)
+    // and "Next after review" selects the card that slides into the same visual grid slot.
+    {
+        QStringList bulkIds;
+        for (int i = 0; i < 16; ++i)
+        {
+            const QString bid = store.addReference(
+                accountId,
+                QStringLiteral("https://www.tiktok.com/@scrolltest/video/7620000000000000%1")
+                    .arg(i, 3, 10, QLatin1Char('0')),
+                QStringLiteral("Scroll stability card %1").arg(i),
+                spyImgPath);
+            requireResearch(!bid.isEmpty(), "add scroll stability card");
+            store.updateReference(bid, QJsonObject{
+                {QStringLiteral("stats"), QJsonObject{{QStringLiteral("views"), 50000 - i * 100}}}
+            });
+            bulkIds << bid;
+        }
+        if (auto *tabs = pane.findChild<QTabWidget *>())
+        {
+            tabs->setCurrentIndex(1); // References tab
+        }
+        if (auto *pendingBtn = pane.findChild<QPushButton *>("researchFilter_pending"))
+        {
+            pendingBtn->click();
+        }
+        pane.resize(1180, 560);
+        pane.show();
+        {
+            QEventLoop settleLoop;
+            QTimer::singleShot(40, &settleLoop, &QEventLoop::quit);
+            settleLoop.exec();
+        }
+
+        auto *scrollArea = pane.findChild<QScrollArea *>("referenceScrollArea");
+        requireResearch(scrollArea && scrollArea->verticalScrollBar(), "reference scroll area exists");
+        auto *vbar = scrollArea->verticalScrollBar();
+        requireResearch(vbar->maximum() > 200,
+                        QStringLiteral("16+ reference cards make scroll area scrollable (max=%1, vpH=%2, cardsH=%3)")
+                            .arg(vbar->maximum())
+                            .arg(scrollArea->viewport()->height())
+                            .arg(scrollArea->widget() ? scrollArea->widget()->height() : -1)
+                            .toUtf8().constData());
+
+        vbar->setValue(140);
+        QApplication::processEvents();
+        const int beforeY = vbar->value();
+        requireResearch(beforeY == 140, "scroll position set to 140px before clicking Reject");
+
+        const QString targetCardId = bulkIds[2];
+        const QString expectedNextSlotCardId = bulkIds[3];
+        auto *rejectBtn = pane.findChild<QPushButton *>("rejectReference_" + targetCardId);
+        requireResearch(rejectBtn != nullptr, "find per-card Reject button");
+        rejectBtn->setFocus(Qt::MouseFocusReason);
+        const int afterFocusY = vbar->value();
+        rejectBtn->click();
+        const int afterClickY = vbar->value();
+        {
+            QEventLoop settleAfterReject;
+            QTimer::singleShot(45, &settleAfterReject, &QEventLoop::quit);
+            settleAfterReject.exec();
+        }
+
+        requireResearch(vbar->value() == beforeY,
+                        QStringLiteral("clicking Reject preserves exact scroll position (got %1, expected %2, afterFocus=%3, afterClick=%4, max=%5)")
+                            .arg(vbar->value())
+                            .arg(beforeY)
+                            .arg(afterFocusY)
+                            .arg(afterClickY)
+                            .arg(vbar->maximum())
+                            .toUtf8().constData());
+        auto *nextSelectedCard = pane.findChild<QFrame *>("referenceCard_" + expectedNextSlotCardId);
+        requireResearch(nextSelectedCard != nullptr
+                            && nextSelectedCard->styleSheet().contains("#58a6ff"),
+                        "Next after review selects the card sliding into the vacated visual grid slot");
+
+        store.removeReferences(bulkIds);
+        QApplication::processEvents();
+    }
+
     const QJsonObject autoBatchSpec = pane.buildAutoBatchSpec(
         {product.value("id").toString()},
         3,
@@ -1232,7 +1411,19 @@ void checkResearch(const QDir &callerWorkingDir)
         requireResearch(!gProps.topLevelNodes().isEmpty(),
                         "Auto-Batch automatically seeds initial A/B properties when catalog is empty");
 
+        const auto &registeredMethods = InspirationAdaptationMethod::all();
+        requireResearch(registeredMethods.contains("reference_swap")
+                            && registeredMethods.contains("reference_variant")
+                            && registeredMethods.contains("reference_properties_full")
+                            && registeredMethods.contains("editorial_ab")
+                            && !registeredMethods.value("reference_swap")->usesSceneProperties()
+                            && registeredMethods.value("reference_variant")->usesSceneProperties()
+                            && registeredMethods.value("reference_properties_full")->usesSceneProperties(),
+                        "InspirationAdaptationMethod::Recorder registers both property-skipping and property-using methods");
+
         QSet<QString> seenFormats;
+        bool sawSkippedPropsMethod = false;
+        bool sawUsedPropsMethod = false;
         for (const auto *rec : gVideos.recordsForProject(genPane.projectsModel()->projectId(0)))
         {
             const QDir gDir = genPane.projectsModel()->generationDir(0, rec->shortCode, false);
@@ -1243,16 +1434,24 @@ void checkResearch(const QDir &callerWorkingDir)
             }
             const QJsonObject dna = QJsonDocument::fromJson(readResearch(dnaPath)).object();
             const QString fmt = dna.value("format").toString();
+            const QString strat = dna.value("strategy").toString();
+            const bool usedProps = dna.value("usedSceneProperties").toBool(true);
+            if (usedProps) sawUsedPropsMethod = true;
+            else sawSkippedPropsMethod = true;
             seenFormats.insert(fmt);
             const QString hookDesc = QString::fromUtf8(readResearch(gDir.filePath("hook-description.txt")));
             const QJsonObject hooksJson = QJsonDocument::fromJson(readResearch(gDir.filePath("hooks.json"))).object();
+            const bool propsConsistent = usedProps
+                ? !dna.value("propertyValueIds").toArray().isEmpty()
+                : dna.value("propertyValueIds").toArray().isEmpty();
             requireResearch(hookDesc.contains("qs", Qt::CaseInsensitive)
                                 && hookDesc.contains("#highheels", Qt::CaseInsensitive)
                                 && hooksJson.value("hooks").toArray().size() >= 5
                                 && !dna.value("productId").toString().isEmpty()
                                 && !dna.value("referenceId").toString().isEmpty()
-                                && !dna.value("propertyValueIds").toArray().isEmpty(),
-                            "each Auto-Batch creative has hook-description.txt with optimized hashtags + qsXXXX tag, multi-option hooks.json, and full creative_dna.json");
+                                && registeredMethods.contains(strat)
+                                && propsConsistent,
+                            "each Auto-Batch creative has hook-description.txt, multi-option hooks.json, Recorder strategy, and consistent propertyValueIds");
             if (fmt == QLatin1String("image"))
             {
                 requireResearch(gDir.entryList({"*.png"}, QDir::Files).size() == 1,
@@ -1271,6 +1470,8 @@ void checkResearch(const QDir &callerWorkingDir)
         }
         requireResearch(seenFormats == QSet<QString>({"image", "carousel", "video"}),
                         "Auto-Batch diversifies across all ticked formats (Image, Carousel, Video)");
+        requireResearch(sawSkippedPropsMethod && sawUsedPropsMethod,
+                        "Auto-Batch tests both skipping scene Properties (reference_swap) and applying scene Properties");
 
         // Verify PaneGeneration "Auto-publish…" button emits autoPublishRequested()
         bool autoPublishSignalEmitted = false;
@@ -1363,12 +1564,24 @@ void checkResearch(const QDir &callerWorkingDir)
             if (auto *pubDlg = qobject_cast<QDialog *>(QApplication::activeModalWidget()))
             {
                 auto *spinMaxAge = pubDlg->findChild<QSpinBox *>("spinPublishMaxDaysOld");
+                auto *spinPerDay = pubDlg->findChild<QSpinBox *>("spinPublishPostsPerDay");
+                auto *radioDay12 = pubDlg->findChild<QRadioButton *>("radioSpacingDaytime12h");
+                auto *radioEven24 = pubDlg->findChild<QRadioButton *>("radioSpacingEven24h");
+                auto *radioFixed = pubDlg->findChild<QRadioButton *>("radioSpacingFixed");
+                auto *spinFixed = pubDlg->findChild<QSpinBox *>("spinPublishFixedMinutes");
                 auto *accList = pubDlg->findChild<QListWidget *>("autoPublishAccountsList");
                 auto *countLbl = pubDlg->findChild<QLabel *>("labelEligiblePublishCount");
-                if (spinMaxAge && accList && accList->count() == 1 && countLbl)
+                if (spinMaxAge && spinPerDay && radioDay12 && radioEven24 && radioFixed && spinFixed
+                    && accList && accList->count() == 1 && countLbl)
                 {
+                    spinPerDay->setValue(6);
+                    radioFixed->setChecked(true);
                     verifiedPublishDialogDefaults =
                         spinMaxAge->value() == 10
+                        && radioDay12->text().contains("120 min")
+                        && radioEven24->text().contains("240 min")
+                        && spinFixed->isEnabled()
+                        && spinFixed->value() == 60
                         && accList->item(0)->checkState() == Qt::Checked
                         && countLbl->text().contains("2 unpublished creative(s) created")
                         && countLbl->text().contains("1 older > 10d skipped")
@@ -1464,8 +1677,10 @@ void checkResearch(const QDir &callerWorkingDir)
             1200
         });
         jobCfg.maxDaysOld = 10;
-        jobCfg.postsPerDay = 3;
+        jobCfg.postsPerDay = 6;
         jobCfg.totalPosts = 2;
+        jobCfg.spacingMode = PanePublishing::SpacingMode::FixedInterval;
+        jobCfg.fixedIntervalMinutes = 60;
         jobCfg.useSystemChromeProfile = false;
         jobCfg.dryRun = false;
         jobCfg.reviewBeforePublish = true;
@@ -1586,13 +1801,22 @@ void checkResearch(const QDir &callerWorkingDir)
                             barVisible
                             && prevStack->currentWidget() == vidWidget
                             && vidPlayer->source().isLocalFile();
-                        if (chkVidTxt && editVidTxt && chkVidTxt->isVisible())
+                        auto *comboVidStyle = revDlg->findChild<QComboBox *>("comboReviewVideoTextStyle");
+                        if (chkVidTxt && editVidTxt && comboVidStyle && chkVidTxt->isVisible()
+                            && comboVidStyle->count() == 4)
                         {
                             chkVidTxt->setChecked(true);
+                            const int serifIdx = comboVidStyle->findData(QStringLiteral("elegance_serif"));
+                            if (serifIdx >= 0)
+                            {
+                                comboVidStyle->setCurrentIndex(serifIdx);
+                            }
                             editVidTxt->setText(QStringLiteral("Custom Edited Runway Hook"));
                             emit editVidTxt->textEdited(QStringLiteral("Custom Edited Runway Hook"));
                             QApplication::processEvents();
-                            videoTextCustomized = candTable->item(r, 2)->text().contains("Custom Edited Runway Hook");
+                            videoTextCustomized =
+                                candTable->item(r, 2)->text().contains("Custom Edited Runway Hook")
+                                && candTable->item(r, 2)->text().contains("Elegance Serif");
                         }
                         break;
                     }
@@ -1621,7 +1845,7 @@ void checkResearch(const QDir &callerWorkingDir)
                     && slideStripShown
                     && candTable->item(0, 2)->text().startsWith(origSecondCode)
                     && candTable->item(0, 3)->text().contains("Immediate (+0m)")
-                    && candTable->item(1, 3)->text().contains("+");
+                    && candTable->item(1, 3)->text().contains("+60m");
             }
             revDlg->accept();
         });
@@ -1694,8 +1918,9 @@ void checkResearch(const QDir &callerWorkingDir)
                     requireResearch(dna.value("mutedOriginalAudio").toBool()
                                         && dna.value("tiktokVideoTextAdded").toBool()
                                         && dna.value("tiktokVideoText").toString() == QLatin1String("Custom Edited Runway Hook")
+                                        && dna.value("tiktokVideoTextStyle").toString() == QLatin1String("elegance_serif")
                                         && QFileInfo::exists(gDir.filePath("hook-description.txt")),
-                                    "Video publish mutes original audio, applies native TikTok text track, and records tiktokVideoText in creative_dna.json");
+                                    "Video publish mutes original audio, applies native TikTok text track + chosen style, and records tiktokVideoText/tiktokVideoTextStyle in creative_dna.json");
                 }
                 else if (rec->shortCode == agedCarouselCode)
                 {
@@ -1773,6 +1998,16 @@ void checkResearch(const QDir &callerWorkingDir)
                 pubVideos.addSnapshot(rec->id, rec->publications.first().postUrl,
                                       AbstractSocialAccount::StatSource::PublicView, vs);
             }
+            else if (rec->shortCode == agedCarouselCode && !rec->publications.isEmpty())
+            {
+                AbstractSocialAccount::VideoStatistics cs;
+                cs.views = 940;
+                cs.likes = 65;
+                cs.comments = 6;
+                cs.shares = 22;
+                pubVideos.addSnapshot(rec->id, rec->publications.first().postUrl,
+                                      AbstractSocialAccount::StatSource::PublicView, cs);
+            }
             else if (!rec->published)
             {
                 const int pRow = pubProjects.rowOfId(rec->projectId);
@@ -1798,11 +2033,23 @@ void checkResearch(const QDir &callerWorkingDir)
                             && qRound64(expSummary.withTextAvgViews) == 1850
                             && expSummary.withoutTextCount == 1
                             && qRound64(expSummary.withoutTextAvgViews) == 210
+                            && !expSummary.styleBreakdown.isEmpty()
+                            && expSummary.styleBreakdown.first().styleId == QLatin1String("elegance_serif")
+                            && qRound64(expSummary.styleBreakdown.first().avgViews) == 1850
                             && !expSummary.winningTexts.isEmpty()
                             && expSummary.winningTexts.first().text == QLatin1String("Custom Edited Runway Hook")
                             && gHooks.hooks(false).contains(QStringLiteral("Custom Edited Runway Hook"))
-                            && expSummary.plannerPromptAddendum().contains("Custom Edited Runway Hook"),
-                        "SocialStatistics::summarizeVideoTextExperiment measures With-Text vs Clean-Video views, promotes winning text hooks, and builds AI learning prompt");
+                            && expSummary.plannerPromptAddendum().contains("Custom Edited Runway Hook")
+                            && expSummary.plannerPromptAddendum().contains("elegance_serif"),
+                        "SocialStatistics::summarizeVideoTextExperiment measures With-Text vs Clean-Video views, per-style breakdown, promotes winning text hooks, and builds AI learning prompt");
+
+        const auto refExpSummary = SocialStatistics::summarizeReferenceExperiment(&pubVideos);
+        requireResearch(refExpSummary.totalMeasuredPosts >= 2
+                            && !refExpSummary.references.isEmpty()
+                            && refExpSummary.references.first().isWinner
+                            && !refExpSummary.strategyBreakdown.isEmpty()
+                            && refExpSummary.plannerPromptAddendum().contains("SOURCE VIDEO & ADAPTATION MODE LEARNING"),
+                        "SocialStatistics::summarizeReferenceExperiment learns winning source references and adaptation strategies (swap vs variant)");
 
         liveGenPane.close();
         panePub.close();
