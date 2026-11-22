@@ -18,13 +18,14 @@ public:
         const QStringList &knownShortCodes = {}) const override;
     bool supportsSpyScrollAndSave() const override;
     QString defaultSpySearchUrl(const QString &query) const override;
-    QCoro::Task<SpyResult> spyScrollAndSave(
+    QString defaultSpyHomeUrl() const override;
+    QCoro::Task<SpyResult> spyScrollAndSaveMode(
         const QString &queryOrUrl,
         const QString &downloadDir,
-        int maxPosts = 24,
-        bool autoScroll = true,
+        int maxPosts,
+        SpyMode mode,
         int minEngagement = 0,
-        const QStringList &excludeUrls = {},
+        const QJsonObject &spyContext = {},
         int maxDaysOld = 0) const override;
     bool supportsAutoPublish() const override;
     QCoro::Task<PublishResult> publishCreative(

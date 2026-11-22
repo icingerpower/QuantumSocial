@@ -258,28 +258,29 @@ def install_tiktok_response_listener(page, metadata_cache: dict) -> None:
 
 
 def _harvest_ssr_hydration_scripts(context, metadata_cache: dict) -> None:
-    if metadata_cache.get("__ssr_checked"):
-        return
-    metadata_cache["__ssr_checked"] = True
+    checked_urls = metadata_cache.setdefault("__ssr_urls", set())
     try:
         pages = [p for p in context.pages if not p.is_closed()]
-        if not pages:
-            return
-        blobs = pages[0].evaluate(
-            """() => {
-                const out = [];
-                for (const id of ['__UNIVERSAL_DATA_FOR_REHYDRATION__', 'SIGI_STATE']) {
-                    const el = document.getElementById(id);
-                    if (el && el.textContent) out.push(el.textContent);
-                }
-                return out;
-            }"""
-        )
-        for raw in blobs or []:
-            try:
-                _walk_tiktok_json(json.loads(raw), metadata_cache)
-            except Exception:
+        for pg in pages:
+            pg_url = (pg.url or "").strip()
+            if not pg_url or pg_url in checked_urls:
                 continue
+            checked_urls.add(pg_url)
+            blobs = pg.evaluate(
+                """() => {
+                    const out = [];
+                    for (const id of ['__UNIVERSAL_DATA_FOR_REHYDRATION__', 'SIGI_STATE']) {
+                        const el = document.getElementById(id);
+                        if (el && el.textContent) out.push(el.textContent);
+                    }
+                    return out;
+                }"""
+            )
+            for raw in blobs or []:
+                try:
+                    _walk_tiktok_json(json.loads(raw), metadata_cache)
+                except Exception:
+                    continue
     except Exception as exc:
         log("tiktok", f"SSR hydration check skipped: {exc}")
 

@@ -1148,6 +1148,317 @@ void checkResearch(const QDir &callerWorkingDir)
         QApplication::processEvents();
     }
 
+    // Verify Favorite Influencers CRUD, handle/URL normalization, stalest-first ordering,
+    // Reference detail "☆ Star @author" action, Scroll & save dialog 3rd mode + influencer UI,
+    // and end-to-end Browser HumanPick mode (hover live stats, Alt+Click, unpick, cross-page persistence,
+    // in-browser ☆ Star creator, direct-to-Approved import, and lastCheckedAt / lastPickedAt tracking).
+    {
+        const QString infNeverId = store.addInfluencer(accountId, "tiktok", "@fresh_muse", "Editorial heels");
+        const QString infOldId = store.addInfluencer(accountId, "tiktok", "https://www.tiktok.com/@heelsobsession/video/7610000000000000003");
+        const QString infTodayId = store.addInfluencer(accountId, "tiktok", "kerina.wang");
+        requireResearch(!infNeverId.isEmpty() && !infOldId.isEmpty() && !infTodayId.isEmpty(),
+                        "add favorite TikTok influencers from @handle, bare handle, and video URL");
+        requireResearch(store.influencer(infOldId).value("handle").toString() == "@heelsobsession"
+                            && store.influencer(infOldId).value("url").toString() == "https://www.tiktok.com/@heelsobsession",
+                        "TikTok video URL normalizes to creator handle and profile URL");
+        requireResearch(store.addInfluencer(accountId, "tiktok", "@FRESH_MUSE", "Updated note") == infNeverId
+                            && store.influencer(infNeverId).value("notes").toString() == "Updated note",
+                        "duplicate influencer handle deduplicates case-insensitively and updates notes");
+
+        const QString twentyDaysAgoTs = QDateTime::currentDateTimeUtc().addDays(-20).toString(Qt::ISODateWithMs);
+        const QString todayTs = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+        requireResearch(store.recordInfluencerActivity(infOldId, true, true, 4, twentyDaysAgoTs),
+                        "record 20d-old checked+picked activity");
+        requireResearch(store.recordInfluencerActivity(infTodayId, true, false, 0, todayTs),
+                        "record today checked-only activity");
+
+        const QJsonArray orderedTtInf = store.influencers(accountId, "tiktok");
+        requireResearch(orderedTtInf.size() == 3
+                            && orderedTtInf[0].toObject().value("id").toString() == infNeverId
+                            && orderedTtInf[1].toObject().value("id").toString() == infOldId
+                            && orderedTtInf[2].toObject().value("id").toString() == infTodayId,
+                        "influencers sort stalest-first: Never checked -> 20d ago -> checked today");
+        requireResearch(PaneResearch::formatInfluencerOptionLabel(orderedTtInf[0].toObject()).contains("Never checked")
+                            && PaneResearch::formatInfluencerOptionLabel(orderedTtInf[1].toObject()).contains("20d ago")
+                            && PaneResearch::formatInfluencerOptionLabel(orderedTtInf[1].toObject()).contains("4 saved")
+                            && PaneResearch::formatInfluencerOptionLabel(orderedTtInf[2].toObject()).contains("today")
+                            && PaneResearch::formatInfluencerOptionLabel(orderedTtInf[2].toObject()).contains("No picks yet"),
+                        "formatInfluencerOptionLabel renders relative checked/picked dates and saved counts");
+
+        // Verify Reference detail "☆ Star @author" button stars an author in 1 click
+        QString kabasuRefId;
+        for (const auto &v : store.references())
+        {
+            const auto r = v.toObject();
+            if (r.value("accountId").toString() == accountId
+                && r.value("url").toString().contains("kerina.wang"))
+            {
+                kabasuRefId = r.value("id").toString();
+                break;
+            }
+        }
+        const QString unstarredAuthorRefId = store.addReference(
+            accountId, "https://www.pinterest.com/pin/8080000099/", "Runway heel closeup", spyImgPath);
+        requireResearch(!unstarredAuthorRefId.isEmpty(), "add reference with author for star button test");
+        store.updateReference(unstarredAuthorRefId, QJsonObject{
+            {QStringLiteral("stats"), QJsonObject{{QStringLiteral("author"), QStringLiteral("@velvet_steps")}}}
+        });
+        if (auto *pendingBtn = pane.findChild<QPushButton *>("researchFilter_pending"))
+        {
+            pendingBtn->click();
+        }
+        QApplication::processEvents();
+        requireResearch(clickReferenceCard(pane, unstarredAuthorRefId), "select reference card with @velvet_steps author");
+        auto *starAuthorBtn = pane.findChild<QPushButton *>("researchStarAuthor");
+        requireResearch(starAuthorBtn && starAuthorBtn->isVisible()
+                            && starAuthorBtn->text().contains("☆ Star @velvet_steps"),
+                        "Reference detail shows ☆ Star @velvet_steps button");
+        starAuthorBtn->click();
+        QApplication::processEvents();
+        const QJsonArray pinInfAfterStar = store.influencers(accountId, "pinterest");
+        requireResearch(pinInfAfterStar.size() == 1
+                            && pinInfAfterStar[0].toObject().value("handle").toString() == "@velvet_steps"
+                            && starAuthorBtn->text().contains("★ @velvet_steps"),
+                        "clicking ☆ Star @author saves Pinterest influencer and updates button to ★");
+        const QString velvetStepsInfId = pinInfAfterStar[0].toObject().value("id").toString();
+
+        // Exercise the Scroll & save dialog's 3rd mode ("pick") + Favorite influencer UI controls
+        bool verifiedSpyDialogPickAndInfluencers = false;
+        QTimer spyDlgTimer;
+        spyDlgTimer.setInterval(25);
+        QObject::connect(&spyDlgTimer, &QTimer::timeout, [&]() {
+            auto *activeModal = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            if (!activeModal || activeModal->objectName() != QLatin1String("dialogScrollAndSave"))
+            {
+                return;
+            }
+            spyDlgTimer.stop();
+            auto *platCombo = activeModal->findChild<QComboBox *>("spyPlatformCombo");
+            auto *modeCombo = activeModal->findChild<QComboBox *>("spyModeCombo");
+            auto *filtersBox = activeModal->findChild<QWidget *>("spyAutoFiltersBox");
+            auto *kwRadio = activeModal->findChild<QRadioButton *>("spyTargetKeywordRadio");
+            auto *infRadio = activeModal->findChild<QRadioButton *>("spyTargetInfluencerRadio");
+            auto *infCombo = activeModal->findChild<QComboBox *>("spyInfluencerCombo");
+            auto *addInfBtn = activeModal->findChild<QPushButton *>("spyAddInfluencerBtn");
+            auto *rmInfBtn = activeModal->findChild<QPushButton *>("spyRemoveInfluencerBtn");
+            auto *queryEd = activeModal->findChild<QLineEdit *>("spyQueryEdit");
+            auto *urlPrev = activeModal->findChild<QLabel *>("spyTargetUrlPreview");
+            if (platCombo && modeCombo && filtersBox && kwRadio && infRadio && infCombo && addInfBtn && rmInfBtn && queryEd && urlPrev)
+            {
+                const int pickIdx = modeCombo->findData(QStringLiteral("pick"));
+                modeCombo->setCurrentIndex(pickIdx);
+                queryEd->clear();
+                QApplication::processEvents();
+                const bool pickHidesFiltersAndAllowsBlankQuery =
+                    pickIdx == 2
+                    && !filtersBox->isVisible()
+                    && urlPrev->text() == QLatin1String("https://www.pinterest.com/");
+
+                infRadio->setChecked(true);
+                QApplication::processEvents();
+                // Separate singleShot timer because Qt 6 suppresses re-entrant firing of the outer QTimer inside nested QDialog::exec()
+                QTimer::singleShot(15, []() {
+                    if (auto *addModal = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                        addModal && addModal->objectName() == QLatin1String("dialogAddInfluencer"))
+                    {
+                        if (auto *inp = addModal->findChild<QLineEdit *>("addInfluencerInput"))
+                        {
+                            inp->setText(QStringLiteral("@temp_dialog_star"));
+                        }
+                        addModal->accept();
+                    }
+                });
+                addInfBtn->click();
+                QApplication::processEvents();
+                const bool addedViaDialog =
+                    infCombo->count() == 2
+                    && infCombo->currentText().contains("@temp_dialog_star")
+                    && urlPrev->text() == QLatin1String("https://www.pinterest.com/temp_dialog_star");
+                rmInfBtn->click();
+                QApplication::processEvents();
+                const bool removedViaDialog =
+                    infCombo->count() == 1
+                    && infCombo->currentText().contains("@velvet_steps");
+
+                verifiedSpyDialogPickAndInfluencers =
+                    pickHidesFiltersAndAllowsBlankQuery && addedViaDialog && removedViaDialog;
+            }
+            activeModal->reject();
+        });
+        spyDlgTimer.start();
+        spyButton->click();
+        spyDlgTimer.stop();
+        requireResearch(verifiedSpyDialogPickAndInfluencers,
+                        "Scroll & save dialog provides 3rd 'pick' mode, hides auto filters, previews default home URL, and adds/removes favorite influencers");
+
+        // End-to-end Browser HumanPick session:
+        // Page 1 hovers Pin A (verifies '+ Pick · 1.4K saves' in Shadow DOM), clicks to pick Pin A,
+        // Alt+Clicks Pin B then unpicks Pin B from the tray, picks low-stat Pin C (3 saves), and navigates to Page 2.
+        // Page 2 verifies Picked: 2 survived navigation, stars '@velvet_new_star' via HUD, picks video Pin D (.mp4),
+        // and clicks '✓ Save & Finish (3)'.
+        const QString pickPage2Path = root.filePath("spy_fixture/pick_page2.html");
+        const QString pickPage1Path = root.filePath("spy_fixture/pick_page1.html");
+        writeResearch(pickPage2Path, QStringLiteral(
+            "<!doctype html><html><body data-profile-handle='@velvet_new_star' style='margin:0;padding:20px'>"
+            "<div data-test-id='pin' data-saves='890' data-likes='45' data-author='@velvet_steps' data-video-url='file://%2' style='width:220px;height:280px'>"
+            "  <a id='pinD' href='https://www.pinterest.com/pin/8181000004/' aria-label='Velvet steps runway video'>"
+            "    <img src='file://%1' style='width:220px;height:260px;display:block'/></a>"
+            "</div>"
+            "<script>"
+            "function stepPage2() {"
+            "  const host = document.getElementById('__qs_picker_host');"
+            "  if (!host || !host.shadowRoot) { setTimeout(stepPage2, 40); return; }"
+            "  const sr = host.shadowRoot;"
+            "  const toggleBtn = sr.getElementById('qs-tray-toggle');"
+            "  const starBtn = sr.getElementById('qs-star-creator-btn');"
+            "  const finishBtn = sr.getElementById('qs-finish-btn');"
+            "  if (!toggleBtn || !toggleBtn.textContent.includes('Picked: 2') || !starBtn || starBtn.style.display === 'none') {"
+            "    setTimeout(stepPage2, 40); return;"
+            "  }"
+            "  starBtn.click();"
+            "  const pinD = document.getElementById('pinD');"
+            "  const rD = pinD.getBoundingClientRect();"
+            "  pinD.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, altKey: true, clientX: rD.left + 40, clientY: rD.top + 40 }));"
+            "  function waitPicked3() {"
+            "    if (!toggleBtn.textContent.includes('Picked: 3') || !starBtn.textContent.includes('★ @velvet_new_star')) {"
+            "      setTimeout(waitPicked3, 40); return;"
+            "    }"
+            "    setTimeout(() => finishBtn.click(), 80);"
+            "  }"
+            "  setTimeout(waitPicked3, 60);"
+            "}"
+            "setTimeout(stepPage2, 80);"
+            "</script></body></html>").arg(spyImgPath, pinVideoPath).toUtf8());
+
+        writeResearch(pickPage1Path, QStringLiteral(
+            "<!doctype html><html><body style='margin:0;padding:20px;display:flex;gap:24px'>"
+            "<div data-test-id='pin' data-saves='1420' data-likes='88' data-author='@velvet_steps' style='width:220px;height:280px'>"
+            "  <a id='pinA' href='https://www.pinterest.com/pin/8181000001/' aria-label='High-stat picked pin'>"
+            "    <img src='file://%1' style='width:220px;height:260px;display:block'/></a>"
+            "</div>"
+            "<div data-test-id='pin' data-saves='2' data-likes='0' data-author='@other' style='width:220px;height:280px'>"
+            "  <a id='pinB' href='https://www.pinterest.com/pin/8181000002/' aria-label='Accidentally clicked then unpicked pin'>"
+            "    <img src='file://%1' style='width:220px;height:260px;display:block'/></a>"
+            "</div>"
+            "<div data-test-id='pin' data-saves='3' data-likes='1' data-author='@indie_stylist' style='width:220px;height:280px'>"
+            "  <a id='pinC' href='https://www.pinterest.com/pin/8181000003/' aria-label='Low-stat human-chosen gem'>"
+            "    <img src='file://%1' style='width:220px;height:260px;display:block'/></a>"
+            "</div>"
+            "<script>"
+            "function stepPage1() {"
+            "  const host = document.getElementById('__qs_picker_host');"
+            "  if (!host || !host.shadowRoot) { setTimeout(stepPage1, 40); return; }"
+            "  const sr = host.shadowRoot;"
+            "  const hoverPill = sr.getElementById('qs-hover-pill');"
+            "  const toggleBtn = sr.getElementById('qs-tray-toggle');"
+            "  const pinA = document.getElementById('pinA');"
+            "  const rA = pinA.getBoundingClientRect();"
+            "  window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: rA.left + 50, clientY: rA.top + 50 }));"
+            "  if (!hoverPill || hoverPill.style.display === 'none' || !hoverPill.textContent.includes('1.4K saves')) {"
+            "    setTimeout(stepPage1, 40); return;"
+            "  }"
+            "  hoverPill.click();"
+            "  const pinB = document.getElementById('pinB');"
+            "  const rB = pinB.getBoundingClientRect();"
+            "  pinB.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, altKey: true, clientX: rB.left + 50, clientY: rB.top + 50 }));"
+            "  const pinC = document.getElementById('pinC');"
+            "  const rC = pinC.getBoundingClientRect();"
+            "  pinC.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, altKey: true, clientX: rC.left + 50, clientY: rC.top + 50 }));"
+            "  function waitAllThreeThenUnpickB() {"
+            "    if (!toggleBtn.textContent.includes('Picked: 3')) { setTimeout(waitAllThreeThenUnpickB, 40); return; }"
+            "    toggleBtn.click();"
+            "    const trayRows = Array.from(sr.querySelectorAll('.qs-tray-row'));"
+            "    const rowB = trayRows.find(r => r.textContent.includes('unpicked pin') || r.textContent.includes('8181000002'));"
+            "    if (!rowB) { setTimeout(waitAllThreeThenUnpickB, 40); return; }"
+            "    rowB.querySelector('.qs-tray-rm').click();"
+            "    function waitAfterUnpick() {"
+            "      if (!toggleBtn.textContent.includes('Picked: 2')) { setTimeout(waitAfterUnpick, 40); return; }"
+            "      window.location.href = 'file://%2';"
+            "    }"
+            "    setTimeout(waitAfterUnpick, 40);"
+            "  }"
+            "  setTimeout(waitAllThreeThenUnpickB, 60);"
+            "}"
+            "setTimeout(stepPage1, 80);"
+            "</script></body></html>").arg(spyImgPath, pickPage2Path).toUtf8());
+
+        {
+            QEventLoop pickLoop;
+            QTimer pickTimeout;
+            pickTimeout.setSingleShot(true);
+            QObject::connect(&pickTimeout, &QTimer::timeout, &pickLoop, &QEventLoop::quit);
+            pickTimeout.start(30000);
+            QCoro::connect(
+                pane.runScrollAndSaveMode(
+                    "pinterest",
+                    "file://" + pickPage1Path,
+                    24,
+                    AbstractSocialAccount::SpyMode::HumanPick,
+                    product.value("id").toString(),
+                    500, // high minEngagement must NOT reject human-picked Pin C (3 saves)
+                    30,
+                    velvetStepsInfId),
+                &pickLoop,
+                [&pickLoop]() { pickLoop.quit(); });
+            pickLoop.exec();
+        }
+        QApplication::processEvents();
+
+        bool foundPickedA = false;
+        bool foundUnpickedB = false;
+        bool foundLowStatPickedC = false;
+        bool foundVideoPickedD = false;
+        for (const auto &v : store.references())
+        {
+            const auto r = v.toObject();
+            if (r.value("accountId").toString() != accountId) continue;
+            const QString u = r.value("url").toString();
+            if (u.contains("8181000001"))
+            {
+                foundPickedA = (r.value("status").toString() == "approved"
+                                && r.value("stats").toObject().value("saves").toInt() == 1420
+                                && QFileInfo::exists(store.mediaPath(r)));
+            }
+            if (u.contains("8181000002"))
+            {
+                foundUnpickedB = true;
+            }
+            if (u.contains("8181000003"))
+            {
+                foundLowStatPickedC = (r.value("status").toString() == "approved"
+                                       && r.value("stats").toObject().value("saves").toInt() == 3);
+            }
+            if (u.contains("8181000004"))
+            {
+                foundVideoPickedD = (r.value("status").toString() == "approved"
+                                     && store.mediaPath(r).endsWith(".mp4", Qt::CaseInsensitive));
+            }
+        }
+        requireResearch(foundPickedA && !foundUnpickedB && foundLowStatPickedC && foundVideoPickedD,
+                        "HumanPick imports only picked posts across navigations (respecting unpick & low-stat human choices), downloads .mp4, and lands directly in Approved");
+        requireResearch(filterApprovedBtn->isChecked(),
+                        "PaneResearch automatically switches to Approved view after HumanPick imports approved posts");
+
+        const QString todayPrefix = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).left(10);
+        const QJsonObject updatedVelvet = store.influencer(velvetStepsInfId);
+        requireResearch(updatedVelvet.value("lastCheckedAt").toString().startsWith(todayPrefix)
+                            && updatedVelvet.value("lastPickedAt").toString().startsWith(todayPrefix)
+                            && updatedVelvet.value("pickedCount").toInt() >= 2,
+                        "HumanPick updates target favorite influencer lastCheckedAt, lastPickedAt, and pickedCount");
+
+        bool foundBrowserStarredCreator = false;
+        for (const auto &v : store.influencers(accountId, "pinterest"))
+        {
+            if (v.toObject().value("handle").toString() == "@velvet_new_star")
+            {
+                foundBrowserStarredCreator = v.toObject().value("lastCheckedAt").toString().startsWith(todayPrefix);
+                break;
+            }
+        }
+        requireResearch(foundBrowserStarredCreator,
+                        "clicking ☆ Star @creator inside Chrome saves favorite influencer and records visited profile date");
+    }
+
     const QJsonObject autoBatchSpec = pane.buildAutoBatchSpec(
         {product.value("id").toString()},
         3,

@@ -35,6 +35,13 @@ public:
         Analytics,
     };
 
+    enum class SpyMode
+    {
+        AutoScroll,
+        ManualScroll,
+        HumanPick,
+    };
+
     // Public stats retrieved for one profile URL. A negative value means the
     // fetch failed or the platform does not publicly expose that stat —
     // callers should leave the previously known value untouched rather than
@@ -109,6 +116,8 @@ public:
     struct SpyResult
     {
         QList<SpyPost> posts;
+        QStringList starredInfluencers;
+        QStringList visitedProfiles;
         int browsedCount = 0;
         int savedCount = 0;
         int rejectedCount = 0;
@@ -194,6 +203,10 @@ public:
     // keyword query (e.g. "red stiletto heels outfit").
     virtual QString defaultSpySearchUrl(const QString &query) const;
 
+    // Builds the default home/explore URL on this platform when browsing
+    // without a specific search query (e.g. in HumanPick mode).
+    virtual QString defaultSpyHomeUrl() const;
+
     // Opens a visible browser window on the given search query or URL, scrolls
     // (automatically or waiting for the user to scroll manually until closing
     // the browser window), downloads discovered post media into downloadDir,
@@ -206,6 +219,18 @@ public:
         int minEngagement = 0,
         const QStringList &excludeUrls = {},
         int maxDaysOld = 0) const;
+
+    virtual QCoro::Task<SpyResult> spyScrollAndSaveMode(
+        const QString &queryOrUrl,
+        const QString &downloadDir,
+        int maxPosts,
+        SpyMode mode,
+        int minEngagement = 0,
+        const QJsonObject &spyContext = {},
+        int maxDaysOld = 0) const;
+
+    static QString spyModeKey(SpyMode mode);
+    static SpyMode spyModeFromKey(const QString &key);
 
     // Whether this platform supports browser-driven self-publishing of videos / image sets.
     virtual bool supportsAutoPublish() const;
@@ -291,6 +316,16 @@ protected:
         bool autoScroll,
         int minEngagement = 0,
         const QStringList &excludeUrls = {},
+        int maxDaysOld = 0) const;
+
+    QCoro::Task<SpyResult> runSpyScriptMode(
+        const QString &scriptFileName,
+        const QString &queryOrUrl,
+        const QString &downloadDir,
+        int maxPosts,
+        SpyMode mode,
+        int minEngagement = 0,
+        const QJsonObject &spyContext = {},
         int maxDaysOld = 0) const;
 
     QCoro::Task<PublishResult> runPublishScript(

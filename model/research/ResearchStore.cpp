@@ -3,6 +3,7 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QLockFile>
 #include <QRegularExpression>
@@ -11,6 +12,7 @@
 #include <QUuid>
 #include <QUrl>
 #include <QUrlQuery>
+#include <algorithm>
 
 namespace {
 QByteArray digest(const QByteArray &data) { return QCryptographicHash::hash(data, QCryptographicHash::Sha256); }
@@ -457,6 +459,534 @@ QStringList ResearchStore::excludedSpyUrls(const QString &accountId) const
         }
     }
     return seen.values();
+}
+
+QJsonObject ResearchStore::spyContextPayload(const QString &accountId, const QString &platformId) const
+{
+    QSet<QString> savedSet;
+    QSet<QString> rejectedSet;
+    if (!accountId.isEmpty())
+    {
+        for (const auto &v : m_data.value("rejectedUrls").toObject().value(accountId).toArray())
+        {
+            const QString u = canonicalUrl(v.toString());
+            if (!u.isEmpty())
+            {
+                rejectedSet.insert(u);
+            }
+        }
+        for (const auto &v : references())
+        {
+            const auto r = v.toObject();
+            if (r.value("accountId").toString() != accountId)
+            {
+                continue;
+            }
+            const QString u = canonicalUrl(r.value("url").toString());
+            if (u.isEmpty())
+            {
+                continue;
+            }
+            if (r.value("status").toString() == QLatin1String("rejected"))
+            {
+                rejectedSet.insert(u);
+            }
+            else
+            {
+                savedSet.insert(u);
+            }
+        }
+    }
+    for (const QString &rj : rejectedSet)
+    {
+        savedSet.remove(rj);
+    }
+    QSet<QString> excludedSet = savedSet;
+    excludedSet.unite(rejectedSet);
+
+    QStringList favHandles;
+    QStringList favUrls;
+    for (const auto &v : influencers(accountId, platformId))
+    {
+        const auto inf = v.toObject();
+        const QString h = inf.value("handle").toString().trimmed();
+        const QString u = inf.value("url").toString().trimmed();
+        if (!h.isEmpty() && !favHandles.contains(h, Qt::CaseInsensitive))
+        {
+            favHandles << h;
+        }
+        if (!u.isEmpty() && !favUrls.contains(u))
+        {
+            favUrls << u;
+        }
+    }
+
+    return QJsonObject{
+        {QStringLiteral("saved"), QJsonArray::fromStringList(savedSet.values())},
+        {QStringLiteral("rejected"), QJsonArray::fromStringList(rejectedSet.values())},
+        {QStringLiteral("excluded"), QJsonArray::fromStringList(excludedSet.values())},
+        {QStringLiteral("favorite_handles"), QJsonArray::fromStringList(favHandles)},
+        {QStringLiteral("favorite_urls"), QJsonArray::fromStringList(favUrls)}
+    };
+}
+
+QString ResearchStore::normalizeInfluencerHandle(const QString &handleOrUrl, const QString &platformId)
+{
+    QString raw = handleOrUrl.trimmed();
+    if (raw.isEmpty())
+    {
+        return {};
+    }
+    if (!raw.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
+        && !raw.startsWith(QLatin1String("https://"), Qt::CaseInsensitive)
+        && !raw.startsWith(QLatin1String("file://"), Qt::CaseInsensitive)
+        && raw.contains(QLatin1Char('/'))
+        && (raw.contains(QLatin1String("tiktok."), Qt::CaseInsensitive)
+            || raw.contains(QLatin1String("pinterest."), Qt::CaseInsensitive)
+            || raw.contains(QLatin1String("instagram."), Qt::CaseInsensitive)
+            || raw.contains(QLatin1String("youtube."), Qt::CaseInsensitive)))
+    {
+        raw = QStringLiteral("https://") + raw;
+    }
+
+    if (raw.startsWith(QLatin1String("file://"), Qt::CaseInsensitive))
+    {
+        const QUrl fileUrl(raw);
+        const QString base = QFileInfo(fileUrl.path()).completeBaseName().trimmed();
+        return base.isEmpty() ? QString{} : (QStringLiteral("@") + base);
+    }
+
+    if (raw.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
+        || raw.startsWith(QLatin1String("https://"), Qt::CaseInsensitive))
+    {
+        const QUrl url(raw);
+        const QString host = url.host().toLower();
+        const QStringList segs = url.path().split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        if (segs.isEmpty())
+        {
+            return {};
+        }
+        const QString seg0 = segs.first().trimmed();
+        if (host.contains(QLatin1String("tiktok.")) || platformId == QLatin1String("tiktok"))
+        {
+            if (seg0.startsWith(QLatin1Char('@')) && seg0.size() > 1)
+            {
+                return seg0;
+            }
+            return {};
+        }
+        if (host.contains(QLatin1String("pinterest.")) || platformId == QLatin1String("pinterest"))
+        {
+            static const QSet<QString> kReserved{
+                QStringLiteral("pin"), QStringLiteral("search"), QStringLiteral("ideas"),
+                QStringLiteral("today"), QStringLiteral("explore"), QStringLiteral("login"),
+                QStringLiteral("settings"), QStringLiteral("business"), QStringLiteral("_")
+            };
+            QString clean = seg0;
+            if (clean.startsWith(QLatin1Char('@'))) clean.remove(0, 1);
+            if (!clean.isEmpty() && !kReserved.contains(clean.toLower()))
+            {
+                return QStringLiteral("@") + clean;
+            }
+            return {};
+        }
+        if (host.contains(QLatin1String("instagram.")) || platformId == QLatin1String("instagram"))
+        {
+            static const QSet<QString> kReserved{
+                QStringLiteral("p"), QStringLiteral("reel"), QStringLiteral("reels"),
+                QStringLiteral("explore"), QStringLiteral("stories"), QStringLiteral("accounts"),
+                QStringLiteral("direct"), QStringLiteral("tv")
+            };
+            QString clean = seg0;
+            if (clean.startsWith(QLatin1Char('@'))) clean.remove(0, 1);
+            if (!clean.isEmpty() && !kReserved.contains(clean.toLower()))
+            {
+                return QStringLiteral("@") + clean;
+            }
+            return {};
+        }
+        if (host.contains(QLatin1String("youtube.")) || platformId == QLatin1String("youtube"))
+        {
+            if (seg0.startsWith(QLatin1Char('@')) && seg0.size() > 1)
+            {
+                return seg0;
+            }
+            if ((seg0 == QLatin1String("c") || seg0 == QLatin1String("user") || seg0 == QLatin1String("channel"))
+                && segs.size() >= 2 && !segs.at(1).trimmed().isEmpty())
+            {
+                return QStringLiteral("@") + segs.at(1).trimmed();
+            }
+            return {};
+        }
+        QString fallback = seg0;
+        if (fallback.startsWith(QLatin1Char('@'))) fallback.remove(0, 1);
+        return fallback.isEmpty() ? QString{} : (QStringLiteral("@") + fallback);
+    }
+
+    while (raw.startsWith(QLatin1Char('@')) || raw.startsWith(QLatin1Char('/')))
+    {
+        raw.remove(0, 1);
+    }
+    while (raw.endsWith(QLatin1Char('/')))
+    {
+        raw.chop(1);
+    }
+    raw = raw.trimmed();
+    static const QRegularExpression kValidHandleRe(QStringLiteral("^[A-Za-z0-9._-]{1,80}$"));
+    if (!kValidHandleRe.match(raw).hasMatch())
+    {
+        return {};
+    }
+    return QStringLiteral("@") + raw;
+}
+
+QString ResearchStore::buildInfluencerUrl(const QString &platformId, const QString &handleOrUrl)
+{
+    QString raw = handleOrUrl.trimmed();
+    if (raw.isEmpty())
+    {
+        return {};
+    }
+    if (raw.startsWith(QLatin1String("file://"), Qt::CaseInsensitive))
+    {
+        return raw;
+    }
+    if (!raw.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
+        && !raw.startsWith(QLatin1String("https://"), Qt::CaseInsensitive)
+        && raw.contains(QLatin1Char('/'))
+        && (raw.contains(QLatin1String("tiktok."), Qt::CaseInsensitive)
+            || raw.contains(QLatin1String("pinterest."), Qt::CaseInsensitive)
+            || raw.contains(QLatin1String("instagram."), Qt::CaseInsensitive)
+            || raw.contains(QLatin1String("youtube."), Qt::CaseInsensitive)))
+    {
+        raw = QStringLiteral("https://") + raw;
+    }
+
+    if (raw.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)
+        || raw.startsWith(QLatin1String("https://"), Qt::CaseInsensitive))
+    {
+        const QString norm = canonicalUrl(raw);
+        if (norm.isEmpty())
+        {
+            return {};
+        }
+        QUrl u(norm);
+        const QString host = u.host().toLower();
+        const QStringList segs = u.path().split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        if (host.contains(QLatin1String("tiktok.")) && segs.size() >= 2 && segs.first().startsWith(QLatin1Char('@'))
+            && (segs.at(1) == QLatin1String("video") || segs.at(1) == QLatin1String("photo")))
+        {
+            return QStringLiteral("https://www.tiktok.com/") + segs.first();
+        }
+        return norm;
+    }
+
+    const QString handle = normalizeInfluencerHandle(raw, platformId);
+    if (handle.isEmpty())
+    {
+        return {};
+    }
+    const QString bare = handle.mid(1);
+    const QString plat = platformId.trimmed().toLower();
+    if (plat == QLatin1String("tiktok"))
+    {
+        return QStringLiteral("https://www.tiktok.com/@") + bare;
+    }
+    if (plat == QLatin1String("pinterest"))
+    {
+        return QStringLiteral("https://www.pinterest.com/") + bare;
+    }
+    if (plat == QLatin1String("instagram"))
+    {
+        return QStringLiteral("https://www.instagram.com/") + bare;
+    }
+    if (plat == QLatin1String("youtube"))
+    {
+        return QStringLiteral("https://www.youtube.com/@") + bare + QStringLiteral("/shorts");
+    }
+    return {};
+}
+
+QJsonArray ResearchStore::influencers(const QString &accountId, const QString &platformId) const
+{
+    const QString plat = platformId.trimmed().toLower();
+    QList<QJsonObject> items;
+    for (const auto &v : m_data.value("influencers").toArray())
+    {
+        const auto obj = v.toObject();
+        if (!accountId.isEmpty() && obj.value("accountId").toString() != accountId)
+        {
+            continue;
+        }
+        if (!plat.isEmpty() && obj.value("platform").toString().toLower() != plat)
+        {
+            continue;
+        }
+        items.append(obj);
+    }
+
+    const auto effectiveLastSeen = [](const QJsonObject &o) {
+        const QString c = o.value("lastCheckedAt").toString();
+        const QString p = o.value("lastPickedAt").toString();
+        return (c >= p) ? c : p;
+    };
+
+    std::stable_sort(items.begin(), items.end(), [&](const QJsonObject &a, const QJsonObject &b) {
+        const QString sa = effectiveLastSeen(a);
+        const QString sb = effectiveLastSeen(b);
+        const bool aNever = sa.isEmpty();
+        const bool bNever = sb.isEmpty();
+        if (aNever != bNever)
+        {
+            return aNever; // Never checked/picked appears first!
+        }
+        if (sa != sb)
+        {
+            return sa < sb; // Oldest checked/picked date first!
+        }
+        return a.value("handle").toString().compare(b.value("handle").toString(), Qt::CaseInsensitive) < 0;
+    });
+
+    QJsonArray out;
+    for (const auto &obj : items)
+    {
+        out.append(obj);
+    }
+    return out;
+}
+
+QJsonObject ResearchStore::influencer(const QString &id) const
+{
+    for (const auto &v : m_data.value("influencers").toArray())
+    {
+        if (v.toObject().value("id").toString() == id)
+        {
+            return v.toObject();
+        }
+    }
+    return {};
+}
+
+QString ResearchStore::addInfluencer(const QString &accountId, const QString &platformId,
+                                     const QString &handleOrUrl, const QString &notes)
+{
+    if (QUuid(accountId).isNull())
+    {
+        m_error = tr("Choose an account first.");
+        return {};
+    }
+    const QString plat = platformId.trimmed().toLower();
+    if (!QStringList{"pinterest", "tiktok", "instagram", "youtube"}.contains(plat))
+    {
+        m_error = tr("Choose a supported social platform.");
+        return {};
+    }
+    const QString url = buildInfluencerUrl(plat, handleOrUrl);
+    QString handle = normalizeInfluencerHandle(handleOrUrl, plat);
+    if (handle.isEmpty() && !url.isEmpty())
+    {
+        handle = normalizeInfluencerHandle(url, plat);
+    }
+    if (url.isEmpty())
+    {
+        m_error = tr("Enter a valid @handle or influencer profile URL.");
+        return {};
+    }
+    if (handle.isEmpty())
+    {
+        handle = url;
+    }
+
+    auto list = m_data.value("influencers").toArray();
+    for (int i = 0; i < list.size(); ++i)
+    {
+        auto existing = list[i].toObject();
+        if (existing.value("accountId").toString() != accountId
+            || existing.value("platform").toString().toLower() != plat)
+        {
+            continue;
+        }
+        const bool sameUrl = existing.value("url").toString().compare(url, Qt::CaseInsensitive) == 0;
+        const bool sameHandle = !handle.startsWith(QLatin1String("http"))
+            && existing.value("handle").toString().compare(handle, Qt::CaseInsensitive) == 0;
+        if (sameUrl || sameHandle)
+        {
+            const QString existingId = existing.value("id").toString();
+            if (!notes.trimmed().isEmpty() && existing.value("notes").toString() != notes.trimmed())
+            {
+                existing.insert("notes", notes.trimmed());
+                existing.insert("updatedAt", now());
+                list[i] = existing;
+                auto next = m_data;
+                next.insert("influencers", list);
+                if (!save(next))
+                {
+                    return {};
+                }
+            }
+            m_error.clear();
+            return existingId;
+        }
+    }
+
+    const QString id = uuid();
+    QJsonObject record{
+        {QStringLiteral("id"), id},
+        {QStringLiteral("accountId"), accountId},
+        {QStringLiteral("platform"), plat},
+        {QStringLiteral("handle"), handle},
+        {QStringLiteral("url"), url},
+        {QStringLiteral("notes"), notes.trimmed()},
+        {QStringLiteral("createdAt"), now()},
+        {QStringLiteral("lastCheckedAt"), QString{}},
+        {QStringLiteral("lastPickedAt"), QString{}},
+        {QStringLiteral("pickedCount"), 0}
+    };
+    list.append(record);
+    auto next = m_data;
+    next.insert("influencers", list);
+    return save(next) ? id : QString{};
+}
+
+bool ResearchStore::removeInfluencer(const QString &id)
+{
+    if (id.isEmpty())
+    {
+        m_error = tr("Select an influencer to remove.");
+        return false;
+    }
+    QJsonArray remaining;
+    bool removed = false;
+    for (const auto &v : m_data.value("influencers").toArray())
+    {
+        const auto obj = v.toObject();
+        if (obj.value("id").toString() == id)
+        {
+            removed = true;
+        }
+        else
+        {
+            remaining.append(obj);
+        }
+    }
+    if (!removed)
+    {
+        m_error = tr("Influencer no longer exists.");
+        return false;
+    }
+    auto next = m_data;
+    next.insert("influencers", remaining);
+    return save(next);
+}
+
+bool ResearchStore::recordInfluencerActivity(const QString &id, bool checked, bool picked,
+                                             int newlyPickedCount, const QString &timestampOverride)
+{
+    if (id.isEmpty() || (!checked && !picked && newlyPickedCount <= 0))
+    {
+        return false;
+    }
+    const QString ts = timestampOverride.trimmed().isEmpty() ? now() : timestampOverride.trimmed();
+    auto list = m_data.value("influencers").toArray();
+    for (int i = 0; i < list.size(); ++i)
+    {
+        auto obj = list[i].toObject();
+        if (obj.value("id").toString() != id)
+        {
+            continue;
+        }
+        if (checked)
+        {
+            obj.insert("lastCheckedAt", ts);
+        }
+        if (picked)
+        {
+            obj.insert("lastPickedAt", ts);
+        }
+        if (newlyPickedCount > 0)
+        {
+            obj.insert("pickedCount", obj.value("pickedCount").toInt(0) + newlyPickedCount);
+        }
+        obj.insert("updatedAt", ts);
+        list[i] = obj;
+        auto next = m_data;
+        next.insert("influencers", list);
+        return save(next);
+    }
+    m_error = tr("Influencer no longer exists.");
+    return false;
+}
+
+int ResearchStore::recordInfluencerPickByAuthorOrUrl(const QString &accountId, const QString &platformId,
+                                                     const QString &authorHandle, const QString &postOrProfileUrl,
+                                                     bool checked, const QString &timestampOverride)
+{
+    if (accountId.isEmpty())
+    {
+        return 0;
+    }
+    const QString plat = platformId.trimmed().toLower();
+    QString normHandle = normalizeInfluencerHandle(authorHandle, plat);
+    if (normHandle.isEmpty() && !postOrProfileUrl.isEmpty())
+    {
+        normHandle = normalizeInfluencerHandle(postOrProfileUrl, plat);
+    }
+    const QString normUrl = postOrProfileUrl.startsWith(QLatin1String("file://"), Qt::CaseInsensitive)
+        ? postOrProfileUrl.trimmed()
+        : canonicalUrl(postOrProfileUrl);
+
+    if (normHandle.isEmpty() && normUrl.isEmpty())
+    {
+        return 0;
+    }
+
+    const QString ts = timestampOverride.trimmed().isEmpty() ? now() : timestampOverride.trimmed();
+    auto list = m_data.value("influencers").toArray();
+    int matched = 0;
+    for (int i = 0; i < list.size(); ++i)
+    {
+        auto obj = list[i].toObject();
+        if (obj.value("accountId").toString() != accountId)
+        {
+            continue;
+        }
+        if (!plat.isEmpty() && obj.value("platform").toString().toLower() != plat)
+        {
+            continue;
+        }
+        const QString infHandle = obj.value("handle").toString().trimmed();
+        const QString infUrl = obj.value("url").toString().trimmed();
+        const bool handleMatch = !normHandle.isEmpty()
+            && !infHandle.isEmpty()
+            && infHandle.compare(normHandle, Qt::CaseInsensitive) == 0;
+        const bool urlMatch = !normUrl.isEmpty()
+            && !infUrl.isEmpty()
+            && (normUrl.compare(infUrl, Qt::CaseInsensitive) == 0
+                || normUrl.startsWith(infUrl + QLatin1Char('/'), Qt::CaseInsensitive));
+        if (!handleMatch && !urlMatch)
+        {
+            continue;
+        }
+        if (checked)
+        {
+            obj.insert("lastCheckedAt", ts);
+        }
+        obj.insert("lastPickedAt", ts);
+        obj.insert("pickedCount", obj.value("pickedCount").toInt(0) + 1);
+        obj.insert("updatedAt", ts);
+        list[i] = obj;
+        ++matched;
+    }
+    if (matched > 0)
+    {
+        auto next = m_data;
+        next.insert("influencers", list);
+        if (!save(next))
+        {
+            return 0;
+        }
+    }
+    return matched;
 }
 
 bool ResearchStore::recordAssessment(const QString &id, const QJsonObject &assessment)

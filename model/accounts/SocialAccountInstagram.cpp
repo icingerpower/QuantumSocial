@@ -45,23 +45,28 @@ QString SocialAccountInstagram::defaultSpySearchUrl(const QString &query) const
         .arg(QString::fromUtf8(QUrl::toPercentEncoding(query.trimmed())));
 }
 
-QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountInstagram::spyScrollAndSave(
+QString SocialAccountInstagram::defaultSpyHomeUrl() const
+{
+    return QStringLiteral("https://www.instagram.com/explore/");
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountInstagram::spyScrollAndSaveMode(
     const QString &queryOrUrl,
     const QString &downloadDir,
     int maxPosts,
-    bool autoScroll,
+    SpyMode mode,
     int minEngagement,
-    const QStringList &excludeUrls,
+    const QJsonObject &spyContext,
     int maxDaysOld) const
 {
-    return runSpyScript(
+    return runSpyScriptMode(
         QStringLiteral("spy_scroll_instagram.py"),
         queryOrUrl,
         downloadDir,
         maxPosts,
-        autoScroll,
+        mode,
         minEngagement,
-        excludeUrls,
+        spyContext,
         maxDaysOld);
 }
 

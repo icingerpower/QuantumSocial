@@ -18,16 +18,18 @@ int ResearchCommand::run(const QStringList &arguments)
     parser.setApplicationDescription("QuantumSocial research commands (no GUI or browser required).");
     parser.addHelpOption();
     parser.addPositionalArgument("research", "Research command group.");
-    parser.addPositionalArgument("action", "accounts, products, references, import-products, add-reference, scroll-and-save, delete-references, link-product, review, or create-project");
+    parser.addPositionalArgument("action", "accounts, products, references, influencers, add-influencer, remove-influencer, import-products, add-reference, scroll-and-save, delete-references, link-product, review, or create-project");
     parser.addOption({"workspace", "Existing QuantumSocial working directory.", "directory"});
     parser.addOption({"source", "AmazonTemplate3 directory to import.", "directory"});
     parser.addOption({"account", "Stable account ID (see accounts).", "id"});
-    parser.addOption({"platform", "Social platform ID for scroll-and-save (pinterest, tiktok, youtube, instagram).", "platform", "pinterest"});
+    parser.addOption({"platform", "Social platform ID for scroll-and-save / influencers (pinterest, tiktok, youtube, instagram).", "platform", "pinterest"});
+    parser.addOption({"influencer", "Favorite influencer ID or @handle for scroll-and-save / add-influencer / remove-influencer.", "influencer"});
+    parser.addOption({"notes", "Optional notes for add-influencer.", "text"});
     parser.addOption({"query", "Search query or URL for scroll-and-save.", "query"});
     parser.addOption({"max-posts", "Maximum posts to save during scroll-and-save.", "count", "24"});
     parser.addOption({"min-engagement", "Minimum engagement threshold (saves+likes or views) for scroll-and-save.", "score", "0"});
     parser.addOption({"max-days-old", "Maximum post age in days (0 = no limit) for scroll-and-save.", "days", "0"});
-    parser.addOption({"mode", "Scroll mode for scroll-and-save: auto or manual.", "mode", "auto"});
+    parser.addOption({"mode", "Scroll mode for scroll-and-save: auto, manual, or pick.", "mode", "auto"});
     parser.addOption({"reference", "Reference ID.", "id"});
     parser.addOption({"all", "Apply action (such as delete-references) to all references of the account."});
     parser.addOption({"product", "Imported product group ID.", "id"});
@@ -47,7 +49,7 @@ int ResearchCommand::run(const QStringList &arguments)
     const auto positional = parser.positionalArguments();
     if (positional.size() != 2 || positional[0] != "research") return error("Usage: QuantumSocial research <action> --workspace <directory>. See research --help.");
     const QString action = positional[1];
-    if (!QStringList{"accounts", "products", "references", "import-products", "add-reference", "scroll-and-save", "delete-references", " link-product", "link-product", "review", "create-project"}.contains(action))
+    if (!QStringList{"accounts", "products", "references", "influencers", "add-influencer", "remove-influencer", "import-products", "add-reference", "scroll-and-save", "delete-references", " link-product", "link-product", "review", "create-project"}.contains(action))
         return error("Unknown research action.");
     const QString workspace = QFileInfo(parser.value("workspace")).canonicalFilePath();
     if (!parser.isSet("workspace") || workspace.isEmpty() || !QFileInfo(workspace).isDir()) return error("--workspace must name an existing directory.");
@@ -85,6 +87,22 @@ int ResearchCommand::run(const QStringList &arguments)
                                      : object.value("accountId").toString() == accountId) rows.append(object);
         }
         return output({{"ok", true}, {action, rows}});
+    }
+    if (action == "influencers")
+    {
+        const QString platFilter = parser.isSet("platform") ? parser.value("platform").trimmed().toLower() : QString{};
+        return output({{"ok", true}, {"influencers", store.influencers(accountId, platFilter)}});
+    }
+    if (action == "add-influencer")
+    {
+        const QString handleOrUrl = parser.isSet("influencer") ? parser.value("influencer").trimmed() : parser.value("url").trimmed();
+        const QString id = store.addInfluencer(accountId, parser.value("platform").trimmed().toLower(), handleOrUrl, parser.value("notes"));
+        return id.isEmpty() ? error(store.lastError()) : output({{"ok", true}, {"influencerId", id}, {"influencer", store.influencer(id)}});
+    }
+    if (action == "remove-influencer")
+    {
+        const QString id = parser.value("influencer").trimmed();
+        return store.removeInfluencer(id) ? output({{"ok", true}}) : error(store.lastError());
     }
     if (action == "add-reference")
     {
@@ -134,24 +152,50 @@ int ResearchCommand::run(const QStringList &arguments)
     }
     if (action == "scroll-and-save")
     {
-        const QString platformId = parser.value("platform").trimmed().toLower();
+        QString platformId = parser.value("platform").trimmed().toLower();
+        QString influencerId;
+        QString queryOrUrl = parser.isSet("query") ? parser.value("query").trimmed() : parser.value("url").trimmed();
+        if (parser.isSet("influencer"))
+        {
+            const QString infArg = parser.value("influencer").trimmed();
+            QJsonObject chosenInf = store.influencer(infArg);
+            if (chosenInf.isEmpty())
+            {
+                const QString normH = ResearchStore::normalizeInfluencerHandle(infArg, platformId);
+                for (const auto &v : store.influencers(accountId, platformId))
+                {
+                    if (v.toObject().value("handle").toString().compare(normH, Qt::CaseInsensitive) == 0)
+                    {
+                        chosenInf = v.toObject();
+                        break;
+                    }
+                }
+            }
+            if (chosenInf.isEmpty() || chosenInf.value("accountId").toString() != accountId)
+            {
+                return error("Influencer not found for this account: " + infArg);
+            }
+            influencerId = chosenInf.value("id").toString();
+            platformId = chosenInf.value("platform").toString().trimmed().toLower();
+            queryOrUrl = chosenInf.value("url").toString();
+        }
         const auto *platform = AbstractSocialAccount::ALL_SOCIAL_ACCOUNTS().value(platformId);
         if (!platform || !platform->supportsSpyScrollAndSave())
             return error("Unsupported platform for scroll-and-save.");
-        const QString queryOrUrl = parser.isSet("query") ? parser.value("query").trimmed() : parser.value("url").trimmed();
-        if (queryOrUrl.isEmpty())
-            return error("--query (or --url) is required for scroll-and-save.");
+        const auto spyMode = AbstractSocialAccount::spyModeFromKey(parser.value("mode"));
+        const bool isHumanPick = (spyMode == AbstractSocialAccount::SpyMode::HumanPick);
+        if (queryOrUrl.isEmpty() && !isHumanPick)
+            return error("--query, --url, or --influencer is required for scroll-and-save.");
         const int maxPosts = qMax(1, parser.value("max-posts").toInt());
         const int minEngagement = qMax(0, parser.value("min-engagement").toInt());
         const int maxDaysOld = qMax(0, parser.value("max-days-old").toInt());
-        const bool autoScroll = parser.value("mode").trimmed().toLower() != QLatin1String("manual");
         const QString downloadDir = store.directory().filePath(QStringLiteral("spy_downloads"));
         QDir().mkpath(downloadDir);
-        const QStringList excludeUrls = store.excludedSpyUrls(accountId);
+        const QJsonObject spyContext = store.spyContextPayload(accountId, platformId);
         QEventLoop loop;
         AbstractSocialAccount::SpyResult spyRes;
         QCoro::connect(
-            platform->spyScrollAndSave(queryOrUrl, downloadDir, maxPosts, autoScroll, minEngagement, excludeUrls, maxDaysOld),
+            platform->spyScrollAndSaveMode(queryOrUrl, downloadDir, maxPosts, spyMode, minEngagement, spyContext, maxDaysOld),
             &loop,
             [&spyRes, &loop](AbstractSocialAccount::SpyResult r) {
                 spyRes = std::move(r);
@@ -160,20 +204,30 @@ int ResearchCommand::run(const QStringList &arguments)
         loop.exec();
         if (!spyRes.errorMessage.isEmpty() && spyRes.posts.isEmpty())
             return error(spyRes.errorMessage);
+        for (const QString &starred : spyRes.starredInfluencers)
+        {
+            store.addInfluencer(accountId, platformId, starred);
+        }
         const QString productId = parser.value("product").trimmed();
         QJsonArray referenceIds;
+        int matchedTargetInfPicks = 0;
         for (const auto &post : spyRes.posts)
         {
-            if (!post.postUrl.isEmpty() && store.isRejectedUrl(accountId, post.postUrl))
+            if (!isHumanPick && !post.postUrl.isEmpty() && store.isRejectedUrl(accountId, post.postUrl))
             {
                 continue;
             }
             const QString id = store.addReference(accountId, post.postUrl, post.title.isEmpty() ? post.postUrl : post.title, post.localMediaPath);
             if (id.isEmpty()) continue;
             const QString existingStatus = store.reference(id).value("status").toString();
-            if (existingStatus == QLatin1String("rejected") || existingStatus == QLatin1String("approved"))
+            if (!isHumanPick && (existingStatus == QLatin1String("rejected") || existingStatus == QLatin1String("approved")))
             {
                 continue;
+            }
+            if (!post.localMediaPath.isEmpty() && QFileInfo::exists(post.localMediaPath)
+                && store.mediaPath(store.reference(id)).isEmpty())
+            {
+                store.attachMedia(id, post.localMediaPath, !isHumanPick);
             }
             QJsonObject patch;
             if (!productId.isEmpty() && !store.product(productId).isEmpty())
@@ -192,7 +246,17 @@ int ResearchCommand::run(const QStringList &arguments)
             if (post.isAd) stats.insert("isAd", true);
             if (!stats.isEmpty()) patch.insert("stats", stats);
             if (!patch.isEmpty()) store.updateReference(id, patch);
+            if (isHumanPick && store.reference(id).value("status").toString() != QLatin1String("approved"))
+            {
+                store.review({id}, QStringLiteral("approved"), QStringLiteral("Picked in browser"));
+            }
+            matchedTargetInfPicks += store.recordInfluencerPickByAuthorOrUrl(accountId, platformId, post.author, post.postUrl);
             referenceIds.append(id);
+        }
+        if (!influencerId.isEmpty())
+        {
+            const int extraCount = (matchedTargetInfPicks > 0) ? 0 : int(referenceIds.size());
+            store.recordInfluencerActivity(influencerId, true, !referenceIds.isEmpty(), extraCount);
         }
         if (spyRes.browsedCount > 0)
         {
@@ -200,6 +264,7 @@ int ResearchCommand::run(const QStringList &arguments)
                 {"platform", platform->getName()},
                 {"platformId", platformId},
                 {"query", queryOrUrl},
+                {"mode", AbstractSocialAccount::spyModeKey(spyMode)},
                 {"browsedCount", spyRes.browsedCount},
                 {"savedCount", int(referenceIds.size())},
                 {"rejectedCount", spyRes.rejectedCount},

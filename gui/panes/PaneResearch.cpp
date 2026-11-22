@@ -42,6 +42,7 @@
 #include <QPointer>
 #include <QProcess>
 #include <QPushButton>
+#include <QRadioButton>
 #include <QRegularExpression>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -759,6 +760,9 @@ QWidget *PaneResearch::buildReferences()
         report(ok, tr("Media replaced. The reference is pending review."));
         if (ok) selectReference(refId);
     });
+    m_starAuthorBtn = button(media, tr("☆ Star @author"), "researchStarAuthor");
+    m_starAuthorBtn->setVisible(false);
+    connect(m_starAuthorBtn, &QPushButton::clicked, this, &PaneResearch::starCurrentReferenceAuthor);
     media->addStretch();
 
     m_title = new QLineEdit;
@@ -1637,6 +1641,78 @@ void PaneResearch::showReference()
     }
     if (r.isEmpty()) m_evidence->clear();
     updateCreateProjectButton();
+    updateStarAuthorButton();
+}
+
+void PaneResearch::updateStarAuthorButton()
+{
+    if (!m_starAuthorBtn)
+    {
+        return;
+    }
+    const auto r = m_store->reference(effectiveReferenceId());
+    if (r.isEmpty())
+    {
+        m_starAuthorBtn->setVisible(false);
+        return;
+    }
+    const QString plat = text(r, "platform").trimmed().toLower();
+    if (!QStringList{"pinterest", "tiktok", "instagram", "youtube"}.contains(plat))
+    {
+        m_starAuthorBtn->setVisible(false);
+        return;
+    }
+    QString handle = ResearchStore::normalizeInfluencerHandle(
+        r.value(QStringLiteral("stats")).toObject().value(QStringLiteral("author")).toString(),
+        plat);
+    if (handle.isEmpty())
+    {
+        handle = ResearchStore::normalizeInfluencerHandle(text(r, "url"), plat);
+    }
+    if (handle.isEmpty())
+    {
+        m_starAuthorBtn->setVisible(false);
+        return;
+    }
+
+    bool alreadySaved = false;
+    for (const auto &v : m_store->influencers(accountId(), plat))
+    {
+        if (text(v.toObject(), "handle").compare(handle, Qt::CaseInsensitive) == 0)
+        {
+            alreadySaved = true;
+            break;
+        }
+    }
+    m_starAuthorBtn->setVisible(true);
+    m_starAuthorBtn->setText(alreadySaved ? tr("★ %1").arg(handle) : tr("☆ Star %1").arg(handle));
+    m_starAuthorBtn->setToolTip(alreadySaved
+        ? tr("%1 is in your Favorite influencers for %2.").arg(handle, plat)
+        : tr("Save %1 as a Favorite influencer for %2.").arg(handle, plat));
+}
+
+void PaneResearch::starCurrentReferenceAuthor()
+{
+    const auto r = m_store->reference(effectiveReferenceId());
+    if (r.isEmpty())
+    {
+        return;
+    }
+    const QString plat = text(r, "platform").trimmed().toLower();
+    QString handle = ResearchStore::normalizeInfluencerHandle(
+        r.value(QStringLiteral("stats")).toObject().value(QStringLiteral("author")).toString(),
+        plat);
+    if (handle.isEmpty())
+    {
+        handle = ResearchStore::normalizeInfluencerHandle(text(r, "url"), plat);
+    }
+    if (handle.isEmpty())
+    {
+        return;
+    }
+    const QString id = m_store->addInfluencer(accountId(), plat, handle);
+    updateStarAuthorButton();
+    report(!id.isEmpty(), tr("Saved %1 to Favorite influencers (%2).").arg(handle, plat));
 }
 
 void PaneResearch::editProfile()
@@ -1928,6 +2004,70 @@ QString PaneResearch::defaultSpyQueryForProduct(const QJsonObject &product)
     return combined.join(QLatin1Char(' ')).simplified();
 }
 
+QString PaneResearch::formatInfluencerOptionLabel(const QJsonObject &influencer)
+{
+    const QString handle = text(influencer, "handle");
+    const QString notes = text(influencer, "notes").trimmed();
+    const QString checkedIso = text(influencer, "lastCheckedAt").trimmed();
+    const QString pickedIso = text(influencer, "lastPickedAt").trimmed();
+    const int pickedCount = influencer.value(QStringLiteral("pickedCount")).toInt(0);
+
+    const auto formatRelativeDate = [](const QString &iso) -> QString {
+        if (iso.size() < 10)
+        {
+            return {};
+        }
+        const QDate d = QDate::fromString(iso.left(10), Qt::ISODate);
+        if (!d.isValid())
+        {
+            return iso.left(10);
+        }
+        const qint64 days = qMax<qint64>(0, d.daysTo(QDate::currentDate()));
+        if (days == 0)
+        {
+            return QObject::tr("today (%1)").arg(iso.left(10));
+        }
+        if (days == 1)
+        {
+            return QObject::tr("1d ago (%1)").arg(iso.left(10));
+        }
+        return QObject::tr("%1d ago (%2)").arg(days).arg(iso.left(10));
+    };
+
+    QStringList metaParts;
+    if (checkedIso.isEmpty() && pickedIso.isEmpty())
+    {
+        metaParts << QObject::tr("Never checked");
+    }
+    else
+    {
+        if (!checkedIso.isEmpty())
+        {
+            metaParts << QObject::tr("Checked %1").arg(formatRelativeDate(checkedIso));
+        }
+        if (!pickedIso.isEmpty())
+        {
+            metaParts << QObject::tr("Last pick %1").arg(formatRelativeDate(pickedIso));
+        }
+        else
+        {
+            metaParts << QObject::tr("No picks yet");
+        }
+    }
+    if (pickedCount > 0)
+    {
+        metaParts << QObject::tr("%1 saved").arg(pickedCount);
+    }
+
+    QString label = handle;
+    if (!notes.isEmpty())
+    {
+        label += QStringLiteral(" (%1)").arg(notes.left(32));
+    }
+    label += QStringLiteral(" — ") + metaParts.join(QStringLiteral(" · "));
+    return label;
+}
+
 void PaneResearch::scrollAndSave()
 {
     if (accountId().isEmpty())
@@ -1944,15 +2084,13 @@ void PaneResearch::scrollAndSave()
     QSettings settings(m_store->directory().filePath("ui.ini"), QSettings::IniFormat);
 
     QDialog dialog(this);
+    dialog.setObjectName("dialogScrollAndSave");
     dialog.setWindowTitle(tr("Scroll & save references from browser"));
-    dialog.resize(620, 340);
+    dialog.resize(680, 420);
     auto *layout = new QVBoxLayout(&dialog);
 
-    auto *help = new QLabel(tr(
-        "Opens a visible Chrome window on the selected social platform, scrolls to discover "
-        "posts, downloads their media into your reference library, and queues them for review.\n"
-        "If a login screen or CAPTCHA appears, scrolling pauses automatically until you solve it.\n"
-        "You can close the Chrome window at any time to finish and save what was collected so far."));
+    auto *help = new QLabel;
+    help->setObjectName("spyDialogHelp");
     help->setWordWrap(true);
     layout->addWidget(help);
 
@@ -1988,6 +2126,19 @@ void PaneResearch::scrollAndSave()
     }
     form->addRow(tr("Social platform:"), platformCombo);
 
+    auto *targetToggleRow = new QHBoxLayout;
+    auto *keywordRadio = new QRadioButton(tr("Keyword or URL"));
+    keywordRadio->setObjectName("spyTargetKeywordRadio");
+    auto *influencerRadio = new QRadioButton(tr("Favorite influencer"));
+    influencerRadio->setObjectName("spyTargetInfluencerRadio");
+    const bool startWithInfluencer = (settings.value("spyTargetKind", "keyword").toString() == QLatin1String("influencer"));
+    keywordRadio->setChecked(!startWithInfluencer);
+    influencerRadio->setChecked(startWithInfluencer);
+    targetToggleRow->addWidget(keywordRadio);
+    targetToggleRow->addWidget(influencerRadio);
+    targetToggleRow->addStretch();
+    form->addRow(tr("Target:"), targetToggleRow);
+
     const auto selectedProduct = m_store->product(m_productId);
     QString initialQuery = defaultSpyQueryForProduct(selectedProduct);
     if (initialQuery.isEmpty())
@@ -1995,43 +2146,40 @@ void PaneResearch::scrollAndSave()
         initialQuery = settings.value("spyLastQuery").toString();
     }
 
+    auto *queryLabel = new QLabel(tr("Search query or URL:"));
     auto *queryEdit = new QLineEdit(initialQuery);
     queryEdit->setObjectName("spyQueryEdit");
-    queryEdit->setPlaceholderText(tr("Search keywords (e.g. burgundy stiletto heels outfit) or full URL…"));
-    form->addRow(tr("Search query or URL:"), queryEdit);
+    form->addRow(queryLabel, queryEdit);
+
+    auto *influencerLabel = new QLabel(tr("Influencer:"));
+    auto *influencerRowWidget = new QWidget;
+    influencerRowWidget->setObjectName("spyInfluencerRowWidget");
+    auto *influencerRow = new QHBoxLayout(influencerRowWidget);
+    influencerRow->setContentsMargins(0, 0, 0, 0);
+    influencerRow->setSpacing(6);
+    auto *influencerCombo = new QComboBox;
+    influencerCombo->setObjectName("spyInfluencerCombo");
+    influencerCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    auto *addInfluencerBtn = new QPushButton(tr("+ Add…"));
+    addInfluencerBtn->setObjectName("spyAddInfluencerBtn");
+    auto *removeInfluencerBtn = new QPushButton(tr("Remove"));
+    removeInfluencerBtn->setObjectName("spyRemoveInfluencerBtn");
+    influencerRow->addWidget(influencerCombo, 1);
+    influencerRow->addWidget(addInfluencerBtn);
+    influencerRow->addWidget(removeInfluencerBtn);
+    form->addRow(influencerLabel, influencerRowWidget);
 
     auto *urlPreview = new QLabel;
+    urlPreview->setObjectName("spyTargetUrlPreview");
     urlPreview->setTextFormat(Qt::PlainText);
     urlPreview->setWordWrap(true);
     form->addRow(tr("Target page:"), urlPreview);
-
-    const auto updateUrlPreview = [platformCombo, queryEdit, urlPreview, &allPlatforms]() {
-        const QString q = queryEdit->text().trimmed();
-        const auto *platform = allPlatforms.value(platformCombo->currentData().toString());
-        if (q.isEmpty() || !platform)
-        {
-            urlPreview->setText(QObject::tr("Enter search keywords or paste a page URL."));
-            return;
-        }
-        if (q.startsWith(QLatin1String("http://"))
-            || q.startsWith(QLatin1String("https://"))
-            || q.startsWith(QLatin1String("file://")))
-        {
-            urlPreview->setText(q);
-        }
-        else
-        {
-            urlPreview->setText(platform->defaultSpySearchUrl(q));
-        }
-    };
-    connect(platformCombo, &QComboBox::currentIndexChanged, &dialog, updateUrlPreview);
-    connect(queryEdit, &QLineEdit::textChanged, &dialog, updateUrlPreview);
-    updateUrlPreview();
 
     auto *modeCombo = new QComboBox;
     modeCombo->setObjectName("spyModeCombo");
     modeCombo->addItem(tr("Auto-scroll in Chrome & save"), "auto");
     modeCombo->addItem(tr("Manual scroll in Chrome (save when window closes)"), "manual");
+    modeCombo->addItem(tr("Human pick in Chrome (click posts → Approved)"), "pick");
     const QString savedMode = settings.value("spyMode", "auto").toString();
     const int savedModeIdx = modeCombo->findData(savedMode);
     if (savedModeIdx >= 0)
@@ -2040,20 +2188,139 @@ void PaneResearch::scrollAndSave()
     }
     form->addRow(tr("Scroll mode:"), modeCombo);
 
+    auto *filtersBox = new QWidget;
+    filtersBox->setObjectName("spyAutoFiltersBox");
+    auto *filtersForm = new QFormLayout(filtersBox);
+    filtersForm->setContentsMargins(0, 0, 0, 0);
+
     auto *maxPostsSpin = new QSpinBox;
     maxPostsSpin->setObjectName("spyMaxPostsSpin");
     maxPostsSpin->setRange(1, 200);
     maxPostsSpin->setValue(settings.value("spyMaxPosts", 24).toInt());
-    form->addRow(tr("Max posts to save:"), maxPostsSpin);
+    filtersForm->addRow(tr("Max posts to save:"), maxPostsSpin);
 
     auto *minEngagementLabel = new QLabel;
     auto *minEngagementSpin = new QSpinBox;
     minEngagementSpin->setObjectName("spyMinEngagementSpin");
     minEngagementSpin->setRange(0, 1'000'000);
     minEngagementSpin->setSpecialValueText(tr("0 (save all — no stats filter)"));
-    form->addRow(minEngagementLabel, minEngagementSpin);
+    filtersForm->addRow(minEngagementLabel, minEngagementSpin);
 
-    const auto syncPlatformThreshold = [platformCombo, minEngagementLabel, minEngagementSpin, &settings]() {
+    auto *maxDaysOldSpin = new QSpinBox;
+    maxDaysOldSpin->setObjectName("spyMaxDaysOldSpin");
+    maxDaysOldSpin->setRange(0, 3650);
+    maxDaysOldSpin->setSingleStep(30);
+    maxDaysOldSpin->setSuffix(tr(" days"));
+    maxDaysOldSpin->setSpecialValueText(tr("0 (any age — no date limit)"));
+    maxDaysOldSpin->setValue(settings.value("spyMaxDaysOld", 365).toInt());
+    filtersForm->addRow(tr("Max post age (days):"), maxDaysOldSpin);
+
+    layout->addWidget(filtersBox);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    const auto reloadInfluencers = [this, platformCombo, influencerCombo, removeInfluencerBtn](const QString &preferId = {}) {
+        const QString pid = platformCombo->currentData().toString();
+        const QString prevId = preferId.isEmpty() ? influencerCombo->currentData().toString() : preferId;
+        const QSignalBlocker block(influencerCombo);
+        influencerCombo->clear();
+        const QJsonArray list = m_store->influencers(accountId(), pid);
+        for (const auto &v : list)
+        {
+            const auto inf = v.toObject();
+            influencerCombo->addItem(formatInfluencerOptionLabel(inf), text(inf, "id"));
+            influencerCombo->setItemData(influencerCombo->count() - 1, text(inf, "url"), Qt::UserRole + 1);
+        }
+        if (influencerCombo->count() == 0)
+        {
+            influencerCombo->addItem(tr("No favorite influencers saved for this platform — click \"+ Add…\""), QString{});
+            influencerCombo->setEnabled(false);
+            removeInfluencerBtn->setEnabled(false);
+        }
+        else
+        {
+            influencerCombo->setEnabled(true);
+            removeInfluencerBtn->setEnabled(true);
+            const int idx = prevId.isEmpty() ? 0 : influencerCombo->findData(prevId);
+            influencerCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+        }
+    };
+
+    const auto updateDialogUi = [&]() {
+        const bool useInfluencer = influencerRadio->isChecked();
+        const bool isPickMode = (modeCombo->currentData().toString() == QLatin1String("pick"));
+        const QString pid = platformCombo->currentData().toString();
+        const auto *platform = allPlatforms.value(pid);
+
+        queryLabel->setVisible(!useInfluencer);
+        queryEdit->setVisible(!useInfluencer);
+        influencerLabel->setVisible(useInfluencer);
+        influencerRowWidget->setVisible(useInfluencer);
+        filtersBox->setVisible(!isPickMode);
+
+        queryEdit->setPlaceholderText(isPickMode
+            ? tr("Optional search keywords or URL (leave empty to browse platform feed)…")
+            : tr("Search keywords (e.g. burgundy stiletto heels outfit) or full URL…"));
+
+        help->setText(isPickMode
+            ? tr("Opens Chrome with an interactive QuantumSocial overlay: hover any post to see its live stats "
+                 "and click \"+ Pick\" (or Alt+Click a card / \"+ Pick open post\" while watching a video). "
+                 "Click \"✓ Save & Finish\" (or close Chrome) — picked posts land directly in Approved!")
+            : tr("Opens a visible Chrome window on the selected social platform, scrolls to discover "
+                 "posts, downloads their media into your reference library, and queues them for review.\n"
+                 "If a login screen or CAPTCHA appears, scrolling pauses automatically until you solve it."));
+
+        if (auto *okBtn = buttons->button(QDialogButtonBox::Ok))
+        {
+            okBtn->setText(isPickMode ? tr("Open Chrome & pick") : tr("Open Chrome & scroll"));
+            if (useInfluencer)
+            {
+                okBtn->setEnabled(!influencerCombo->currentData().toString().isEmpty());
+            }
+            else
+            {
+                okBtn->setEnabled(isPickMode || !queryEdit->text().trimmed().isEmpty());
+            }
+        }
+
+        if (!platform)
+        {
+            urlPreview->setText(tr("Choose a social platform."));
+            return;
+        }
+        if (useInfluencer)
+        {
+            const QString infUrl = influencerCombo->currentData(Qt::UserRole + 1).toString();
+            urlPreview->setText(infUrl.isEmpty()
+                ? tr("Add or select a favorite influencer above.")
+                : infUrl);
+        }
+        else
+        {
+            const QString q = queryEdit->text().trimmed();
+            if (q.isEmpty())
+            {
+                urlPreview->setText(isPickMode
+                    ? platform->defaultSpyHomeUrl()
+                    : tr("Enter search keywords or paste a page URL."));
+            }
+            else if (q.startsWith(QLatin1String("http://"))
+                     || q.startsWith(QLatin1String("https://"))
+                     || q.startsWith(QLatin1String("file://")))
+            {
+                urlPreview->setText(q);
+            }
+            else
+            {
+                urlPreview->setText(platform->defaultSpySearchUrl(q));
+            }
+        }
+    };
+
+    const auto syncPlatformThreshold = [&]() {
         const QString pid = platformCombo->currentData().toString();
         if (pid == QLatin1String("pinterest"))
         {
@@ -2072,27 +2339,63 @@ void PaneResearch::scrollAndSave()
         }
         const QString key = QStringLiteral("spyMinEngagement_%1").arg(pid);
         minEngagementSpin->setValue(settings.value(key, defaultMinEngagementForPlatform(pid)).toInt());
+        reloadInfluencers();
+        updateDialogUi();
     };
+
+    connect(addInfluencerBtn, &QPushButton::clicked, &dialog, [&]() {
+        QDialog addDlg(&dialog);
+        addDlg.setObjectName("dialogAddInfluencer");
+        addDlg.setWindowTitle(tr("Add favorite influencer (%1)").arg(platformCombo->currentText()));
+        addDlg.resize(460, 160);
+        auto *addLayout = new QVBoxLayout(&addDlg);
+        auto *addForm = new QFormLayout;
+        auto *handleEdit = new QLineEdit;
+        handleEdit->setObjectName("addInfluencerInput");
+        handleEdit->setPlaceholderText(tr("@handle or https://… profile / board URL"));
+        auto *notesEdit = new QLineEdit;
+        notesEdit->setObjectName("addInfluencerNotes");
+        notesEdit->setPlaceholderText(tr("Optional note (e.g. Luxury heels runway)"));
+        addForm->addRow(tr("Handle or URL:"), handleEdit);
+        addForm->addRow(tr("Note:"), notesEdit);
+        addLayout->addLayout(addForm);
+        auto *addBtns = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
+        addLayout->addWidget(addBtns);
+        connect(addBtns, &QDialogButtonBox::accepted, &addDlg, &QDialog::accept);
+        connect(addBtns, &QDialogButtonBox::rejected, &addDlg, &QDialog::reject);
+        if (addDlg.exec() != QDialog::Accepted)
+        {
+            return;
+        }
+        const QString pid = platformCombo->currentData().toString();
+        const QString addedId = m_store->addInfluencer(accountId(), pid, handleEdit->text(), notesEdit->text());
+        if (addedId.isEmpty())
+        {
+            QMessageBox::warning(&dialog, tr("Invalid influencer"), m_store->lastError());
+            return;
+        }
+        reloadInfluencers(addedId);
+        updateDialogUi();
+    });
+
+    connect(removeInfluencerBtn, &QPushButton::clicked, &dialog, [&]() {
+        const QString infId = influencerCombo->currentData().toString();
+        if (infId.isEmpty())
+        {
+            return;
+        }
+        m_store->removeInfluencer(infId);
+        reloadInfluencers();
+        updateDialogUi();
+    });
+
     connect(platformCombo, &QComboBox::currentIndexChanged, &dialog, syncPlatformThreshold);
+    connect(keywordRadio, &QRadioButton::toggled, &dialog, updateDialogUi);
+    connect(influencerRadio, &QRadioButton::toggled, &dialog, updateDialogUi);
+    connect(influencerCombo, &QComboBox::currentIndexChanged, &dialog, updateDialogUi);
+    connect(queryEdit, &QLineEdit::textChanged, &dialog, updateDialogUi);
+    connect(modeCombo, &QComboBox::currentIndexChanged, &dialog, updateDialogUi);
     syncPlatformThreshold();
-
-    auto *maxDaysOldSpin = new QSpinBox;
-    maxDaysOldSpin->setObjectName("spyMaxDaysOldSpin");
-    maxDaysOldSpin->setRange(0, 3650);
-    maxDaysOldSpin->setSingleStep(30);
-    maxDaysOldSpin->setSuffix(tr(" days"));
-    maxDaysOldSpin->setSpecialValueText(tr("0 (any age — no date limit)"));
-    maxDaysOldSpin->setValue(settings.value("spyMaxDaysOld", 365).toInt());
-    form->addRow(tr("Max post age (days):"), maxDaysOldSpin);
-
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-    if (auto *okBtn = buttons->button(QDialogButtonBox::Ok))
-    {
-        okBtn->setText(tr("Open Chrome & scroll"));
-    }
-    layout->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 
     if (dialog.exec() != QDialog::Accepted)
     {
@@ -2100,25 +2403,49 @@ void PaneResearch::scrollAndSave()
     }
 
     const QString platformId = platformCombo->currentData().toString();
-    const QString queryOrUrl = queryEdit->text().trimmed();
-    if (queryOrUrl.isEmpty())
+    const QString modeKey = modeCombo->currentData().toString();
+    const auto spyMode = AbstractSocialAccount::spyModeFromKey(modeKey);
+    const bool useInfluencer = influencerRadio->isChecked();
+
+    QString influencerId;
+    QString queryOrUrl;
+    if (useInfluencer)
     {
-        report(false, tr("Enter a search query or URL to scroll."));
-        return;
+        influencerId = influencerCombo->currentData().toString();
+        queryOrUrl = influencerCombo->currentData(Qt::UserRole + 1).toString().trimmed();
+        if (influencerId.isEmpty() || queryOrUrl.isEmpty())
+        {
+            report(false, tr("Select or add a favorite influencer first."));
+            return;
+        }
     }
-    const bool autoScroll = modeCombo->currentData().toString() != QLatin1String("manual");
+    else
+    {
+        queryOrUrl = queryEdit->text().trimmed();
+        if (queryOrUrl.isEmpty() && spyMode != AbstractSocialAccount::SpyMode::HumanPick)
+        {
+            report(false, tr("Enter a search query or URL to scroll."));
+            return;
+        }
+    }
+
     const int maxPosts = maxPostsSpin->value();
     const int minEngagement = minEngagementSpin->value();
     const int maxDaysOld = maxDaysOldSpin->value();
 
     settings.setValue("spyPlatform", platformId);
-    settings.setValue("spyLastQuery", queryOrUrl);
-    settings.setValue("spyMode", modeCombo->currentData().toString());
+    settings.setValue("spyTargetKind", useInfluencer ? QStringLiteral("influencer") : QStringLiteral("keyword"));
+    if (!useInfluencer)
+    {
+        settings.setValue("spyLastQuery", queryOrUrl);
+    }
+    settings.setValue("spyMode", modeKey);
     settings.setValue("spyMaxPosts", maxPosts);
     settings.setValue(QStringLiteral("spyMinEngagement_%1").arg(platformId), minEngagement);
     settings.setValue("spyMaxDaysOld", maxDaysOld);
 
-    m_spyTask = runScrollAndSave(platformId, queryOrUrl, maxPosts, autoScroll, QString{}, minEngagement, maxDaysOld);
+    m_spyTask = runScrollAndSaveMode(
+        platformId, queryOrUrl, maxPosts, spyMode, QString{}, minEngagement, maxDaysOld, influencerId);
 }
 
 QCoro::Task<void> PaneResearch::runScrollAndSave(
@@ -2129,6 +2456,27 @@ QCoro::Task<void> PaneResearch::runScrollAndSave(
     QString linkProductId,
     int minEngagement,
     int maxDaysOld)
+{
+    return runScrollAndSaveMode(
+        std::move(platformId),
+        std::move(queryOrUrl),
+        maxPosts,
+        autoScroll ? AbstractSocialAccount::SpyMode::AutoScroll : AbstractSocialAccount::SpyMode::ManualScroll,
+        std::move(linkProductId),
+        minEngagement,
+        maxDaysOld,
+        QString{});
+}
+
+QCoro::Task<void> PaneResearch::runScrollAndSaveMode(
+    QString platformId,
+    QString queryOrUrl,
+    int maxPosts,
+    AbstractSocialAccount::SpyMode mode,
+    QString linkProductId,
+    int minEngagement,
+    int maxDaysOld,
+    QString influencerId)
 {
     const auto *platform = AbstractSocialAccount::ALL_SOCIAL_ACCOUNTS().value(platformId);
     if (!platform || !platform->supportsSpyScrollAndSave())
@@ -2141,32 +2489,43 @@ QCoro::Task<void> PaneResearch::runScrollAndSave(
         co_return;
     }
 
+    const bool isHumanPick = (mode == AbstractSocialAccount::SpyMode::HumanPick);
     m_spying = true;
     if (m_scrollAndSave)
     {
         m_scrollAndSave->setEnabled(false);
-        m_scrollAndSave->setText(tr("Scrolling in Chrome…"));
+        m_scrollAndSave->setText(isHumanPick ? tr("Picking in Chrome…") : tr("Scrolling in Chrome…"));
     }
-    QStringList filterHints;
-    if (minEngagement > 0) filterHints << tr("min stats ≥ %1").arg(minEngagement);
-    if (maxDaysOld > 0) filterHints << tr("≤ %1d old").arg(maxDaysOld);
-    const QString filterHint = filterHints.isEmpty()
-        ? QString{}
-        : QStringLiteral(" (%1)").arg(filterHints.join(QStringLiteral(", ")));
-    report(true, tr("Opening %1 in Chrome to scroll & save up to %2 posts%3… "
-                    "(pauses automatically for login or CAPTCHA; close Chrome anytime to finish and save)")
-        .arg(platform->getName())
-        .arg(maxPosts)
-        .arg(filterHint));
+
+    if (isHumanPick)
+    {
+        report(true, tr("Opening %1 in Chrome for human picking… "
+                        "Click \"+ Pick\" on any inspiring post, then click \"✓ Save & Finish\" (lands directly in Approved).")
+            .arg(platform->getName()));
+    }
+    else
+    {
+        QStringList filterHints;
+        if (minEngagement > 0) filterHints << tr("min stats ≥ %1").arg(minEngagement);
+        if (maxDaysOld > 0) filterHints << tr("≤ %1d old").arg(maxDaysOld);
+        const QString filterHint = filterHints.isEmpty()
+            ? QString{}
+            : QStringLiteral(" (%1)").arg(filterHints.join(QStringLiteral(", ")));
+        report(true, tr("Opening %1 in Chrome to scroll & save up to %2 posts%3… "
+                        "(pauses automatically for login or CAPTCHA; close Chrome anytime to finish and save)")
+            .arg(platform->getName())
+            .arg(maxPosts)
+            .arg(filterHint));
+    }
 
     const QString downloadDir = m_store->directory().filePath(QStringLiteral("spy_downloads"));
     QDir().mkpath(downloadDir);
-    const QStringList excludeUrls = m_store->excludedSpyUrls(accountId());
+    const QJsonObject spyContext = m_store->spyContextPayload(accountId(), platformId);
 
     QPointer<PaneResearch> self(this);
     AbstractSocialAccount::SpyResult result;
-    result = co_await platform->spyScrollAndSave(
-        queryOrUrl, downloadDir, maxPosts, autoScroll, minEngagement, excludeUrls, maxDaysOld);
+    result = co_await platform->spyScrollAndSaveMode(
+        queryOrUrl, downloadDir, maxPosts, mode, minEngagement, spyContext, maxDaysOld);
     if (!self)
     {
         co_return;
@@ -2185,14 +2544,59 @@ QCoro::Task<void> PaneResearch::runScrollAndSave(
         co_return;
     }
 
-    const int savedCount = importSpyResult(result, linkProductId);
+    if (!accountId().isEmpty())
+    {
+        for (const QString &starred : result.starredInfluencers)
+        {
+            const QString starredId = m_store->addInfluencer(accountId(), platformId, starred);
+            if (!starredId.isEmpty())
+            {
+                m_store->recordInfluencerActivity(starredId, true, false, 0);
+            }
+        }
+    }
+
+    int matchedInfluencerPicks = 0;
+    const int savedCount = importSpyResult(result, linkProductId, isHumanPick, platformId, &matchedInfluencerPicks);
+
+    if (!accountId().isEmpty())
+    {
+        if (!influencerId.isEmpty())
+        {
+            const int extraCount = (matchedInfluencerPicks > 0) ? 0 : savedCount;
+            m_store->recordInfluencerActivity(influencerId, true, savedCount > 0, extraCount);
+        }
+        for (const QString &vis : result.visitedProfiles)
+        {
+            const QString visHandle = ResearchStore::normalizeInfluencerHandle(vis, platformId);
+            for (const auto &v : m_store->influencers(accountId(), platformId))
+            {
+                const auto inf = v.toObject();
+                const QString id = text(inf, "id");
+                if (id == influencerId)
+                {
+                    continue;
+                }
+                const bool sameHandle = !visHandle.isEmpty()
+                    && text(inf, "handle").compare(visHandle, Qt::CaseInsensitive) == 0;
+                const bool sameUrl = text(inf, "url").compare(vis, Qt::CaseInsensitive) == 0;
+                if (sameHandle || sameUrl)
+                {
+                    m_store->recordInfluencerActivity(id, true, false, 0);
+                }
+            }
+        }
+        updateStarAuthorButton();
+    }
+
     const int browsedCount = qMax(result.browsedCount, savedCount + result.rejectedCount);
     if (browsedCount > 0 && !accountId().isEmpty())
     {
         m_store->recordSpySession(accountId(), QJsonObject{
             {QStringLiteral("platform"), platform->getName()},
             {QStringLiteral("platformId"), platformId},
-            {QStringLiteral("query"), queryOrUrl},
+            {QStringLiteral("query"), queryOrUrl.isEmpty() ? platform->defaultSpyHomeUrl() : queryOrUrl},
+            {QStringLiteral("mode"), AbstractSocialAccount::spyModeKey(mode)},
             {QStringLiteral("browsedCount"), browsedCount},
             {QStringLiteral("savedCount"), savedCount},
             {QStringLiteral("rejectedCount"), result.rejectedCount},
@@ -2200,6 +2604,24 @@ QCoro::Task<void> PaneResearch::runScrollAndSave(
             {QStringLiteral("maxDaysOld"), result.maxDaysOld}
         });
         refreshReferences();
+    }
+
+    if (isHumanPick)
+    {
+        if (savedCount <= 0)
+        {
+            report(true, result.starredInfluencers.isEmpty()
+                ? tr("Browser picking finished (0 posts picked).")
+                : tr("Browser picking finished — saved %1 favorite influencer(s).")
+                    .arg(result.starredInfluencers.size()));
+        }
+        else
+        {
+            report(true, tr("Picked & approved %1 reference post(s) from %2 — ready to create projects!")
+                .arg(savedCount)
+                .arg(platform->getName()));
+        }
+        co_return;
     }
 
     if (savedCount <= 0)
@@ -2237,8 +2659,15 @@ QCoro::Task<void> PaneResearch::runScrollAndSave(
 
 int PaneResearch::importSpyResult(
     const AbstractSocialAccount::SpyResult &result,
-    const QString &linkProductId)
+    const QString &linkProductId,
+    bool autoApprove,
+    const QString &platformId,
+    int *outMatchedInfluencerPicks)
 {
+    if (outMatchedInfluencerPicks)
+    {
+        *outMatchedInfluencerPicks = 0;
+    }
     if (accountId().isEmpty())
     {
         return 0;
@@ -2249,10 +2678,11 @@ int PaneResearch::importSpyResult(
 
     QString firstId;
     int imported = 0;
+    int matchedInfPicks = 0;
     m_refreshing = true;
     for (const auto &post : result.posts)
     {
-        if (!post.postUrl.isEmpty() && m_store->isRejectedUrl(accountId(), post.postUrl))
+        if (!autoApprove && !post.postUrl.isEmpty() && m_store->isRejectedUrl(accountId(), post.postUrl))
         {
             continue;
         }
@@ -2264,7 +2694,7 @@ int PaneResearch::importSpyResult(
         }
         const auto existing = m_store->reference(id);
         const QString existingStatus = text(existing, "status");
-        if (existingStatus == QLatin1String("rejected") || existingStatus == QLatin1String("approved"))
+        if (!autoApprove && (existingStatus == QLatin1String("rejected") || existingStatus == QLatin1String("approved")))
         {
             continue;
         }
@@ -2272,7 +2702,7 @@ int PaneResearch::importSpyResult(
             && QFileInfo::exists(post.localMediaPath)
             && m_store->mediaPath(existing).isEmpty())
         {
-            m_store->attachMedia(id, post.localMediaPath);
+            m_store->attachMedia(id, post.localMediaPath, !autoApprove);
         }
 
         QJsonObject patch;
@@ -2280,6 +2710,8 @@ int PaneResearch::importSpyResult(
         {
             patch.insert("productId", linkProductId);
         }
+
+        const QString effectivePlat = !platformId.isEmpty() ? platformId : text(existing, "platform");
 
         // Persist structured post statistics on the reference record
         QJsonObject stats = existing.value(QStringLiteral("stats")).toObject();
@@ -2289,7 +2721,7 @@ int PaneResearch::importSpyResult(
         if (post.shares >= 0)
         {
             stats.insert(QStringLiteral("shares"), post.shares);
-            if (text(existing, "platform") == QLatin1String("pinterest"))
+            if (effectivePlat == QLatin1String("pinterest"))
             {
                 stats.insert(QStringLiteral("saves"), post.shares);
             }
@@ -2321,6 +2753,13 @@ int PaneResearch::importSpyResult(
         {
             m_store->updateReference(id, patch);
         }
+        if (autoApprove && text(m_store->reference(id), "status") != QLatin1String("approved"))
+        {
+            m_store->review({id}, QStringLiteral("approved"), tr("Picked in browser"));
+        }
+
+        matchedInfPicks += m_store->recordInfluencerPickByAuthorOrUrl(
+            accountId(), effectivePlat, post.author, post.postUrl);
 
         if (firstId.isEmpty())
         {
@@ -2329,7 +2768,18 @@ int PaneResearch::importSpyResult(
         ++imported;
     }
     m_refreshing = false;
-    refreshReferences();
+    if (outMatchedInfluencerPicks)
+    {
+        *outMatchedInfluencerPicks = matchedInfPicks;
+    }
+    if (autoApprove && imported > 0 && m_activeFilter == QLatin1String("pending"))
+    {
+        setFilter(QStringLiteral("approved"));
+    }
+    else
+    {
+        refreshReferences();
+    }
     if (!firstId.isEmpty())
     {
         selectReference(firstId);

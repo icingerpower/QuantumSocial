@@ -56,23 +56,28 @@ QString SocialAccountTiktok::defaultSpySearchUrl(const QString &query) const
         .arg(QString::fromUtf8(QUrl::toPercentEncoding(query.trimmed())));
 }
 
-QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountTiktok::spyScrollAndSave(
+QString SocialAccountTiktok::defaultSpyHomeUrl() const
+{
+    return QStringLiteral("https://www.tiktok.com/");
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountTiktok::spyScrollAndSaveMode(
     const QString &queryOrUrl,
     const QString &downloadDir,
     int maxPosts,
-    bool autoScroll,
+    SpyMode mode,
     int minEngagement,
-    const QStringList &excludeUrls,
+    const QJsonObject &spyContext,
     int maxDaysOld) const
 {
-    return runSpyScript(
+    return runSpyScriptMode(
         QStringLiteral("spy_scroll_tiktok.py"),
         queryOrUrl,
         downloadDir,
         maxPosts,
-        autoScroll,
+        mode,
         minEngagement,
-        excludeUrls,
+        spyContext,
         maxDaysOld);
 }
 

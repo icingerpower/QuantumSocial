@@ -27,6 +27,17 @@ public:
     bool review(const QStringList &ids, const QString &status, const QString &reason);
     bool isRejectedUrl(const QString &accountId, const QString &url) const;
     QStringList excludedSpyUrls(const QString &accountId) const;
+    QJsonObject spyContextPayload(const QString &accountId, const QString &platformId = {}) const;
+    QJsonArray influencers(const QString &accountId = {}, const QString &platformId = {}) const;
+    QJsonObject influencer(const QString &id) const;
+    QString addInfluencer(const QString &accountId, const QString &platformId,
+                          const QString &handleOrUrl, const QString &notes = {});
+    bool removeInfluencer(const QString &id);
+    bool recordInfluencerActivity(const QString &id, bool checked, bool picked,
+                                  int newlyPickedCount = 0, const QString &timestampOverride = {});
+    int recordInfluencerPickByAuthorOrUrl(const QString &accountId, const QString &platformId,
+                                          const QString &authorHandle, const QString &postOrProfileUrl,
+                                          bool checked = false, const QString &timestampOverride = {});
     bool recordAssessment(const QString &referenceId, const QJsonObject &assessment);
     bool recordSpySession(const QString &accountId, const QJsonObject &session);
     QJsonObject lastSpySession(const QString &accountId) const;
@@ -34,6 +45,8 @@ public:
     QString lastError() const { return m_error; }
     QDir directory() const { return m_dir; }
     static QString canonicalUrl(const QString &url);
+    static QString normalizeInfluencerHandle(const QString &handleOrUrl, const QString &platformId = {});
+    static QString buildInfluencerUrl(const QString &platformId, const QString &handleOrUrl);
     static QString productRestriction(const QJsonObject &product, const QJsonObject &profile);
 
 signals:

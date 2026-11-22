@@ -42,7 +42,13 @@ public:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
     static QString defaultSpyQueryForProduct(const QJsonObject &product);
-    int importSpyResult(const AbstractSocialAccount::SpyResult &result, const QString &linkProductId = {});
+    static QString formatInfluencerOptionLabel(const QJsonObject &influencer);
+    int importSpyResult(
+        const AbstractSocialAccount::SpyResult &result,
+        const QString &linkProductId = {},
+        bool autoApprove = false,
+        const QString &platformId = {},
+        int *outMatchedInfluencerPicks = nullptr);
     QCoro::Task<void> runScrollAndSave(
         QString platformId,
         QString queryOrUrl,
@@ -51,6 +57,15 @@ public:
         QString linkProductId = {},
         int minEngagement = 0,
         int maxDaysOld = 0);
+    QCoro::Task<void> runScrollAndSaveMode(
+        QString platformId,
+        QString queryOrUrl,
+        int maxPosts,
+        AbstractSocialAccount::SpyMode mode,
+        QString linkProductId = {},
+        int minEngagement = 0,
+        int maxDaysOld = 0,
+        QString influencerId = {});
     QJsonObject buildAutoBatchSpec(
         const QStringList &productIds,
         int generationsPerProduct,
@@ -94,6 +109,7 @@ private:
     int m_pendingScrollRestoreY = -1;
     int m_visibleCards = 24;
     QPushButton *m_playPauseBtn = nullptr;
+    QPushButton *m_starAuthorBtn = nullptr;
     QLineEdit *m_title;
     QPlainTextEdit *m_notes;
     QPlainTextEdit *m_evidence;
@@ -132,6 +148,8 @@ private:
     void refreshProjectProducts();
     void refreshReferences();
     void updateCreateProjectButton();
+    void updateStarAuthorButton();
+    void starCurrentReferenceAuthor();
     void backfillMissingPinterestMetadata();
     void showProduct();
     void showReference();

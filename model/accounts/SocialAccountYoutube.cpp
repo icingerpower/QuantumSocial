@@ -43,23 +43,28 @@ QString SocialAccountYoutube::defaultSpySearchUrl(const QString &query) const
         .arg(QString::fromUtf8(QUrl::toPercentEncoding(query.trimmed())));
 }
 
-QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountYoutube::spyScrollAndSave(
+QString SocialAccountYoutube::defaultSpyHomeUrl() const
+{
+    return QStringLiteral("https://www.youtube.com/");
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> SocialAccountYoutube::spyScrollAndSaveMode(
     const QString &queryOrUrl,
     const QString &downloadDir,
     int maxPosts,
-    bool autoScroll,
+    SpyMode mode,
     int minEngagement,
-    const QStringList &excludeUrls,
+    const QJsonObject &spyContext,
     int maxDaysOld) const
 {
-    return runSpyScript(
+    return runSpyScriptMode(
         QStringLiteral("spy_scroll_youtube.py"),
         queryOrUrl,
         downloadDir,
         maxPosts,
-        autoScroll,
+        mode,
         minEngagement,
-        excludeUrls,
+        spyContext,
         maxDaysOld);
 }
 

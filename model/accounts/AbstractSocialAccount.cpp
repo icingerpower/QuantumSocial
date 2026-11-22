@@ -147,6 +147,39 @@ QString AbstractSocialAccount::defaultSpySearchUrl(const QString &query) const
     return QString{};
 }
 
+QString AbstractSocialAccount::defaultSpyHomeUrl() const
+{
+    return QString{};
+}
+
+QString AbstractSocialAccount::spyModeKey(SpyMode mode)
+{
+    switch (mode)
+    {
+    case SpyMode::ManualScroll:
+        return QStringLiteral("manual");
+    case SpyMode::HumanPick:
+        return QStringLiteral("pick");
+    case SpyMode::AutoScroll:
+    default:
+        return QStringLiteral("auto");
+    }
+}
+
+AbstractSocialAccount::SpyMode AbstractSocialAccount::spyModeFromKey(const QString &key)
+{
+    const QString k = key.trimmed().toLower();
+    if (k == QLatin1String("manual"))
+    {
+        return SpyMode::ManualScroll;
+    }
+    if (k == QLatin1String("pick") || k == QLatin1String("human") || k == QLatin1String("human-pick"))
+    {
+        return SpyMode::HumanPick;
+    }
+    return SpyMode::AutoScroll;
+}
+
 QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::spyScrollAndSave(
     const QString &queryOrUrl,
     const QString &downloadDir,
@@ -156,12 +189,36 @@ QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::spyScrollAn
     const QStringList &excludeUrls,
     int maxDaysOld) const
 {
+    QJsonObject ctx;
+    if (!excludeUrls.isEmpty())
+    {
+        ctx.insert(QStringLiteral("excluded"), QJsonArray::fromStringList(excludeUrls));
+    }
+    return spyScrollAndSaveMode(
+        queryOrUrl,
+        downloadDir,
+        maxPosts,
+        autoScroll ? SpyMode::AutoScroll : SpyMode::ManualScroll,
+        minEngagement,
+        ctx,
+        maxDaysOld);
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::spyScrollAndSaveMode(
+    const QString &queryOrUrl,
+    const QString &downloadDir,
+    int maxPosts,
+    SpyMode mode,
+    int minEngagement,
+    const QJsonObject &spyContext,
+    int maxDaysOld) const
+{
     Q_UNUSED(queryOrUrl);
     Q_UNUSED(downloadDir);
     Q_UNUSED(maxPosts);
-    Q_UNUSED(autoScroll);
+    Q_UNUSED(mode);
     Q_UNUSED(minEngagement);
-    Q_UNUSED(excludeUrls);
+    Q_UNUSED(spyContext);
     Q_UNUSED(maxDaysOld);
     SpyResult result;
     result.notSupported = true;
@@ -385,21 +442,50 @@ QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::runSpyScrip
     const QStringList &excludeUrls,
     int maxDaysOld) const
 {
-    const QString mode = autoScroll ? QStringLiteral("auto") : QStringLiteral("manual");
-    const QStringList args{
+    QJsonObject ctx;
+    if (!excludeUrls.isEmpty())
+    {
+        ctx.insert(QStringLiteral("excluded"), QJsonArray::fromStringList(excludeUrls));
+    }
+    return runSpyScriptMode(
+        scriptFileName,
         queryOrUrl,
         downloadDir,
+        maxPosts,
+        autoScroll ? SpyMode::AutoScroll : SpyMode::ManualScroll,
+        minEngagement,
+        ctx,
+        maxDaysOld);
+}
+
+QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::runSpyScriptMode(
+    const QString &scriptFileName,
+    const QString &queryOrUrl,
+    const QString &downloadDir,
+    int maxPosts,
+    SpyMode mode,
+    int minEngagement,
+    const QJsonObject &spyContext,
+    int maxDaysOld) const
+{
+    const QString modeStr = spyModeKey(mode);
+    const QString effectiveQuery = (queryOrUrl.trimmed().isEmpty() && mode == SpyMode::HumanPick)
+        ? defaultSpyHomeUrl()
+        : queryOrUrl;
+    const QStringList args{
+        effectiveQuery,
+        downloadDir,
         QString::number(qMax(1, maxPosts)),
-        mode,
+        modeStr,
         QString::number(qMax(0, minEngagement)),
         QString::number(qMax(0, maxDaysOld))
     };
 
     QTemporaryFile excludeFile;
     QString excludeFilePath;
-    if (!excludeUrls.isEmpty() && excludeFile.open())
+    if (!spyContext.isEmpty() && excludeFile.open())
     {
-        const QByteArray payload = QJsonDocument(QJsonArray::fromStringList(excludeUrls)).toJson(QJsonDocument::Compact);
+        const QByteArray payload = QJsonDocument(spyContext).toJson(QJsonDocument::Compact);
         excludeFile.write(payload);
         excludeFile.flush();
         excludeFilePath = excludeFile.fileName();
@@ -416,6 +502,23 @@ QCoro::Task<AbstractSocialAccount::SpyResult> AbstractSocialAccount::runSpyScrip
     result.browsedCount = object.value(QStringLiteral("browsed_count")).toInt(0);
     result.savedCount = object.value(QStringLiteral("saved_count")).toInt(0);
     result.rejectedCount = object.value(QStringLiteral("rejected_count")).toInt(0);
+
+    for (const QJsonValue &starVal : object.value(QStringLiteral("starred_influencers")).toArray())
+    {
+        const QString s = starVal.toString().trimmed();
+        if (!s.isEmpty() && !result.starredInfluencers.contains(s, Qt::CaseInsensitive))
+        {
+            result.starredInfluencers << s;
+        }
+    }
+    for (const QJsonValue &visVal : object.value(QStringLiteral("visited_profiles")).toArray())
+    {
+        const QString v = visVal.toString().trimmed();
+        if (!v.isEmpty() && !result.visitedProfiles.contains(v, Qt::CaseInsensitive))
+        {
+            result.visitedProfiles << v;
+        }
+    }
 
     for (const QJsonValue &postValue : object.value(QStringLiteral("posts")).toArray())
     {
