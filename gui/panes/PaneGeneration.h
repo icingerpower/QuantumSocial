@@ -91,6 +91,9 @@ public:
     TableProjects *projectsModel() const { return m_projects; }
     bool createResearchProject(const QJsonObject &context, const QString &imagePath);
     bool startAutoBatch(const QJsonObject &batchSpec);
+    bool isAutoBatchRunning() const { return m_autoBatchRunning; }
+    void cancelAutoBatch();
+    bool deleteUnpublishedCreative(const QString &shortCode, QString *outError = nullptr);
 
     struct GenerationPromptEntry
     {
@@ -113,6 +116,9 @@ public:
 
 signals:
     void autoPublishRequested();
+    void autoBatchStarted(int totalCreatives);
+    void autoBatchProgress(int completedCreatives, int totalCreatives, const QString &message);
+    void autoBatchFinished(int completedCreatives, int totalCreatives, bool cancelled, const QString &errorMessage);
 
 private slots:
     void _addProject();
@@ -302,6 +308,10 @@ private:
     QHash<QString, QList<GenerationJob>> m_jobGroups;
     int m_jobCounter = 0;
     bool m_batchCancelled = false;
+    bool m_autoBatchRunning = false;
+    int m_autoBatchCompleted = 0;
+    int m_autoBatchTotal = 0;
+    QList<QMetaObject::Connection> m_autoBatchWorkflowCancelConns;
     void _queueJobs(int row, const QUuid &projectId, const QList<GenerationJob> &jobs);
     // One in-flight coroutine per group currently running an image/slideshow
     // job (kept alive by this map — a QCoro::Task must not be destroyed

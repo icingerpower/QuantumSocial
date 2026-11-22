@@ -5,6 +5,7 @@
 #include "panes/PaneInspiration.h"
 #include "panes/PanePublishing.h"
 #include "panes/PaneResearch.h"
+#include "panes/PaneWorkflow.h"
 #include "model/research/ResearchStore.h"
 #include "panes/PaneProperties.h"
 #include "panes/PaneSettings.h"
@@ -91,7 +92,8 @@ MainWindow::MainWindow(QWidget *parent)
         }
     }
 
-    ui->tabWidget->addTab(new PaneAccounts(m_accounts, this), tr("Accounts"));
+    auto *paneAccounts = new PaneAccounts(m_accounts, this);
+    ui->tabWidget->addTab(paneAccounts, tr("Accounts"));
     auto *researchStore = new ResearchStore(workingDir.absolutePath());
     auto *research = new PaneResearch(m_accounts, researchStore, m_availableClis, this);
     researchStore->setParent(research);
@@ -110,6 +112,17 @@ MainWindow::MainWindow(QWidget *parent)
                                               m_videos, m_availableClis, this,
                                               m_hashtags, m_favoriteHooks);
     ui->tabWidget->addTab(panePublishing, tr("Publishing"));
+
+    auto *paneWorkflow = new PaneWorkflow(m_accounts, researchStore, research,
+                                          paneGeneration, panePublishing, m_videos,
+                                          m_availableClis, m_favoriteHooks, this);
+    ui->tabWidget->insertTab(0, paneWorkflow, tr("Workflow"));
+    ui->tabWidget->setCurrentIndex(0);
+
+    connect(paneWorkflow, &PaneWorkflow::openResearchTabRequested, this,
+            [this, research]() { ui->tabWidget->setCurrentWidget(research); });
+    connect(paneWorkflow, &PaneWorkflow::openAccountsTabRequested, this,
+            [this, paneAccounts]() { ui->tabWidget->setCurrentWidget(paneAccounts); });
     connect(paneGeneration, &PaneGeneration::autoPublishRequested, this,
             [this, panePublishing]() {
         ui->tabWidget->setCurrentWidget(panePublishing);

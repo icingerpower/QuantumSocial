@@ -3,8 +3,12 @@
 
 #include <QCoro/QCoroTask>
 
+#include <QColor>
 #include <QDateTime>
+#include <QDir>
 #include <QList>
+#include <QPixmap>
+#include <QSize>
 #include <QString>
 #include <QStringList>
 #include <QUuid>
@@ -62,26 +66,6 @@ public:
         QString uploadUrlOverride; // Offline HTML fixture override for automated tests
     };
 
-    explicit PanePublishing(TableAccounts *accounts,
-                            TableProjects *projects,
-                            TableVideos *videos,
-                            const QList<AbstractCli *> &availableClis,
-                            QWidget *parent = nullptr,
-                            PreferredHashtags *hashtags = nullptr,
-                            FavoriteHooks *favoriteHooks = nullptr);
-    ~PanePublishing() override;
-
-    bool isJobRunning() const { return m_jobActive; }
-    bool startPublishJob(const PublishJobConfig &config);
-
-public slots:
-    void openAutoPublishDialog();
-    void stopJob();
-    void publishNextNow();
-    void reconnectBrowserSession(const QString &accountUrl = QString{});
-    void openDebugLogsFolder();
-
-private:
     struct EligibleCreative
     {
         QUuid videoId;
@@ -116,6 +100,79 @@ private:
         QString status; // "Queued", "Uploading", "Published", "Dry-run OK", "Failed", "Stopped"
     };
 
+    explicit PanePublishing(TableAccounts *accounts,
+                            TableProjects *projects,
+                            TableVideos *videos,
+                            const QList<AbstractCli *> &availableClis,
+                            QWidget *parent = nullptr,
+                            PreferredHashtags *hashtags = nullptr,
+                            FavoriteHooks *favoriteHooks = nullptr);
+    ~PanePublishing() override;
+
+    bool isJobRunning() const { return m_jobActive; }
+    bool canPublishNextNow() const;
+    const QList<ScheduledItem> &activeQueue() const { return m_queue; }
+    QString statusText() const;
+    QString logText() const;
+    TableProjects *projectsModel() const { return m_projects; }
+
+    bool startPublishJob(const PublishJobConfig &config);
+    bool startPlannedPublishJob(const PublishJobConfig &config,
+                                const QList<ScheduledItem> &confirmedQueue);
+
+    QList<EligibleCreative> collectEligibleCreatives(int maxDaysOld,
+                                                     bool skipSingleImages = true,
+                                                     int *outOlderExcluded = nullptr,
+                                                     int *outSingleImagesExcluded = nullptr) const;
+    QCoro::Task<QList<ScheduledItem>> buildAiPlannedQueue(
+        PublishJobConfig config,
+        QList<EligibleCreative> candidates,
+        QString *outExperimentSummary = nullptr,
+        std::shared_ptr<bool> cancelFlag = nullptr);
+
+    static QList<ScheduledItem> buildDeterministicDefaultQueue(
+        const PublishJobConfig &config,
+        const QList<EligibleCreative> &candidates,
+        TableVideos *videos = nullptr,
+        FavoriteHooks *favoriteHooks = nullptr,
+        QString *outExperimentSummary = nullptr);
+    static int baseIntervalMinutesForConfig(const PublishJobConfig &config);
+    static void applySpacingSchedule(QList<ScheduledItem> &queue, const PublishJobConfig &config);
+
+    static const QStringList &curatedVideoTextStyleIds();
+    static QString normalizeVideoTextStyleId(const QString &raw);
+    static QString videoTextStyleDisplayName(const QString &styleId);
+    static QString videoTextStyleShortTag(const QString &styleId);
+    static QString cleanShortHookForOverlay(const QString &rawHook, const QString &productSummary);
+    static QString codeTagFromShortCode(const QString &shortCode);
+    static QString resolveCreativePreviewImagePath(const QDir &genDir,
+                                                   const QDir &tempDir,
+                                                   const QString &format,
+                                                   const QStringList &mediaPaths,
+                                                   bool allowFfmpegExtract);
+    static QPixmap renderCreativeCardPixmap(const QString &imagePath,
+                                            const QString &shortCode,
+                                            const QString &productSummary,
+                                            const QString &badgeText,
+                                            const QColor &badgeColor,
+                                            const QSize &targetSize,
+                                            const QString &overlayPreviewText = QString{},
+                                            const QString &overlayStyleId = QString{});
+
+signals:
+    void jobStateChanged(bool running);
+    void queueUpdated();
+    void statusTextChanged(const QString &text);
+    void logLineAppended(const QString &line);
+
+public slots:
+    void openAutoPublishDialog();
+    void stopJob();
+    void publishNextNow();
+    void reconnectBrowserSession(const QString &accountUrl = QString{});
+    void openDebugLogsFolder();
+
+private:
     QList<EligibleCreative> _collectEligibleCreatives(int maxDaysOld,
                                                       bool skipSingleImages = true,
                                                       int *outOlderExcluded = nullptr,
@@ -124,7 +181,10 @@ private:
                                        const QList<EligibleCreative> &allCandidates,
                                        int baseIntervalMins,
                                        const QString &experimentSummaryLine);
+    QCoro::Task<int> _syncLivePublicationsForTargets(const PublishJobConfig &config,
+                                                     std::shared_ptr<bool> cancelToken);
     QCoro::Task<void> _runJobCoroutine(PublishJobConfig config, QList<EligibleCreative> candidates);
+    QCoro::Task<void> _runPlannedJobCoroutine(PublishJobConfig config, QList<ScheduledItem> confirmedQueue);
     void _appendLog(const QString &line);
     void _refreshQueueTable();
     void _updateActionButtons();

@@ -11,6 +11,7 @@
 #include "gui/panes/PaneGeneration.h"
 #include "gui/panes/PanePublishing.h"
 #include "gui/panes/PaneResearch.h"
+#include "gui/panes/PaneWorkflow.h"
 #include "model/FavoriteHooks.h"
 #include "model/FavoriteVideoPrompts.h"
 #include "model/PreferredHashtags.h"
@@ -2050,6 +2051,146 @@ void checkResearch(const QDir &callerWorkingDir)
                             && !refExpSummary.strategyBreakdown.isEmpty()
                             && refExpSummary.plannerPromptAddendum().contains("SOURCE VIDEO & ADAPTATION MODE LEARNING"),
                         "SocialStatistics::summarizeReferenceExperiment learns winning source references and adaptation strategies (swap vs variant)");
+
+        // Verify end-to-end 3-Step Guided Workflow Tab (PaneWorkflow):
+        // Step 1 (Pick Products & inline generation) -> auto-advance to Step 2 (inline WidgetCreativeReview,
+        // AI Select & Order, delete unwanted creative) -> Step 3 (spacing radio buttons + Auto-Publish job)!
+        {
+            liveGenPane.setAvailableClis({&swapCli});
+            ResearchStore wfStore(genWork.path());
+            const QString wfAccId = pubAccounts.accountId(0).toString(QUuid::WithoutBraces);
+            wfStore.setProfile(wfAccId, QJsonObject{
+                {QStringLiteral("brands"), QJsonArray{QStringLiteral("Pradize")}},
+                {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}}
+            });
+            wfStore.replaceProducts(QJsonArray{
+                QJsonObject{
+                    {QStringLiteral("id"), QStringLiteral("wf-prod-1")},
+                    {QStringLiteral("title"), QStringLiteral("Pradize Velvet Slingback Stiletto")},
+                    {QStringLiteral("color"), QStringLiteral("Burgundy")},
+                    {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                    {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                    {QStringLiteral("localImage"), spyImgPath}
+                },
+                QJsonObject{
+                    {QStringLiteral("id"), QStringLiteral("wf-prod-2")},
+                    {QStringLiteral("title"), QStringLiteral("Pradize Crystal Strap Pump")},
+                    {QStringLiteral("color"), QStringLiteral("Silver")},
+                    {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                    {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                    {QStringLiteral("localImage"), spyImgPath}
+                }
+            }, genWork.path());
+
+            PaneResearch wfResearch(&pubAccounts, &wfStore, {&swapCli});
+            PaneWorkflow wfPane(&pubAccounts, &wfStore, &wfResearch, &liveGenPane, &panePub,
+                                &pubVideos, {&swapCli}, &gHooks);
+            wfPane.resize(1200, 780);
+            wfPane.show();
+            QApplication::processEvents();
+
+            requireResearch(wfPane.currentStep() == 0, "PaneWorkflow opens on Step 1 (Pick Products)");
+            auto *wfProdList = wfPane.findChild<QListWidget *>("listWorkflowProducts");
+            auto *wfCheckAll = wfPane.findChild<QPushButton *>("buttonWorkflowCheckAllProducts");
+            auto *wfSpinPerProd = wfPane.findChild<QSpinBox *>("spinWorkflowGenPerProduct");
+            auto *wfChkVideo = wfPane.findChild<QCheckBox *>("checkWorkflowFormatVideo");
+            auto *wfChkCarousel = wfPane.findChild<QCheckBox *>("checkWorkflowFormatCarousel");
+            auto *wfChkImage = wfPane.findChild<QCheckBox *>("checkWorkflowFormatImage");
+            auto *wfBtnGen = wfPane.findChild<QPushButton *>("buttonWorkflowGenerate");
+            auto *wfGenLog = wfPane.findChild<QPlainTextEdit *>("textWorkflowGenLog");
+            requireResearch(wfProdList && wfProdList->count() == 2 && wfCheckAll && wfSpinPerProd
+                                && wfChkVideo && wfChkCarousel && wfChkImage && wfBtnGen && wfGenLog,
+                            "PaneWorkflow Step 1 displays eligible products with controls");
+
+            wfCheckAll->click();
+            wfSpinPerProd->setValue(1);
+            wfChkVideo->setChecked(false);
+            wfChkCarousel->setChecked(true);
+            wfChkImage->setChecked(false);
+            QApplication::processEvents();
+            requireResearch(wfBtnGen->isEnabled() && wfBtnGen->text().contains("Generate 2 Creative(s)"),
+                            "Step 1 computes total creatives (2 products x 1 = 2) and enables Generate button");
+
+            bool sawModalDuringWorkflowGen = false;
+            wfBtnGen->click();
+            QElapsedTimer wfGenWait;
+            wfGenWait.start();
+            while ((liveGenPane.isAutoBatchRunning() || wfPane.currentStep() == 0) && wfGenWait.elapsed() < 30000)
+            {
+                if (QApplication::activeModalWidget() != nullptr)
+                {
+                    sawModalDuringWorkflowGen = true;
+                }
+                QApplication::processEvents();
+                QThread::msleep(20);
+            }
+            requireResearch(!sawModalDuringWorkflowGen
+                                && wfPane.currentStep() == 1
+                                && wfGenLog->toPlainText().contains("Saved"),
+                            "Step 1 runs Auto-Batch inline without modal progress dialog and auto-advances to Step 2");
+
+            // Step 2: Review Generated Content inline
+            auto *wfCandTable = wfPane.findChild<QTableWidget *>("tableReviewCandidates");
+            auto *wfBtnAiSelect = wfPane.findChild<QPushButton *>("buttonWorkflowAiSelect");
+            auto *wfBtnToStep3 = wfPane.findChild<QPushButton *>("buttonWorkflowToStep3");
+            requireResearch(wfCandTable && wfCandTable->rowCount() >= 2 && wfBtnAiSelect && wfBtnToStep3,
+                            "Step 2 embeds WidgetCreativeReview with newly generated creatives");
+
+            wfBtnAiSelect->click();
+            QElapsedTimer wfAiWait;
+            wfAiWait.start();
+            while (!wfBtnAiSelect->isEnabled() && wfAiWait.elapsed() < 10000)
+            {
+                QApplication::processEvents();
+                QThread::msleep(20);
+            }
+            const int rowsBeforeDelete = wfCandTable->rowCount();
+            const QString codeToDelete = wfCandTable->item(rowsBeforeDelete - 1, 2)->text().section(' ', 0, 0);
+            requireResearch(wfPane.deleteCreativeByShortCode(codeToDelete, false)
+                                && wfCandTable->rowCount() == rowsBeforeDelete - 1
+                                && pubVideos.recordFromShortCode(codeToDelete) == nullptr,
+                            "Step 2 deletes an unwanted unpublished creative from disk, TableVideos, and review table");
+
+            requireResearch(wfBtnToStep3->isEnabled(), "Step 2 enables Continue to Step 3 with remaining checked creative");
+            wfBtnToStep3->click();
+            QApplication::processEvents();
+            requireResearch(wfPane.currentStep() == 2, "Step 2 advances cleanly to Step 3 (Start Auto-Publish Jobs)");
+
+            // Step 3: Verify live spacing radio buttons + execute Dry-Run Auto-Publish job
+            auto *wfRadioFixed = wfPane.findChild<QRadioButton *>("radioWorkflowSpacingFixed");
+            auto *wfSpinFixed = wfPane.findChild<QSpinBox *>("spinWorkflowFixedMinutes");
+            auto *wfChkDryRun = wfPane.findChild<QCheckBox *>("checkWorkflowDryRun");
+            auto *wfQueueTable = wfPane.findChild<QTableWidget *>("tableWorkflowPublishQueue");
+            auto *wfPubLogs = wfPane.findChild<QPlainTextEdit *>("textWorkflowPublishLogs");
+            auto *wfBtnStartPub = wfPane.findChild<QPushButton *>("buttonWorkflowStartPublish");
+            requireResearch(wfRadioFixed && wfSpinFixed && wfChkDryRun && wfQueueTable && wfPubLogs && wfBtnStartPub,
+                            "Step 3 exposes spacing radio buttons, queue preview table, logs, and Start Auto-Publish button");
+
+            wfRadioFixed->setChecked(true);
+            wfSpinFixed->setValue(45);
+            wfChkDryRun->setChecked(true);
+            wfPane.setUploadUrlOverride(QStringLiteral("file://") + studioHtmlPath);
+            QApplication::processEvents();
+            requireResearch(wfQueueTable->rowCount() >= 1 && wfBtnStartPub->isEnabled(),
+                            "Step 3 previews scheduled queue from Step 2 selection before job starts");
+
+            wfBtnStartPub->click();
+            QElapsedTimer wfPubWait;
+            wfPubWait.start();
+            while (panePub.isJobRunning() && wfPubWait.elapsed() < 30000)
+            {
+                QApplication::processEvents();
+                QThread::msleep(25);
+            }
+            requireResearch(!panePub.isJobRunning()
+                                && wfPubLogs->toPlainText().contains("[JOB-START]")
+                                && wfPubLogs->toPlainText().contains("[JOB-DONE]")
+                                && wfQueueTable->item(0, 6)
+                                && wfQueueTable->item(0, 6)->text().contains("Dry-run OK"),
+                            "Step 3 executes planned Auto-Publish job on PanePublishing and streams live status & logs");
+
+            wfPane.close();
+        }
 
         liveGenPane.close();
         panePub.close();

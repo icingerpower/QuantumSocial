@@ -34,6 +34,8 @@ SET(GUI_FILES
     ${CMAKE_CURRENT_LIST_DIR}/DialogReviewNewProperties.h
     ${CMAKE_CURRENT_LIST_DIR}/DialogValidateIdea.cpp
     ${CMAKE_CURRENT_LIST_DIR}/DialogValidateIdea.h
+    ${CMAKE_CURRENT_LIST_DIR}/WidgetCreativeReview.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/WidgetCreativeReview.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneAccounts.ui
@@ -45,6 +47,8 @@ SET(GUI_FILES
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneGeneration.ui
     ${CMAKE_CURRENT_LIST_DIR}/panes/PanePublishing.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PanePublishing.h
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneWorkflow.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/panes/PaneWorkflow.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.cpp
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.h
     ${CMAKE_CURRENT_LIST_DIR}/panes/PaneProperties.ui

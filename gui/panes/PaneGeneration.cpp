@@ -4847,6 +4847,10 @@ void PaneGeneration::_logProgress(const QString &message)
         m_progress.status->setText(
             compact.size() > 180 ? (compact.left(179) + QStringLiteral("…")) : compact);
     }
+    if (m_autoBatchRunning)
+    {
+        emit autoBatchProgress(m_autoBatchCompleted, m_autoBatchTotal, message);
+    }
 }
 
 void PaneGeneration::_finishProgress(const QString &message)
@@ -5497,6 +5501,10 @@ int PaneGeneration::_findOrCreateAutoBatchProject(const QString &accountId,
 
 bool PaneGeneration::startAutoBatch(const QJsonObject &batchSpec)
 {
+    if (m_autoBatchRunning)
+    {
+        return false;
+    }
     if (!_promptCli())
     {
         QMessageBox::information(this, tr("No CLI available"),
@@ -5520,6 +5528,70 @@ bool PaneGeneration::startAutoBatch(const QJsonObject &batchSpec)
 
     ui->toolBox->setCurrentIndex(1);
     m_autoBatchTask = std::make_unique<QCoro::Task<void>>(_runAutoBatch(batchSpec));
+    return true;
+}
+
+void PaneGeneration::cancelAutoBatch()
+{
+    if (!m_autoBatchRunning)
+    {
+        return;
+    }
+    m_batchCancelled = true;
+    if (m_activeMultiVideoWorkflow)
+    {
+        m_activeMultiVideoWorkflow->cancel();
+    }
+    _stopVideoGeneratorsIfConfigured();
+    _logProgress(tr("Cancelling remaining generations after the current steps finish..."));
+}
+
+bool PaneGeneration::deleteUnpublishedCreative(const QString &shortCode, QString *outError)
+{
+    if (!m_videos || !m_projects)
+    {
+        if (outError) *outError = tr("Models unavailable.");
+        return false;
+    }
+    const auto *rec = m_videos->recordFromShortCode(shortCode);
+    if (!rec)
+    {
+        if (outError) *outError = tr("Creative %1 was not found.").arg(shortCode);
+        return false;
+    }
+    if (rec->published || m_videos->hasRetrievedStatistics(rec->id))
+    {
+        if (outError) *outError = tr("Cannot delete %1 because it has already been published.").arg(rec->shortCode);
+        return false;
+    }
+    const QUuid vidId = rec->id;
+    const QString exactCode = rec->shortCode;
+    const int projRow = m_projects->rowOfId(rec->projectId);
+
+    // Stop inline preview if currently playing a file from this generation folder
+    if (m_mediaPlayer)
+    {
+        m_mediaPlayer->stop();
+        m_mediaPlayer->setSource(QUrl{});
+    }
+
+    if (projRow >= 0)
+    {
+        QDir genDir = m_projects->generationDir(projRow, exactCode, false);
+        if (genDir.exists())
+        {
+            genDir.removeRecursively();
+        }
+    }
+    if (!m_videos->removeVideo(vidId))
+    {
+        if (outError) *outError = tr("Could not remove %1 from video records.").arg(exactCode);
+        return false;
+    }
+    if (projRow >= 0 && ui->tableViewProjects->currentIndex().row() == projRow)
+    {
+        _refreshGenerationsView(projRow);
+    }
     return true;
 }
 
@@ -5649,23 +5721,42 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
     int attemptedCreatives = 0;
     m_runGenerations.clear();
     m_runVideoFormatLabel = videoFormatLabel;
+    m_batchCancelled = false;
+    m_autoBatchRunning = true;
+    m_autoBatchCompleted = 0;
+    m_autoBatchTotal = totalCreatives;
 
-    _openProgress();
-    if (m_progress.cancelBtn)
+    const bool suppressModalProgress = batchSpec.value(QStringLiteral("suppressModalProgressDialog")).toBool(false);
+    if (!suppressModalProgress)
     {
-        m_progress.cancelBtn->show();
+        _openProgress();
+        if (m_progress.cancelBtn)
+        {
+            m_progress.cancelBtn->show();
+        }
+        if (m_progress.bar)
+        {
+            m_progress.bar->setRange(0, totalCreatives);
+            m_progress.bar->setValue(0);
+        }
     }
-    if (m_progress.bar)
+    else
     {
-        m_progress.bar->setRange(0, totalCreatives);
-        m_progress.bar->setValue(0);
+        if (m_progressDlg)
+        {
+            m_progressDlg->close();
+        }
+        m_progress = decltype(m_progress){};
     }
 
     setEnabled(false);
     const auto restoreUi = qScopeGuard([this]() {
+        m_autoBatchRunning = false;
         setEnabled(true);
         _stopVideoGeneratorsIfConfigured();
     });
+
+    emit autoBatchStarted(totalCreatives);
 
     _logProgress(tr("Starting Auto-Batch: %1 product(s) × %2 generation(s) = %3 creative(s) "
                     "(%4 approved reference(s) in pool).")
@@ -6607,6 +6698,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
             }
 
             ++completedCreatives;
+            m_autoBatchCompleted = completedCreatives;
             if (m_progress.bar)
             {
                 m_progress.bar->setValue(completedCreatives);
@@ -6644,4 +6736,10 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         _finishProgress(tr("Auto-Batch finished: %1/%2 creative(s) generated with hooks, captions, and tracking codes.")
             .arg(completedCreatives).arg(totalCreatives));
     }
+    m_autoBatchRunning = false;
+    emit autoBatchFinished(
+        completedCreatives,
+        totalCreatives,
+        m_batchCancelled,
+        hitHardStopError ? hardStopReason : QString{});
 }
