@@ -114,6 +114,8 @@ private:
     QLabel *m_prodPreviewCaption = nullptr;
     QLabel *m_inspirationsInfoLabel = nullptr;
     QSpinBox *m_spinGenPerProduct = nullptr;
+    QComboBox *m_comboPromptCli = nullptr;
+    QComboBox *m_comboImageCli = nullptr;
     QCheckBox *m_chkFormatVideo = nullptr;
     QComboBox *m_comboVideoGen = nullptr;
     QCheckBox *m_chkFormatCarousel = nullptr;

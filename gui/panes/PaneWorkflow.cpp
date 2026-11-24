@@ -384,7 +384,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
     splitter->addWidget(leftBox);
 
     // Right: Creative batch options + inline progress
-    auto *rightBox = new QGroupBox(tr("Step 1B — Batch Formats & Inline Generation"), splitter);
+    auto *rightBox = new QGroupBox(tr("Step 1B — Batch Formats && Inline Generation"), splitter);
     auto *rightLayout = new QVBoxLayout(rightBox);
 
     m_inspirationsInfoLabel = new QLabel(rightBox);
@@ -398,6 +398,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
     QSettings uiSettings = m_store
         ? QSettings(m_store->directory().filePath(QStringLiteral("ui.ini")), QSettings::IniFormat)
         : QSettings();
+    QSettings appSettings;
 
     auto *form = new QFormLayout;
     m_spinGenPerProduct = new QSpinBox(rightBox);
@@ -405,6 +406,66 @@ QWidget *PaneWorkflow::_buildStep1Page()
     m_spinGenPerProduct->setRange(1, 50);
     m_spinGenPerProduct->setValue(uiSettings.value(QStringLiteral("autoBatch/generationsPerProduct"), 6).toInt());
     form->addRow(tr("Generations per product:"), m_spinGenPerProduct);
+
+    m_comboPromptCli = new QComboBox(rightBox);
+    m_comboPromptCli->setObjectName(QStringLiteral("comboWorkflowPromptCli"));
+    m_comboPromptCli->setToolTip(
+        tr("AI CLI used to plan creative prompts, write hooks & captions, and run quality checks."));
+    int defaultPromptIdx = 0;
+    bool foundTextOnlyFallback = false;
+    for (AbstractCli *cli : m_clis)
+    {
+        if (!cli) continue;
+        if (!foundTextOnlyFallback && !cli->canGenImages())
+        {
+            defaultPromptIdx = m_comboPromptCli->count();
+            foundTextOnlyFallback = true;
+        }
+        m_comboPromptCli->addItem(cli->getName(), QVariant::fromValue(cli));
+    }
+    if (m_comboPromptCli->count() == 0)
+    {
+        m_comboPromptCli->addItem(tr("(No AI CLI detected)"), QVariant{});
+        m_comboPromptCli->setEnabled(false);
+    }
+    else
+    {
+        const QString savedPromptCli = uiSettings.value(
+            QStringLiteral("autoBatch/promptCli"),
+            appSettings.value(QStringLiteral("generation/promptCli")).toString()).toString();
+        const int pIdx = m_comboPromptCli->findText(savedPromptCli);
+        m_comboPromptCli->setCurrentIndex(pIdx >= 0 ? pIdx : defaultPromptIdx);
+    }
+    form->addRow(tr("Content / prompt CLI:"), m_comboPromptCli);
+
+    m_comboImageCli = new QComboBox(rightBox);
+    m_comboImageCli->setObjectName(QStringLiteral("comboWorkflowImageCli"));
+    m_comboImageCli->setToolTip(
+        tr("Image-capable AI CLI used for product swaps, video starting frames, 4-slide carousels, and single images."));
+    for (AbstractCli *cli : m_clis)
+    {
+        if (cli && cli->canGenImages())
+        {
+            m_comboImageCli->addItem(cli->getName(), QVariant::fromValue(cli));
+        }
+    }
+    if (m_comboImageCli->count() == 0)
+    {
+        m_comboImageCli->addItem(tr("(No image-capable CLI detected)"), QVariant{});
+        m_comboImageCli->setEnabled(false);
+    }
+    else
+    {
+        const QString savedImageCli = uiSettings.value(
+            QStringLiteral("autoBatch/imageCli"),
+            appSettings.value(QStringLiteral("generation/imageCli")).toString()).toString();
+        const int iIdx = m_comboImageCli->findText(savedImageCli);
+        if (iIdx >= 0)
+        {
+            m_comboImageCli->setCurrentIndex(iIdx);
+        }
+    }
+    form->addRow(tr("Image generation CLI:"), m_comboImageCli);
 
     m_comboAspectFormat = new QComboBox(rightBox);
     m_comboAspectFormat->setObjectName(QStringLiteral("comboWorkflowAspectFormat"));
@@ -504,7 +565,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
     m_btnSkipToStep2->setObjectName(QStringLiteral("buttonWorkflowSkipToStep2"));
     m_btnSkipToStep2->setMinimumHeight(36);
 
-    m_btnGenerateAndNext = new QPushButton(tr("✨ Generate Selected Products & Continue to Step 2 →"), page);
+    m_btnGenerateAndNext = new QPushButton(tr("✨ Generate Selected Products && Continue to Step 2 →"), page);
     m_btnGenerateAndNext->setObjectName(QStringLiteral("buttonWorkflowGenerate"));
     m_btnGenerateAndNext->setMinimumHeight(36);
     m_btnGenerateAndNext->setStyleSheet(QStringLiteral(
@@ -577,6 +638,34 @@ QWidget *PaneWorkflow::_buildStep1Page()
     connect(m_spinGenPerProduct, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
         _updateStep1SummaryAndButtons();
     });
+    connect(m_comboPromptCli, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (auto *cli = m_comboPromptCli->currentData().value<AbstractCli *>())
+        {
+            QSettings().setValue(QStringLiteral("generation/promptCli"), cli->getName());
+            if (m_paneGeneration)
+            {
+                m_paneGeneration->setSelectedPromptCli(cli->getName());
+            }
+            if (m_store)
+            {
+                QSettings s(m_store->directory().filePath(QStringLiteral("ui.ini")), QSettings::IniFormat);
+                s.setValue(QStringLiteral("autoBatch/promptCli"), cli->getName());
+            }
+        }
+        _updateStep1SummaryAndButtons();
+    });
+    connect(m_comboImageCli, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        if (auto *cli = m_comboImageCli->currentData().value<AbstractCli *>())
+        {
+            QSettings().setValue(QStringLiteral("generation/imageCli"), cli->getName());
+            if (m_store)
+            {
+                QSettings s(m_store->directory().filePath(QStringLiteral("ui.ini")), QSettings::IniFormat);
+                s.setValue(QStringLiteral("autoBatch/imageCli"), cli->getName());
+            }
+        }
+        _updateStep1SummaryAndButtons();
+    });
     connect(m_chkFormatVideo, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
     connect(m_chkFormatCarousel, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
     connect(m_chkFormatImage, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
@@ -647,7 +736,7 @@ QWidget *PaneWorkflow::_buildStep2Page()
     }
     topBar->addWidget(m_comboPlannerCli);
 
-    m_btnAiSelect = new QPushButton(tr("✨ AI Select & Order Best"), page);
+    m_btnAiSelect = new QPushButton(tr("✨ AI Select && Order Best"), page);
     m_btnAiSelect->setObjectName(QStringLiteral("buttonWorkflowAiSelect"));
     m_btnAiSelect->setStyleSheet(QStringLiteral("font-weight: 600; padding: 4px 10px;"));
     topBar->addWidget(m_btnAiSelect);
@@ -743,7 +832,7 @@ QWidget *PaneWorkflow::_buildStep3Page()
     pageLayout->addWidget(mainSplitter, 1);
 
     // Left: Target accounts + Spacing mode radio buttons + Start / Stop controls
-    auto *leftBox = new QGroupBox(tr("Step 3A — Target Accounts & Wait Spacing"), mainSplitter);
+    auto *leftBox = new QGroupBox(tr("Step 3A — Target Accounts && Wait Spacing"), mainSplitter);
     auto *leftLayout = new QVBoxLayout(leftBox);
 
     auto *accRow = new QHBoxLayout;
@@ -828,7 +917,7 @@ QWidget *PaneWorkflow::_buildStep3Page()
     form->addRow(tr("Wait between posts:"), spacingBox);
 
     m_chkSuggestedSound = new QCheckBox(
-        tr("Mute original video audio & add #1 suggested TikTok sound"), leftBox);
+        tr("Mute original video audio && add #1 suggested TikTok sound"), leftBox);
     m_chkSuggestedSound->setObjectName(QStringLiteral("checkWorkflowSuggestedSound"));
     m_chkSuggestedSound->setChecked(settings.value(QStringLiteral("publishing/useSuggestedSound"), true).toBool());
     form->addRow(QString{}, m_chkSuggestedSound);
@@ -865,7 +954,7 @@ QWidget *PaneWorkflow::_buildStep3Page()
     mainSplitter->addWidget(leftBox);
 
     // Right: Live schedule preview / running queue + diagnostic console
-    auto *rightBox = new QGroupBox(tr("Step 3B — Scheduled Queue & Live Diagnostic Logs"), mainSplitter);
+    auto *rightBox = new QGroupBox(tr("Step 3B — Scheduled Queue && Live Diagnostic Logs"), mainSplitter);
     auto *rightLayout = new QVBoxLayout(rightBox);
 
     m_publishStatusLabel = new QLabel(tr("Ready — review your scheduled queue below and click Start Auto-Publish Job."), rightBox);
@@ -1284,6 +1373,10 @@ void PaneWorkflow::_updateStep1SummaryAndButtons()
     const bool anyFormat = (m_chkFormatVideo && m_chkFormatVideo->isChecked())
         || (m_chkFormatCarousel && m_chkFormatCarousel->isChecked())
         || (m_chkFormatImage && m_chkFormatImage->isChecked());
+    const bool hasPromptCli = m_comboPromptCli
+        && m_comboPromptCli->currentData().value<AbstractCli *>() != nullptr;
+    const bool hasImageCli = m_comboImageCli
+        && m_comboImageCli->currentData().value<AbstractCli *>() != nullptr;
     const int perProd = m_spinGenPerProduct ? m_spinGenPerProduct->value() : 1;
     const int totalToGen = checkedCount * perProd;
     const bool batchRunning = m_paneGeneration && m_paneGeneration->isAutoBatchRunning();
@@ -1299,10 +1392,19 @@ void PaneWorkflow::_updateStep1SummaryAndButtons()
     }
     if (m_btnGenerateAndNext)
     {
-        m_btnGenerateAndNext->setEnabled(!batchRunning && checkedCount > 0 && anyFormat && !_selectedAccountId().isEmpty());
-        m_btnGenerateAndNext->setText(checkedCount > 0
-            ? tr("✨ Generate %1 Creative(s) & Continue to Step 2 →").arg(totalToGen)
-            : tr("Select at least 1 product to generate"));
+        m_btnGenerateAndNext->setEnabled(
+            !batchRunning && checkedCount > 0 && anyFormat
+            && hasPromptCli && hasImageCli && !_selectedAccountId().isEmpty());
+        if (!hasPromptCli || !hasImageCli)
+        {
+            m_btnGenerateAndNext->setText(tr("Select valid Content && Image CLIs above"));
+        }
+        else
+        {
+            m_btnGenerateAndNext->setText(checkedCount > 0
+                ? tr("✨ Generate %1 Creative(s) && Continue to Step 2 →").arg(totalToGen)
+                : tr("Select at least 1 product to generate"));
+        }
     }
 
     if (m_panePublishing && m_btnSkipToStep2)
@@ -1323,6 +1425,16 @@ void PaneWorkflow::_saveStep1Settings() const
     }
     QSettings settings(m_store->directory().filePath(QStringLiteral("ui.ini")), QSettings::IniFormat);
     settings.setValue(QStringLiteral("autoBatch/generationsPerProduct"), m_spinGenPerProduct->value());
+    if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
+    {
+        settings.setValue(QStringLiteral("autoBatch/promptCli"), pCli->getName());
+        QSettings().setValue(QStringLiteral("generation/promptCli"), pCli->getName());
+    }
+    if (auto *iCli = m_comboImageCli ? m_comboImageCli->currentData().value<AbstractCli *>() : nullptr)
+    {
+        settings.setValue(QStringLiteral("autoBatch/imageCli"), iCli->getName());
+        QSettings().setValue(QStringLiteral("generation/imageCli"), iCli->getName());
+    }
     settings.setValue(QStringLiteral("autoBatch/includeVideo"), m_chkFormatVideo->isChecked());
     settings.setValue(QStringLiteral("autoBatch/includeCarousel"), m_chkFormatCarousel->isChecked());
     settings.setValue(QStringLiteral("autoBatch/carouselHookOverlay"), m_chkCarouselOverlay->isChecked());
@@ -1359,6 +1471,14 @@ void PaneWorkflow::startStep1Generation()
         m_chkCarouselOverlay->isChecked(),
         m_comboAspectFormat->currentText(),
         m_comboVideoGen->currentData().toString());
+    if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
+    {
+        spec.insert(QStringLiteral("promptCli"), pCli->getName());
+    }
+    if (auto *iCli = m_comboImageCli ? m_comboImageCli->currentData().value<AbstractCli *>() : nullptr)
+    {
+        spec.insert(QStringLiteral("imageCli"), iCli->getName());
+    }
     spec.insert(QStringLiteral("suppressModalProgressDialog"), true);
 
     m_genLogConsole->clear();
@@ -1480,7 +1600,7 @@ QCoro::Task<void> PaneWorkflow::_runAiSelectCoroutine()
 
     m_aiPlanningInProgress = false;
     m_btnAiSelect->setEnabled(true);
-    m_btnAiSelect->setText(tr("✨ AI Select & Order Best"));
+    m_btnAiSelect->setText(tr("✨ AI Select && Order Best"));
 
     const int baseMins = PanePublishing::baseIntervalMinutesForConfig(cfg);
     m_reviewWidget->setCandidates(

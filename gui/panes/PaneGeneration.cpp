@@ -879,6 +879,21 @@ void PaneGeneration::setAvailableClis(const QList<AbstractCli *> &clis)
     ui->comboBoxCli->setCurrentIndex(restored >= 0 ? restored : fallback);
 }
 
+void PaneGeneration::setSelectedPromptCli(const QString &cliName)
+{
+    if (cliName.trimmed().isEmpty())
+    {
+        return;
+    }
+    const int idx = ui->comboBoxCli->findText(cliName.trimmed());
+    if (idx >= 0 && ui->comboBoxCli->currentIndex() != idx)
+    {
+        QSignalBlocker blocker{ui->comboBoxCli};
+        ui->comboBoxCli->setCurrentIndex(idx);
+    }
+    QSettings().setValue(SETTING_PROMPT_CLI, cliName.trimmed());
+}
+
 void PaneGeneration::_addProject()
 {
     DialogNewProject dialog{this};
@@ -5505,6 +5520,16 @@ bool PaneGeneration::startAutoBatch(const QJsonObject &batchSpec)
     {
         return false;
     }
+    const QString reqPromptCli = batchSpec.value(QStringLiteral("promptCli")).toString().trimmed();
+    if (!reqPromptCli.isEmpty())
+    {
+        setSelectedPromptCli(reqPromptCli);
+    }
+    const QString reqImageCli = batchSpec.value(QStringLiteral("imageCli")).toString().trimmed();
+    if (!reqImageCli.isEmpty())
+    {
+        QSettings().setValue(QStringLiteral("generation/imageCli"), reqImageCli);
+    }
     if (!_promptCli())
     {
         QMessageBox::information(this, tr("No CLI available"),
@@ -5759,11 +5784,12 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
     emit autoBatchStarted(totalCreatives);
 
     _logProgress(tr("Starting Auto-Batch: %1 product(s) × %2 generation(s) = %3 creative(s) "
-                    "(%4 approved reference(s) in pool).")
+                    "(%4 approved reference(s) in pool · Content CLI: %5 · Image CLI: %6).")
         .arg(products.size())
         .arg(generationsPerProduct)
         .arg(totalCreatives)
-        .arg(rankedRefs.size()));
+        .arg(rankedRefs.size())
+        .arg(promptCli->getName(), imgCli->getName()));
 
     bool hitHardStopError = false;
     QString hardStopReason;

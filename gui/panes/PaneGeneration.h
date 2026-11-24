@@ -87,6 +87,7 @@ public:
     // Fills the prompt-suggestion CLI combo (top of the Generation page).
     // The image-step CLI is chosen separately in DialogGenerationOptions.
     void setAvailableClis(const QList<AbstractCli *> &clis);
+    void setSelectedPromptCli(const QString &cliName);
 
     TableProjects *projectsModel() const { return m_projects; }
     bool createResearchProject(const QJsonObject &context, const QString &imagePath);
