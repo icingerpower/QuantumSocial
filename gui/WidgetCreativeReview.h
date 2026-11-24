@@ -12,6 +12,7 @@ class QAudioOutput;
 class QCheckBox;
 class QComboBox;
 class QHBoxLayout;
+class QHideEvent;
 class QLabel;
 class QLineEdit;
 class QMediaPlayer;
@@ -57,6 +58,9 @@ signals:
     void selectionChanged(int checkedCount, int totalCount);
     void deleteCandidateRequested(const QString &shortCode);
 
+protected:
+    void hideEvent(QHideEvent *event) override;
+
 private:
     struct CandidateRowState
     {
@@ -96,6 +100,7 @@ private:
     QPushButton *m_btnGroupTop = nullptr;
     QPushButton *m_btnResetAi = nullptr;
     QPushButton *m_btnDeleteCreative = nullptr;
+    QPushButton *m_btnDeleteInspector = nullptr;
     QLabel *m_summaryLbl = nullptr;
 
     QStackedWidget *m_previewStack = nullptr;
@@ -126,6 +131,7 @@ private:
     bool m_updatingUi = false;
     bool m_scrubbingSlider = false;
     bool m_autoPlayVideosOnSelect = false;
+    bool m_deleteEnabled = false;
     QString m_loadedVideoPath;
 };
 

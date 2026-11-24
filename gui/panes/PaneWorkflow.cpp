@@ -1625,9 +1625,9 @@ bool PaneWorkflow::deleteCreativeByShortCode(const QString &shortCode, bool askC
         const auto ans = QMessageBox::question(
             this,
             tr("Delete Unpublished Creative"),
-            tr("Permanently delete unpublished creative %1 from disk?").arg(shortCode),
+            tr("Permanently delete unpublished creative %1 from disk so it will never be published?").arg(shortCode),
             QMessageBox::Yes | QMessageBox::No,
-            QMessageBox::No);
+            QMessageBox::Yes);
         if (ans != QMessageBox::Yes)
         {
             return false;

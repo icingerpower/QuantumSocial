@@ -11,12 +11,14 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QHideEvent>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMediaPlayer>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QShortcut>
 #include <QSlider>
 #include <QSpinBox>
 #include <QSplitter>
@@ -59,13 +61,14 @@ WidgetCreativeReview::WidgetCreativeReview(QWidget *parent)
     auto *leftLayout = new QVBoxLayout(leftBox);
     leftLayout->setContentsMargins(0, 0, 4, 0);
 
-    m_table = new QTableWidget(0, 4, leftBox);
+    m_table = new QTableWidget(0, 5, leftBox);
     m_table->setObjectName(QStringLiteral("tableReviewCandidates"));
     m_table->setHorizontalHeaderLabels({
         tr("Publish / Order"),
         tr("Preview"),
         tr("Creative Details (Product, Hook & AI Note)"),
-        tr("Target & Timing")
+        tr("Target & Timing"),
+        tr("Action")
     });
     m_table->setIconSize(QSize(72, 112));
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -79,7 +82,10 @@ WidgetCreativeReview::WidgetCreativeReview(QWidget *parent)
     m_table->setColumnWidth(1, 86);
     m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
     m_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
-    m_table->horizontalHeader()->resizeSection(3, 195);
+    m_table->horizontalHeader()->resizeSection(3, 185);
+    m_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Fixed);
+    m_table->setColumnWidth(4, 88);
+    m_table->setColumnHidden(4, true);
     leftLayout->addWidget(m_table, 1);
 
     auto *orderBar = new QHBoxLayout;
@@ -95,10 +101,14 @@ WidgetCreativeReview::WidgetCreativeReview(QWidget *parent)
     m_btnGroupTop->setObjectName(QStringLiteral("buttonSortCheckedTop"));
     m_btnResetAi = new QPushButton(tr("↺ Reset to AI Plan"), leftBox);
     m_btnResetAi->setObjectName(QStringLiteral("buttonResetAiSelection"));
-    m_btnDeleteCreative = new QPushButton(tr("🗑 Delete"), leftBox);
+    m_btnDeleteCreative = new QPushButton(tr("🗑 Delete Selected"), leftBox);
     m_btnDeleteCreative->setObjectName(QStringLiteral("buttonDeleteCandidateCreative"));
-    m_btnDeleteCreative->setToolTip(tr("Permanently delete this unpublished creative from disk."));
-    m_btnDeleteCreative->setStyleSheet(QStringLiteral("color: #e89774;"));
+    m_btnDeleteCreative->setToolTip(tr("Permanently delete this unpublished creative from disk so it is never published (Del)."));
+    m_btnDeleteCreative->setStyleSheet(QStringLiteral(
+        "QPushButton { background: rgba(220, 38, 38, 0.20); border: 1px solid rgba(248, 113, 113, 0.55); "
+        "color: #fca5a5; font-weight: 700; padding: 4px 10px; border-radius: 5px; }"
+        "QPushButton:hover { background: rgba(220, 38, 38, 0.38); color: #ffffff; }"
+        "QPushButton:disabled { background: rgba(55, 65, 81, 0.35); border-color: rgba(107, 114, 128, 0.3); color: #6b7280; }"));
     m_btnDeleteCreative->setVisible(false);
 
     orderBar->addWidget(m_btnToggleCheck);
@@ -193,9 +203,22 @@ WidgetCreativeReview::WidgetCreativeReview(QWidget *parent)
     m_slideStripWidget->setVisible(false);
     rightLayout->addWidget(m_slideStripWidget);
 
-    m_btnOpenMedia = new QPushButton(tr("Open Media File Externally"), rightBox);
+    auto *mediaActionRow = new QHBoxLayout;
+    mediaActionRow->setSpacing(6);
+    m_btnOpenMedia = new QPushButton(tr("Open Externally"), rightBox);
     m_btnOpenMedia->setObjectName(QStringLiteral("buttonOpenCandidateMedia"));
-    rightLayout->addWidget(m_btnOpenMedia);
+    m_btnDeleteInspector = new QPushButton(tr("🗑 Delete Creative"), rightBox);
+    m_btnDeleteInspector->setObjectName(QStringLiteral("buttonDeleteInspectorCreative"));
+    m_btnDeleteInspector->setToolTip(tr("Permanently delete this unpublished creative from disk so it will never be published (Del)."));
+    m_btnDeleteInspector->setStyleSheet(QStringLiteral(
+        "QPushButton { background: rgba(220, 38, 38, 0.24); border: 1px solid rgba(248, 113, 113, 0.60); "
+        "color: #fca5a5; font-weight: 700; padding: 5px 10px; border-radius: 5px; }"
+        "QPushButton:hover { background: rgba(220, 38, 38, 0.45); color: #ffffff; }"
+        "QPushButton:disabled { background: rgba(55, 65, 81, 0.35); border-color: rgba(107, 114, 128, 0.3); color: #6b7280; }"));
+    m_btnDeleteInspector->setVisible(false);
+    mediaActionRow->addWidget(m_btnOpenMedia, 1);
+    mediaActionRow->addWidget(m_btnDeleteInspector, 1);
+    rightLayout->addLayout(mediaActionRow);
 
     auto *slotForm = new QFormLayout;
     m_targetCombo = new QComboBox(rightBox);
@@ -324,7 +347,12 @@ WidgetCreativeReview::WidgetCreativeReview(QWidget *parent)
         m_btnMoveDown->setEnabled(currentRow >= 0 && currentRow + 1 < m_rows.size());
         m_btnMoveTop->setEnabled(currentRow > 0);
         m_btnToggleCheck->setEnabled(currentRow >= 0);
-        m_btnDeleteCreative->setEnabled(currentRow >= 0 && currentRow < m_rows.size());
+        const bool validSel = currentRow >= 0 && currentRow < m_rows.size();
+        m_btnDeleteCreative->setEnabled(validSel);
+        if (m_btnDeleteInspector)
+        {
+            m_btnDeleteInspector->setEnabled(validSel);
+        }
         _refreshInspector(currentRow);
     });
 
@@ -377,13 +405,22 @@ WidgetCreativeReview::WidgetCreativeReview(QWidget *parent)
         _rebuildTable(0);
     });
 
-    connect(m_btnDeleteCreative, &QPushButton::clicked, this, [this]() {
+    const auto triggerDeleteCurrent = [this]() {
+        if (!m_deleteEnabled)
+        {
+            return;
+        }
         const QString code = currentShortCode();
         if (!code.isEmpty())
         {
             emit deleteCandidateRequested(code);
         }
-    });
+    };
+    connect(m_btnDeleteCreative, &QPushButton::clicked, this, triggerDeleteCurrent);
+    connect(m_btnDeleteInspector, &QPushButton::clicked, this, triggerDeleteCurrent);
+    auto *delShortcut = new QShortcut(QKeySequence::Delete, m_table);
+    delShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(delShortcut, &QShortcut::activated, this, triggerDeleteCurrent);
 
     connect(m_targetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
         if (m_updatingUi)
@@ -523,7 +560,16 @@ WidgetCreativeReview::~WidgetCreativeReview()
 
 void WidgetCreativeReview::setDeleteButtonVisible(bool visible)
 {
+    m_deleteEnabled = visible;
     m_btnDeleteCreative->setVisible(visible);
+    if (m_btnDeleteInspector)
+    {
+        m_btnDeleteInspector->setVisible(visible);
+    }
+    if (m_table)
+    {
+        m_table->setColumnHidden(4, !visible);
+    }
 }
 
 void WidgetCreativeReview::setBannerText(const QString &html)
@@ -699,8 +745,8 @@ void WidgetCreativeReview::setCandidates(
 
     QString bannerHtml = tr(
         "Selected <b>%1</b> of <b>%2</b> eligible creative(s) in publish order. "
-        "Check/uncheck candidates, reorder with <b>Move Up / Move Down / Move to #1</b>, and customize "
-        "each video's optional native TikTok text overlay (<i>Aa Texte</i>).")
+        "Check/uncheck candidates, reorder with <b>Move Up / Move Down / Move to #1</b>, customize "
+        "each video's optional TikTok text overlay (<i>Aa Texte</i>), or click <b>🗑 Delete</b> to permanently remove unwanted content.")
             .arg(initialPlannedQueue.size())
             .arg(m_rows.size());
     if (!experimentSummaryLine.trimmed().isEmpty())
@@ -843,7 +889,14 @@ QString WidgetCreativeReview::currentShortCode() const
 
 void WidgetCreativeReview::stopPlayback()
 {
+    m_autoPlayVideosOnSelect = false;
     _stopInlineVideo();
+}
+
+void WidgetCreativeReview::hideEvent(QHideEvent *event)
+{
+    stopPlayback();
+    QWidget::hideEvent(event);
 }
 
 int WidgetCreativeReview::_checkedOrderOfRow(int targetRow) const
@@ -923,6 +976,11 @@ void WidgetCreativeReview::_refreshInspector(int row)
         m_slideStripWidget->setVisible(false);
         m_detailsBox->clear();
         m_btnOpenMedia->setEnabled(false);
+        if (m_btnDeleteInspector)
+        {
+            m_btnDeleteInspector->setEnabled(false);
+            m_btnDeleteInspector->setText(tr("🗑 Delete Creative"));
+        }
         return;
     }
 
@@ -972,7 +1030,7 @@ void WidgetCreativeReview::_refreshInspector(int row)
         if (m_loadedVideoPath != c.mediaPaths.first())
         {
             _stopInlineVideo();
-            if (m_autoPlayVideosOnSelect)
+            if (m_autoPlayVideosOnSelect && isVisible())
             {
                 _startInlineVideoForRow(row);
             }
@@ -1025,8 +1083,16 @@ void WidgetCreativeReview::_refreshInspector(int row)
 
     m_btnOpenMedia->setEnabled(!c.mediaPaths.isEmpty());
     m_btnOpenMedia->setText(c.format == QLatin1String("video")
-        ? tr("Open Video Externally (%1)").arg(QFileInfo{c.mediaPaths.first()}.fileName())
-        : tr("Open Slide Folder (%1 files)").arg(c.mediaPaths.size()));
+        ? tr("Open Video Externally")
+        : tr("Open Slide Folder (%1)").arg(c.mediaPaths.size()));
+    m_btnOpenMedia->setToolTip(c.mediaPaths.isEmpty()
+        ? QString{}
+        : QDir::toNativeSeparators(c.mediaPaths.first()));
+    if (m_btnDeleteInspector)
+    {
+        m_btnDeleteInspector->setEnabled(true);
+        m_btnDeleteInspector->setText(tr("🗑 Delete %1").arg(c.shortCode));
+    }
 
     if (!m_config.targets.isEmpty())
     {
@@ -1183,6 +1249,24 @@ void WidgetCreativeReview::_rebuildTable(int selectRow)
             timingItem->setForeground(QColor(QStringLiteral("#9ca3af")));
         }
         m_table->setItem(r, 3, timingItem);
+
+        auto *actionWrap = new QWidget(m_table);
+        auto *actionLayout = new QHBoxLayout(actionWrap);
+        actionLayout->setContentsMargins(4, 4, 4, 4);
+        actionLayout->setAlignment(Qt::AlignCenter);
+        auto *rowDelBtn = new QPushButton(tr("🗑 Delete"), actionWrap);
+        rowDelBtn->setObjectName(QStringLiteral("buttonDeleteRow_") + c.shortCode);
+        rowDelBtn->setToolTip(tr("Permanently delete %1 from disk so it is never published.").arg(c.shortCode));
+        rowDelBtn->setStyleSheet(QStringLiteral(
+            "QPushButton { background: rgba(220, 38, 38, 0.20); border: 1px solid rgba(248, 113, 113, 0.50); "
+            "color: #fca5a5; font-weight: 600; font-size: 11px; padding: 4px 7px; border-radius: 5px; }"
+            "QPushButton:hover { background: rgba(220, 38, 38, 0.42); color: #ffffff; }"));
+        const QString rowCode = c.shortCode;
+        connect(rowDelBtn, &QPushButton::clicked, this, [this, rowCode]() {
+            emit deleteCandidateRequested(rowCode);
+        });
+        actionLayout->addWidget(rowDelBtn);
+        m_table->setCellWidget(r, 4, actionWrap);
         m_table->setRowHeight(r, 122);
     }
 
@@ -1201,7 +1285,12 @@ void WidgetCreativeReview::_rebuildTable(int selectRow)
     m_btnMoveDown->setEnabled(clampedSel >= 0 && clampedSel + 1 < m_rows.size());
     m_btnMoveTop->setEnabled(clampedSel > 0);
     m_btnToggleCheck->setEnabled(clampedSel >= 0);
-    m_btnDeleteCreative->setEnabled(clampedSel >= 0 && clampedSel < m_rows.size());
+    const bool hasValidSel = clampedSel >= 0 && clampedSel < m_rows.size();
+    m_btnDeleteCreative->setEnabled(hasValidSel);
+    if (m_btnDeleteInspector)
+    {
+        m_btnDeleteInspector->setEnabled(hasValidSel);
+    }
 
     m_updatingUi = false;
     _refreshInspector(clampedSel);

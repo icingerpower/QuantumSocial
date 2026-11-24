@@ -2357,6 +2357,7 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
 
     auto *mainLayout = new QVBoxLayout(&dlg);
     auto *reviewWidget = new WidgetCreativeReview(&dlg);
+    reviewWidget->setDeleteButtonVisible(m_projects != nullptr && m_videos != nullptr);
     mainLayout->addWidget(reviewWidget, 1);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -2366,6 +2367,45 @@ bool PanePublishing::_reviewPlannedSelectionDialog(const PublishJobConfig &confi
         okBtn->setObjectName(QStringLiteral("buttonConfirmPublishPlan"));
     }
     mainLayout->addWidget(buttons);
+
+    connect(reviewWidget, &WidgetCreativeReview::deleteCandidateRequested, &dlg,
+            [this, &dlg, reviewWidget](const QString &shortCode) {
+        if (!m_projects || !m_videos || shortCode.trimmed().isEmpty())
+        {
+            return;
+        }
+        const auto *rec = m_videos->recordFromShortCode(shortCode);
+        if (!rec || rec->published || m_videos->hasRetrievedStatistics(rec->id))
+        {
+            return;
+        }
+        const auto ans = QMessageBox::question(
+            &dlg,
+            tr("Delete Unpublished Creative"),
+            tr("Permanently delete unpublished creative %1 from disk so it will never be published?").arg(shortCode),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::Yes);
+        if (ans != QMessageBox::Yes)
+        {
+            return;
+        }
+        reviewWidget->stopPlayback();
+        const QUuid vidId = rec->id;
+        const QString exactCode = rec->shortCode;
+        const int projRow = m_projects->rowOfId(rec->projectId);
+        if (projRow >= 0)
+        {
+            QDir genDir = m_projects->generationDir(projRow, exactCode, false);
+            if (genDir.exists())
+            {
+                genDir.removeRecursively();
+            }
+        }
+        if (m_videos->removeVideo(vidId))
+        {
+            reviewWidget->removeCandidateByShortCode(exactCode);
+        }
+    });
 
     connect(reviewWidget, &WidgetCreativeReview::selectionChanged, &dlg,
             [okBtn](int checked, int) {

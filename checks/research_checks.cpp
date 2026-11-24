@@ -1096,15 +1096,22 @@ void checkResearch(const QDir &callerWorkingDir)
         }
         pane.resize(1180, 560);
         pane.show();
-        {
-            QEventLoop settleLoop;
-            QTimer::singleShot(40, &settleLoop, &QEventLoop::quit);
-            settleLoop.exec();
-        }
-
         auto *scrollArea = pane.findChild<QScrollArea *>("referenceScrollArea");
         requireResearch(scrollArea && scrollArea->verticalScrollBar(), "reference scroll area exists");
         auto *vbar = scrollArea->verticalScrollBar();
+        {
+            QElapsedTimer settleTimer;
+            settleTimer.start();
+            while (vbar->maximum() <= 200 && settleTimer.elapsed() < 500)
+            {
+                if (scrollArea->widget())
+                {
+                    scrollArea->widget()->adjustSize();
+                }
+                QApplication::processEvents();
+                QThread::msleep(15);
+            }
+        }
         requireResearch(vbar->maximum() > 200,
                         QStringLiteral("16+ reference cards make scroll area scrollable (max=%1, vpH=%2, cardsH=%3)")
                             .arg(vbar->maximum())
@@ -2404,19 +2411,32 @@ void checkResearch(const QDir &callerWorkingDir)
             auto *wfProdList = wfPane.findChild<QListWidget *>("listWorkflowProducts");
             auto *wfCheckAll = wfPane.findChild<QPushButton *>("buttonWorkflowCheckAllProducts");
             auto *wfSpinPerProd = wfPane.findChild<QSpinBox *>("spinWorkflowGenPerProduct");
+            auto *wfComboPromptCli = wfPane.findChild<QComboBox *>("comboWorkflowPromptCli");
+            auto *wfComboImageCli = wfPane.findChild<QComboBox *>("comboWorkflowImageCli");
             auto *wfChkVideo = wfPane.findChild<QCheckBox *>("checkWorkflowFormatVideo");
             auto *wfChkCarousel = wfPane.findChild<QCheckBox *>("checkWorkflowFormatCarousel");
             auto *wfChkImage = wfPane.findChild<QCheckBox *>("checkWorkflowFormatImage");
             auto *wfBtnGen = wfPane.findChild<QPushButton *>("buttonWorkflowGenerate");
             auto *wfGenLog = wfPane.findChild<QPlainTextEdit *>("textWorkflowGenLog");
             requireResearch(wfProdList && wfProdList->count() == 2 && wfCheckAll && wfSpinPerProd
+                                && wfComboPromptCli && wfComboPromptCli->currentText().contains("ProductSwap fixture CLI")
+                                && wfComboImageCli && wfComboImageCli->currentText().contains("ProductSwap fixture CLI")
                                 && wfChkVideo && wfChkCarousel && wfChkImage && wfBtnGen && wfGenLog,
-                            "PaneWorkflow Step 1 displays eligible products with controls");
+                            "PaneWorkflow Step 1 displays eligible products, Content/Image CLI selectors, and batch controls");
 
+            auto *wfComboVideoGen = wfPane.findChild<QComboBox *>("comboWorkflowVideoGenerator");
             wfCheckAll->click();
             wfSpinPerProd->setValue(1);
-            wfChkVideo->setChecked(false);
-            wfChkCarousel->setChecked(true);
+            wfChkVideo->setChecked(true);
+            if (wfComboVideoGen)
+            {
+                const int vgIdx = wfComboVideoGen->findData(researchVideoBackend.getId());
+                if (vgIdx >= 0)
+                {
+                    wfComboVideoGen->setCurrentIndex(vgIdx);
+                }
+            }
+            wfChkCarousel->setChecked(false);
             wfChkImage->setChecked(false);
             QApplication::processEvents();
             requireResearch(wfBtnGen->isEnabled() && wfBtnGen->text().contains("Generate 2 Creative(s)"),
@@ -2440,7 +2460,7 @@ void checkResearch(const QDir &callerWorkingDir)
                                 && wfGenLog->toPlainText().contains("Saved"),
                             "Step 1 runs Auto-Batch inline without modal progress dialog and auto-advances to Step 2");
 
-            // Step 2: Review Generated Content inline
+            // Step 2: Review Generated Content inline (1 VIDEO + 1 SLIDESHOW)
             auto *wfCandTable = wfPane.findChild<QTableWidget *>("tableReviewCandidates");
             auto *wfBtnAiSelect = wfPane.findChild<QPushButton *>("buttonWorkflowAiSelect");
             auto *wfBtnToStep3 = wfPane.findChild<QPushButton *>("buttonWorkflowToStep3");
@@ -2456,16 +2476,74 @@ void checkResearch(const QDir &callerWorkingDir)
                 QThread::msleep(20);
             }
             const int rowsBeforeDelete = wfCandTable->rowCount();
-            const QString codeToDelete = wfCandTable->item(rowsBeforeDelete - 1, 2)->text().section(' ', 0, 0);
-            requireResearch(wfPane.deleteCreativeByShortCode(codeToDelete, false)
-                                && wfCandTable->rowCount() == rowsBeforeDelete - 1
+            int nonVideoDelRow = rowsBeforeDelete - 1;
+            for (int r = 0; r < rowsBeforeDelete; ++r)
+            {
+                if (wfCandTable->item(r, 2) && !wfCandTable->item(r, 2)->text().contains("VIDEO"))
+                {
+                    nonVideoDelRow = r;
+                    break;
+                }
+            }
+            const QString codeToDelete = wfCandTable->item(nonVideoDelRow, 2)->text().section(' ', 0, 0);
+            auto *wfInspectorDelBtn = wfPane.findChild<QPushButton *>("buttonDeleteInspectorCreative");
+            auto *wfRowDelBtn = wfPane.findChild<QPushButton *>(QStringLiteral("buttonDeleteRow_") + codeToDelete);
+            requireResearch(wfInspectorDelBtn && wfInspectorDelBtn->isVisible()
+                                && wfRowDelBtn && !wfCandTable->isColumnHidden(4),
+                            "Step 2 exposes visible Delete buttons both under the right preview inspector and on each candidate row");
+            QTimer::singleShot(15, []() {
+                if (auto *msgBox = qobject_cast<QMessageBox *>(QApplication::activeModalWidget()))
+                {
+                    if (auto *yesBtn = msgBox->button(QMessageBox::Yes))
+                    {
+                        yesBtn->click();
+                    }
+                    else
+                    {
+                        msgBox->accept();
+                    }
+                }
+            });
+            wfRowDelBtn->click();
+            QApplication::processEvents();
+            requireResearch(wfCandTable->rowCount() == rowsBeforeDelete - 1
                                 && pubVideos.recordFromShortCode(codeToDelete) == nullptr,
-                            "Step 2 deletes an unwanted unpublished creative from disk, TableVideos, and review table");
+                            "clicking per-row Delete button removes unwanted unpublished creative from disk, TableVideos, and review table");
 
-            requireResearch(wfBtnToStep3->isEnabled(), "Step 2 enables Continue to Step 3 with remaining checked creative");
+            // Start playing the VIDEO candidate in Step 2, then move to Step 3 and verify video/audio stops
+            // and stays stopped even when Step 3 schedule settings refresh WidgetCreativeReview.
+            auto *wfBtnPlayVid = wfPane.findChild<QPushButton *>("buttonPlayPauseCandidateVideo");
+            auto *wfPrevStack = wfPane.findChild<QStackedWidget *>("stackedReviewPreview");
+            auto *wfVidWidget = wfPane.findChild<QVideoWidget *>("videoReviewPlayerWidget");
+            auto *wfVidPlayer = wfPane.findChild<QMediaPlayer *>("playerReviewVideo");
+            requireResearch(wfBtnPlayVid && wfPrevStack && wfVidWidget && wfVidPlayer,
+                            "Step 2 exposes inline video player controls");
+            int wfVideoRow = -1;
+            for (int r = 0; r < wfCandTable->rowCount(); ++r)
+            {
+                if (wfCandTable->item(r, 2) && wfCandTable->item(r, 2)->text().contains("VIDEO"))
+                {
+                    wfVideoRow = r;
+                    break;
+                }
+            }
+            requireResearch(wfVideoRow >= 0, "Step 2 contains newly generated VIDEO creative");
+            wfCandTable->item(wfVideoRow, 0)->setCheckState(Qt::Checked);
+            wfCandTable->selectRow(wfVideoRow);
+            QApplication::processEvents();
+            wfBtnPlayVid->click();
+            QApplication::processEvents();
+            requireResearch(wfPrevStack->currentWidget() == wfVidWidget && wfVidPlayer->source().isLocalFile(),
+                            "Step 2 starts inline video playback when Play Video is clicked");
+
+            requireResearch(wfBtnToStep3->isEnabled(), "Step 2 enables Continue to Step 3 with checked creative");
             wfBtnToStep3->click();
             QApplication::processEvents();
-            requireResearch(wfPane.currentStep() == 2, "Step 2 advances cleanly to Step 3 (Start Auto-Publish Jobs)");
+            requireResearch(wfPane.currentStep() == 2
+                                && wfVidPlayer->playbackState() != QMediaPlayer::PlayingState
+                                && wfVidPlayer->source().isEmpty()
+                                && wfPrevStack->currentWidget() != wfVidWidget,
+                            "Step 2 advances cleanly to Step 3 and immediately stops Step 2 video/audio playback");
 
             // Step 3: Verify live spacing radio buttons + execute Dry-Run Auto-Publish job
             auto *wfRadioFixed = wfPane.findChild<QRadioButton *>("radioWorkflowSpacingFixed");
@@ -2482,8 +2560,11 @@ void checkResearch(const QDir &callerWorkingDir)
             wfChkDryRun->setChecked(true);
             wfPane.setUploadUrlOverride(QStringLiteral("file://") + studioHtmlPath);
             QApplication::processEvents();
-            requireResearch(wfQueueTable->rowCount() >= 1 && wfBtnStartPub->isEnabled(),
-                            "Step 3 previews scheduled queue from Step 2 selection before job starts");
+            requireResearch(wfQueueTable->rowCount() >= 1
+                                && wfBtnStartPub->isEnabled()
+                                && wfVidPlayer->playbackState() != QMediaPlayer::PlayingState
+                                && wfVidPlayer->source().isEmpty(),
+                            "Step 3 previews scheduled queue and never restarts hidden Step 2 video playback");
 
             wfBtnStartPub->click();
             QElapsedTimer wfPubWait;
