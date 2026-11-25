@@ -16,6 +16,9 @@ QString VideoGeneratorGemini::getName() const
 QList<AbstractVideoGenerator::SettingSpec> VideoGeneratorGemini::availableSettings() const
 {
     return {
+        {QStringLiteral("deleteChatOnFinish"),
+         QObject::tr("Automatically delete the Gemini chat once the video is downloaded or if the chat is abandoned after failure"),
+         true},
         {QStringLiteral("closeBrowserOnFinish"),
          QObject::tr("Automatically close the browser once video generation is complete (releases Chrome profile lock)"),
          true},
@@ -36,6 +39,9 @@ QList<AbstractVideoGenerator::SettingSpec> VideoGeneratorGemini::availableSettin
          QObject::tr("After a refusal, quick retries in the same browser with "
                      "a tiny prompt edit (add/remove a dot) before giving up"),
          3},
+        {QStringLiteral("capacityCooldownSec"),
+         QObject::tr("Base cooldown seconds to wait when Gemini reports high traffic / full capacity before retrying"),
+         30},
         {QStringLiteral("attemptStallTimeoutSec"),
          QObject::tr("Seconds without any reply before one attempt is "
                      "considered silently refused and retried"),
@@ -93,6 +99,45 @@ QCoro::Task<AbstractVideoGenerator::Result> VideoGeneratorGemini::generate(
 
     co_return co_await runGeneratorScript(QStringLiteral("generate_video_gemini.py"),
                                            prompt, imagePaths, outputDir, settings);
+}
+
+QCoro::Task<void> VideoGeneratorGemini::deleteConversation(
+    const QString &conversationUrl, const QVariantMap &settings) const
+{
+    co_await runDeleteConversationInWorker(conversationUrl, settings);
+}
+
+QCoro::Task<AbstractVideoGenerator::DeleteConversationsResult>
+VideoGeneratorGemini::deleteConversations(
+    const QStringList &conversationUrls, const QVariantMap &settings) const
+{
+    const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
+    if (python.isEmpty())
+    {
+        DeleteConversationsResult result;
+        result.failedUrls = conversationUrls;
+        result.errorMessage = QObject::tr("python3 was not found on PATH.");
+        co_return result;
+    }
+
+    QProcess dependencyCheck;
+    dependencyCheck.start(python,
+        {QStringLiteral("-c"), QStringLiteral("import playwright")});
+    if (!dependencyCheck.waitForStarted(5000)
+        || !dependencyCheck.waitForFinished(10000)
+        || dependencyCheck.exitStatus() != QProcess::NormalExit
+        || dependencyCheck.exitCode() != 0)
+    {
+        DeleteConversationsResult result;
+        result.failedUrls = conversationUrls;
+        result.errorMessage = QObject::tr(
+            "Python Playwright is not installed for %1. Install it with "
+            "'python3 -m pip install playwright', then retry.").arg(python);
+        co_return result;
+    }
+
+    co_return co_await runDeleteConversationsInWorker(
+        QStringLiteral("generate_video_gemini.py"), conversationUrls, settings);
 }
 
 DECLARE_VIDEO_GENERATOR(VideoGeneratorGemini)

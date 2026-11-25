@@ -36,6 +36,11 @@ bool AbstractVideoGenerator::isWorkerRunning() const
 
 void AbstractVideoGenerator::stopWorker()
 {
+    _stopWorkerInternal();
+}
+
+void AbstractVideoGenerator::_stopWorkerInternal() const
+{
     if (!m_worker)
     {
         return;
@@ -102,6 +107,202 @@ QList<AbstractVideoGenerator::SettingSpec> AbstractVideoGenerator::availableSett
 double AbstractVideoGenerator::continuationDurationSeconds(const QVariantMap &) const
 {
     return 0.0;
+}
+
+QCoro::Task<void> AbstractVideoGenerator::deleteConversation(
+    const QString &conversationUrl, const QVariantMap &settings) const
+{
+    Q_UNUSED(conversationUrl);
+    Q_UNUSED(settings);
+    co_return;
+}
+
+QCoro::Task<AbstractVideoGenerator::DeleteConversationsResult>
+AbstractVideoGenerator::deleteConversations(
+    const QStringList &conversationUrls, const QVariantMap &settings) const
+{
+    Q_UNUSED(settings);
+    DeleteConversationsResult res;
+    res.failedUrls = conversationUrls;
+    if (!conversationUrls.isEmpty())
+    {
+        res.errorMessage = QObject::tr("Conversation cleanup is not supported by %1.").arg(getName());
+    }
+    co_return res;
+}
+
+QCoro::Task<void> AbstractVideoGenerator::runDeleteConversationInWorker(
+    const QString &conversationUrl, const QVariantMap &settings) const
+{
+    if (conversationUrl.trimmed().isEmpty() || !isWorkerRunning())
+    {
+        co_return;
+    }
+    QJsonObject request;
+    request.insert(QStringLiteral("deleteConversation"), true);
+    request.insert(QStringLiteral("conversationUrl"), conversationUrl.trimmed());
+    request.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(settings));
+    m_worker->write(QJsonDocument{request}.toJson(QJsonDocument::Compact) + "\n");
+
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < 20000)
+    {
+        if (m_worker->canReadLine())
+        {
+            const QByteArray line = m_worker->readLine().trimmed();
+            if (line.isEmpty())
+            {
+                continue;
+            }
+            QJsonParseError parseError;
+            const QJsonDocument doc = QJsonDocument::fromJson(line, &parseError);
+            if (parseError.error == QJsonParseError::NoError && doc.isObject())
+            {
+                break;
+            }
+            continue;
+        }
+        if (m_worker->state() == QProcess::NotRunning)
+        {
+            break;
+        }
+        co_await QCoro::sleepFor(std::chrono::milliseconds(50));
+    }
+}
+
+QCoro::Task<AbstractVideoGenerator::DeleteConversationsResult>
+AbstractVideoGenerator::runDeleteConversationsInWorker(
+    const QString &scriptFileName,
+    const QStringList &conversationUrls,
+    const QVariantMap &settings) const
+{
+    DeleteConversationsResult result;
+    QStringList cleanedUrls;
+    for (const QString &raw : conversationUrls)
+    {
+        const QString trimmed = raw.trimmed();
+        if (!trimmed.isEmpty() && !cleanedUrls.contains(trimmed))
+        {
+            cleanedUrls.append(trimmed);
+        }
+    }
+    if (cleanedUrls.isEmpty())
+    {
+        co_return result;
+    }
+
+    const QString python = QStandardPaths::findExecutable(QStringLiteral("python3"));
+    if (python.isEmpty())
+    {
+        result.failedUrls = cleanedUrls;
+        result.errorMessage = QObject::tr("python3 was not found on PATH.");
+        co_return result;
+    }
+
+    const QString scriptPath = QDir(QString::fromUtf8(VIDEO_GEN_SCRIPT_DIR))
+        .filePath(scriptFileName);
+    if (!QFileInfo::exists(scriptPath))
+    {
+        result.failedUrls = cleanedUrls;
+        result.errorMessage = QObject::tr("Video generator script not found at %1 "
+            "(stale build? re-run cmake).").arg(scriptPath);
+        co_return result;
+    }
+
+    const bool wasRunning = isWorkerRunning();
+    if (!wasRunning)
+    {
+        m_worker = std::make_unique<QProcess>();
+        m_worker->setProcessChannelMode(QProcess::SeparateChannels);
+        const QStringList workerArgs{scriptPath, QStringLiteral("--worker")};
+        m_worker->start(python, workerArgs);
+        if (!m_worker->waitForStarted(5000))
+        {
+            result.failedUrls = cleanedUrls;
+            result.errorMessage = QObject::tr("Could not start the video generator (%1).")
+                .arg(m_worker->errorString());
+            m_worker.reset();
+            co_return result;
+        }
+    }
+
+    QJsonObject request;
+    request.insert(QStringLiteral("deleteConversations"), true);
+    request.insert(QStringLiteral("conversationUrls"), QJsonArray::fromStringList(cleanedUrls));
+    request.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(settings));
+    m_worker->write(QJsonDocument{request}.toJson(QJsonDocument::Compact) + "\n");
+
+    const qint64 perChatBudgetMs = static_cast<qint64>(cleanedUrls.size()) * 25000 + 30000;
+    const qint64 timeoutMs = wasRunning ? qMax<qint64>(60000, perChatBudgetMs)
+                                        : qMax<qint64>(360000, perChatBudgetMs);
+    QElapsedTimer timer;
+    timer.start();
+    QJsonDocument doc;
+    while (timer.elapsed() < timeoutMs)
+    {
+        if (m_worker->canReadLine())
+        {
+            const QByteArray line = m_worker->readLine().trimmed();
+            if (line.isEmpty())
+            {
+                continue;
+            }
+            QJsonParseError parseError;
+            doc = QJsonDocument::fromJson(line, &parseError);
+            if (parseError.error == QJsonParseError::NoError && doc.isObject())
+            {
+                break;
+            }
+            doc = QJsonDocument{};
+            continue;
+        }
+        if (m_worker->state() == QProcess::NotRunning)
+        {
+            break;
+        }
+        co_await QCoro::sleepFor(std::chrono::milliseconds(80));
+    }
+
+    if (doc.isNull() || !doc.isObject())
+    {
+        const QByteArray stderrOutput = m_worker->readAllStandardError().trimmed();
+        result.failedUrls = cleanedUrls;
+        result.errorMessage = m_worker->state() == QProcess::NotRunning
+            ? QObject::tr("The video generator worker stopped unexpectedly%1")
+                .arg(stderrOutput.isEmpty() ? QString{}
+                    : QObject::tr(": %1").arg(QString::fromUtf8(stderrOutput).left(300)))
+            : QObject::tr("Timed out while deleting Gemini chats.");
+        m_worker->kill();
+        m_worker->waitForFinished(2000);
+        m_worker.reset();
+        co_return result;
+    }
+
+    const QJsonObject obj = doc.object();
+    for (const QJsonValue &val : obj.value(QStringLiteral("deleted")).toArray())
+    {
+        const QString url = val.toString().trimmed();
+        if (!url.isEmpty())
+        {
+            result.deletedUrls.append(url);
+        }
+    }
+    for (const QJsonValue &val : obj.value(QStringLiteral("failed")).toArray())
+    {
+        const QString url = val.toString().trimmed();
+        if (!url.isEmpty())
+        {
+            result.failedUrls.append(url);
+        }
+    }
+    result.errorMessage = obj.value(QStringLiteral("error")).toString().trimmed();
+
+    if (!wasRunning && settings.value(QStringLiteral("closeBrowserOnFinish"), true).toBool())
+    {
+        _stopWorkerInternal();
+    }
+    co_return result;
 }
 
 QCoro::Task<AbstractVideoGenerator::Result> AbstractVideoGenerator::runGeneratorScript(

@@ -88,6 +88,24 @@ public:
                                          const QString &outputDir,
                                          const QVariantMap &settings) const = 0;
 
+    struct DeleteConversationsResult
+    {
+        QStringList deletedUrls;
+        QStringList failedUrls;
+        QString errorMessage;
+    };
+
+    // Best-effort cleanup of a remote conversation (e.g. after a multi-video
+    // workflow finishes downloading its final step or is abandoned). Default: no-op.
+    virtual QCoro::Task<void> deleteConversation(const QString &conversationUrl,
+                                                 const QVariantMap &settings) const;
+
+    // Deletes one or more remote conversations (launching the backend worker on
+    // demand if it is not already running). Default: unsupported.
+    virtual QCoro::Task<DeleteConversationsResult> deleteConversations(
+        const QStringList &conversationUrls,
+        const QVariantMap &settings) const;
+
     // Shuts down this backend's persistent worker process (if running),
     // which cleanly closes the browser context and releases any profile locks.
     void stopWorker();
@@ -135,8 +153,15 @@ protected:
                                            const QStringList &imagePaths,
                                            const QString &outputDir,
                                            const QVariantMap &settings) const;
+    QCoro::Task<void> runDeleteConversationInWorker(const QString &conversationUrl,
+                                                    const QVariantMap &settings) const;
+    QCoro::Task<DeleteConversationsResult> runDeleteConversationsInWorker(
+        const QString &scriptFileName,
+        const QStringList &conversationUrls,
+        const QVariantMap &settings) const;
 
 private:
+    void _stopWorkerInternal() const;
     // This backend's worker (see runGeneratorScript). mutable because
     // generate() — and so runGeneratorScript() — is const on what are
     // process-wide singletons.

@@ -98,6 +98,7 @@ public:
 
     QString lastConversationUrl() const { return m_lastConversationUrl; }
     bool promptSubmitted() const { return m_promptSubmitted; }
+    bool quotaExceeded() const { return m_quotaExceeded; }
 
 signals:
     void progress(const QString &message);
@@ -109,6 +110,7 @@ private:
     bool m_cancelled = false;
     QString m_lastConversationUrl;
     bool m_promptSubmitted = false;
+    bool m_quotaExceeded = false;
     QCoro::Task<void> m_task;
 
     QCoro::Task<void> _run(Request request);

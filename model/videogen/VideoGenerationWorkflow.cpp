@@ -217,6 +217,7 @@ void VideoGenerationWorkflow::start(const Request &request)
     m_running = true;
     m_cancelled = false;
     m_promptSubmitted = false;
+    m_quotaExceeded = false;
     m_lastConversationUrl.clear();
     m_task = _run(request);
 }
@@ -286,6 +287,10 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             }
             if (!result.videoPath.isEmpty() || !result.retryable || result.quotaExceeded || m_cancelled)
             {
+                if (result.quotaExceeded)
+                {
+                    m_quotaExceeded = true;
+                }
                 break;
             }
             if (result.browserLost && browserRecoveries < maxBrowserRecoveries)
@@ -411,6 +416,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             }
             if (result.quotaExceeded)
             {
+                m_quotaExceeded = true;
                 _finish({}, result.errorMessage);
                 co_return;
             }
@@ -446,6 +452,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
                     if (replyObj.value(QStringLiteral("quota")).toBool())
                     {
                         result.quotaExceeded = true;
+                        m_quotaExceeded = true;
                         const QString reason = replyObj.value(QStringLiteral("reason")).toString();
                         _finish({}, tr("Video quota reached (%1): %2")
                             .arg(generator->getName(), reason.isEmpty() ? result.errorMessage : reason));
@@ -530,6 +537,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             const QJsonObject reply = parseJsonReply(decision.output);
             if (reply.value(QStringLiteral("action")).toString() == QLatin1String("quota"))
             {
+                m_quotaExceeded = true;
                 const QString reason = reply.value(QStringLiteral("reason")).toString();
                 _finish({}, tr("Video quota reached (%1): %2")
                     .arg(generator->getName(), reason.isEmpty() ? lastError : reason));

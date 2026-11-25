@@ -16,6 +16,11 @@ public:
                                  const QStringList &imagePaths,
                                  const QString &outputDir,
                                  const QVariantMap &settings) const override;
+    QCoro::Task<void> deleteConversation(const QString &conversationUrl,
+                                         const QVariantMap &settings) const override;
+    QCoro::Task<DeleteConversationsResult> deleteConversations(
+        const QStringList &conversationUrls,
+        const QVariantMap &settings) const override;
 };
 
 #endif // VIDEOGENERATORGEMINI_H

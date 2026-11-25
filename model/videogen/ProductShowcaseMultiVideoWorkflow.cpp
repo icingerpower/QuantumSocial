@@ -8,9 +8,11 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
+#include <QSet>
 #include <QTimer>
 
 #include "AbstractCli.h"
+#include "AbstractVideoGenerator.h"
 #include "VideoClipProcessing.h"
 #include "model/imagegen/AbstractImageGenerator.h"
 
@@ -425,6 +427,25 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
     {
         if (m_cancelled)
         {
+            if (auto *gen = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(m_generatorId))
+            {
+                QSet<QString> urlsToDelete;
+                if (!m_conversationUrl.isEmpty())
+                {
+                    urlsToDelete.insert(m_conversationUrl);
+                }
+                for (const auto &t : m_takes)
+                {
+                    if (!t.conversationUrl.isEmpty())
+                    {
+                        urlsToDelete.insert(t.conversationUrl);
+                    }
+                }
+                for (const QString &u : urlsToDelete)
+                {
+                    co_await gen->deleteConversation(u, m_settings);
+                }
+            }
             setState(State::Cancelled, tr("Cancelled."));
             _saveState();
             emit failed(tr("Cancelled."));
@@ -490,6 +511,11 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
             take.failed = true;
             take.errorMessage = err;
             _saveState();
+            if (auto *gen = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(m_generatorId);
+                gen && !m_conversationUrl.isEmpty())
+            {
+                co_await gen->deleteConversation(m_conversationUrl, m_settings);
+            }
             setState(State::Error, err);
             emit failed(err);
             co_return;
@@ -516,6 +542,12 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
             request.chatMode = QStringLiteral("fresh");
             request.messageAction = QStringLiteral("new");
             request.conversationUrl.clear();
+            if (m_steps.size() > 1)
+            {
+                // Preserve Step 1's winning chat so Step 2+ can continue in it
+                // (failed Step 1 attempts still delete their abandoned chats).
+                request.settings.insert(QStringLiteral("keepConversation"), true);
+            }
         }
         else
         {
@@ -603,6 +635,25 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
 
         if (m_cancelled)
         {
+            if (auto *gen = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(m_generatorId))
+            {
+                QSet<QString> urlsToDelete;
+                if (!m_conversationUrl.isEmpty())
+                {
+                    urlsToDelete.insert(m_conversationUrl);
+                }
+                for (const auto &t : m_takes)
+                {
+                    if (!t.conversationUrl.isEmpty())
+                    {
+                        urlsToDelete.insert(t.conversationUrl);
+                    }
+                }
+                for (const QString &u : urlsToDelete)
+                {
+                    co_await gen->deleteConversation(u, m_settings);
+                }
+            }
             setState(State::Cancelled, tr("Cancelled."));
             _saveState();
             emit failed(tr("Cancelled."));
@@ -680,7 +731,26 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
         }
     }
 
-    // All takes completed!
+    // All takes completed! Clean up any Gemini conversation(s) used by this workflow.
+    if (auto *gen = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(m_generatorId))
+    {
+        QSet<QString> urlsToDelete;
+        if (!m_conversationUrl.isEmpty())
+        {
+            urlsToDelete.insert(m_conversationUrl);
+        }
+        for (const auto &t : m_takes)
+        {
+            if (!t.conversationUrl.isEmpty())
+            {
+                urlsToDelete.insert(t.conversationUrl);
+            }
+        }
+        for (const QString &u : urlsToDelete)
+        {
+            co_await gen->deleteConversation(u, m_settings);
+        }
+    }
     setState(State::Completed);
     _saveState();
 

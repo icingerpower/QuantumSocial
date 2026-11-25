@@ -5,6 +5,9 @@ Requires Playwright and its Chromium browser.
 """
 import base64
 import io
+import json
+import os
+import sys
 import tempfile
 import time
 import unittest
@@ -914,6 +917,321 @@ class GeminiSubmissionTests(unittest.TestCase):
             worker._ensure_imperative_video_prompt("Video: Close-up on the heels."),
             "Generate a video: Close-up on the heels."
         )
+
+    def test_delete_current_chat_via_header_conversation_actions_french(self):
+        self.page.set_content("""
+            <header style="height:56px;">
+                <conversation-actions>
+                    <button data-test-id="actions-menu-button" id="hdr_menu">Options</button>
+                </conversation-actions>
+            </header>
+            <div class="cdk-overlay-pane" id="menu_overlay" hidden>
+                <div role="menu">
+                    <button role="menuitem">Épingler</button>
+                    <button role="menuitem" data-test-id="delete-button" id="del_item">Supprimer</button>
+                </div>
+            </div>
+            <mat-dialog-container id="confirm_dlg" hidden>
+                <p>Supprimer la discussion ?</p>
+                <mat-dialog-actions>
+                    <button>Annuler</button>
+                    <button data-test-id="confirm-button" id="confirm_del">Supprimer</button>
+                </mat-dialog-actions>
+            </mat-dialog-container>
+            <script>
+                window.deletedChat = false;
+                hdr_menu.onclick = () => { menu_overlay.hidden = false; };
+                del_item.onclick = () => { menu_overlay.hidden = true; confirm_dlg.hidden = false; };
+                confirm_del.onclick = () => { window.deletedChat = true; confirm_dlg.hidden = true; };
+            </script>
+        """)
+        with patch.object(type(self.page), "url", new_callable=lambda: property(lambda _: (
+            "https://gemini.google.com/app" if self.page.evaluate("window.deletedChat")
+            else "https://gemini.google.com/app/chat_abc12345"
+        ))):
+            self.assertTrue(worker._delete_current_chat(self.page))
+        self.assertTrue(self.page.evaluate("window.deletedChat"))
+
+    def test_delete_current_chat_via_collapsed_sidebar_matching_chat_id_only(self):
+        self.page.set_content("""
+            <header style="height:56px;">
+                <button data-test-id="side-nav-menu-button" id="hamburger" aria-label="Menu principal">☰</button>
+            </header>
+            <nav id="sidenav" hidden>
+                <div class="conversation-items-container">
+                    <a data-test-id="conversation" href="/app/other_personal_chat">Personal Chat</a>
+                    <button data-test-id="actions-menu-button" id="other_dots">...</button>
+                </div>
+                <div class="conversation-items-container">
+                    <a data-test-id="conversation" href="/app/veo_target_98765" id="target_link">Veo Video</a>
+                    <button data-test-id="actions-menu-button" id="target_dots">...</button>
+                </div>
+            </nav>
+            <div class="cdk-overlay-pane" id="overlay" hidden>
+                <div role="menu">
+                    <button role="menuitem" id="del_opt">Delete</button>
+                </div>
+            </div>
+            <div role="dialog" id="dlg" hidden>
+                <button id="cancel_btn">Cancel</button>
+                <button id="confirm_btn">Delete</button>
+            </div>
+            <script>
+                window.otherClicked = false;
+                window.targetDeleted = false;
+                hamburger.onclick = () => { sidenav.hidden = false; };
+                other_dots.onclick = () => { window.otherClicked = true; };
+                target_dots.onclick = () => { overlay.hidden = false; };
+                del_opt.onclick = () => { overlay.hidden = true; dlg.hidden = false; };
+                confirm_btn.onclick = () => {
+                    window.targetDeleted = true;
+                    target_link.parentElement.remove();
+                    dlg.hidden = true;
+                };
+            </script>
+        """)
+        with patch.object(type(self.page), "url", new_callable=lambda: property(lambda _: (
+            "https://gemini.google.com/app" if self.page.evaluate("window.targetDeleted")
+            else "https://gemini.google.com/app/veo_target_98765"
+        ))):
+            self.assertTrue(worker._delete_current_chat(self.page))
+        self.assertFalse(self.page.evaluate("window.otherClicked"))
+        self.assertTrue(self.page.evaluate("window.targetDeleted"))
+
+    def test_delete_current_chat_never_deletes_sidebar_when_no_chat_id_in_url(self):
+        self.page.set_content("""
+            <nav>
+                <div class="conversation-items-container">
+                    <a data-test-id="conversation" href="/app/user_important_chat">Important Chat</a>
+                    <button data-test-id="actions-menu-button" id="dots">...</button>
+                </div>
+            </nav>
+            <script>
+                window.dotsClicked = false;
+                dots.onclick = () => { window.dotsClicked = true; };
+            </script>
+        """)
+        with patch.object(type(self.page), "url", new_callable=lambda: property(lambda _: "https://gemini.google.com/app")):
+            self.assertFalse(worker._delete_current_chat(self.page))
+        self.assertFalse(self.page.evaluate("window.dotsClicked"))
+
+    def test_generate_once_deletes_chat_after_download_and_after_abandoned_failure(self):
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://gemini.google.com/app/chat_try_1"
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_wait_ready_or_login", return_value="ready"), \
+                patch.object(worker, "_delete_current_chat", return_value=True) as delete_chat, \
+                patch.object(worker, "_run_attempt", side_effect=[
+                    ("rejected", "high traffic"),
+                    ("video", "/saved/final.mp4"),
+                ]):
+            result, _ = worker._generate_once(None, page, "Prompt.", [], directory, {})
+        self.assertEqual(result["video"], "/saved/final.mp4")
+        # Deleted once for the abandoned rejected chat, and once after downloading the video!
+        self.assertEqual(delete_chat.call_count, 2)
+
+    def test_generate_once_deletes_abandoned_chat_on_terminal_error_and_preserves_multi_video_step1(self):
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://gemini.google.com/app/chat_step_0"
+
+        # 1) Multi-video Step 0 (keepConversation=True): failed attempt deletes abandoned chat,
+        #    successful download keeps the winning chat for Step 2 continuation!
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_wait_ready_or_login", return_value="ready"), \
+                patch.object(worker, "_delete_current_chat", return_value=True) as delete_chat, \
+                patch.object(worker, "_run_attempt", side_effect=[
+                    ("stalled", "no reply"),
+                    ("video", "/saved/intro.mp4"),
+                ]):
+            result, _ = worker._generate_once(
+                None, page, "Intro prompt.", [], directory, {"keepConversation": True})
+        self.assertEqual(result["video"], "/saved/intro.mp4")
+        self.assertEqual(delete_chat.call_count, 1)
+
+        # 2) Terminal error after chat was created: abandoned chat is deleted before returning!
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_delete_current_chat", return_value=True) as delete_chat, \
+                patch.object(worker, "_run_attempt", return_value=("error", "download failed")):
+            result, _ = worker._generate_once(None, page, "Prompt.", [], directory, {})
+        self.assertIsNone(result["video"])
+        self.assertEqual(delete_chat.call_count, 1)
+
+    def test_delete_current_chat_handles_multi_account_u4_url_and_mat_icon_controls(self):
+        self.page.set_content("""
+            <header style="height:56px;">
+                <button data-test-id="side-nav-menu-button" id="hamburger" aria-label="Menu principal">☰</button>
+            </header>
+            <nav id="sidenav" hidden>
+                <div class="conversation-items-container">
+                    <a data-test-id="conversation" href="/u/4/app/4b0fabcb65a95129?pageId=none" id="u4_link">Video</a>
+                    <button id="u4_dots"><mat-icon fonticon="more_vert"></mat-icon></button>
+                </div>
+            </nav>
+            <div class="cdk-overlay-pane" id="overlay" hidden>
+                <div role="menu">
+                    <button role="menuitem" id="del_icon_btn"><mat-icon fonticon="delete"></mat-icon><span>Supprimer</span></button>
+                </div>
+            </div>
+            <mat-dialog-container id="dlg" hidden>
+                <mat-dialog-actions>
+                    <button>Annuler</button>
+                    <button id="confirm_btn">Supprimer</button>
+                </mat-dialog-actions>
+            </mat-dialog-container>
+            <script>
+                window.deletedU4 = false;
+                hamburger.onclick = () => { sidenav.hidden = false; };
+                u4_dots.onclick = () => { overlay.hidden = false; };
+                del_icon_btn.onclick = () => { overlay.hidden = true; dlg.hidden = false; };
+                confirm_btn.onclick = () => {
+                    window.deletedU4 = true;
+                    u4_link.parentElement.remove();
+                    dlg.hidden = true;
+                };
+            </script>
+        """)
+        with patch.object(type(self.page), "url", new_callable=lambda: property(lambda _: (
+            "https://gemini.google.com/u/4/app" if self.page.evaluate("window.deletedU4")
+            else "https://gemini.google.com/u/4/app/4b0fabcb65a95129?pageId=none&pli=1"
+        ))):
+            self.assertTrue(worker._delete_current_chat(self.page))
+        self.assertTrue(self.page.evaluate("window.deletedU4"))
+
+    def test_capacity_saturation_uses_cooldown_and_escalates_as_quota_when_persistent(self):
+        page = Mock()
+        page.is_closed.return_value = False
+        page.url = "https://gemini.google.com/u/4/app/cap_chat_123"
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(worker, "_wait_ready_or_login", return_value="ready"), \
+                patch.object(worker, "_delete_current_chat", return_value=True) as delete_chat, \
+                patch.object(worker.time, "sleep") as sleep_mock, \
+                patch.object(worker, "_run_attempt", return_value=(
+                    "capacity", "I'm experiencing unusually high traffic right now generating videos and am at full capacity.")):
+            result, _ = worker._generate_once(
+                None, page, "Keep exact prompt.", [], directory,
+                {"inPageRejectionRetries": 2, "capacityCooldownSec": 15})
+        self.assertTrue(result["quotaExceeded"])
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["rejected"])
+        self.assertEqual(delete_chat.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [15, 30])
+        # Multi-account /u/4/app prefix is preserved when navigating to fresh chat on retry
+        for call in page.goto.call_args_list:
+            self.assertEqual(call.args[0], "https://gemini.google.com/u/4/app")
+
+    def test_chat_cache_records_dedupes_and_removes_on_confirmed_delete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = os.path.join(directory, "gemini_chat_cache.json")
+            with patch.dict(os.environ, {worker.CHAT_CACHE_ENV: cache_file}):
+                url = "https://gemini.google.com/u/4/app/4b0fabcb65a95129?pageId=none&pli=1"
+                self.assertTrue(worker._record_cached_chat(url, status="active"))
+                first = worker._load_chat_cache()
+                self.assertEqual(len(first), 1)
+                created_at = first[0]["createdAt"]
+                self.assertEqual(first[0]["chatId"], "4b0fabcb65a95129")
+                self.assertEqual(first[0]["status"], "active")
+
+                # Recording again updates status without losing creation date or duplicating
+                self.assertTrue(worker._record_cached_chat(url, status="delete_failed"))
+                second = worker._load_chat_cache()
+                self.assertEqual(len(second), 1)
+                self.assertEqual(second[0]["createdAt"], created_at)
+                self.assertEqual(second[0]["status"], "delete_failed")
+
+                # Confirmed deletion in DOM automatically removes it from the cache
+                self.page.set_content("""
+                    <header style="height:56px;">
+                        <conversation-actions>
+                            <button data-test-id="actions-menu-button" id="hdr_menu">⋮</button>
+                        </conversation-actions>
+                    </header>
+                    <div class="cdk-overlay-pane" id="overlay" hidden>
+                        <div role="menu">
+                            <button role="menuitem" id="del_item">Delete</button>
+                        </div>
+                    </div>
+                    <div role="dialog" id="dlg" hidden>
+                        <button id="confirm_btn">Delete</button>
+                    </div>
+                    <script>
+                        window.deletedCached = false;
+                        hdr_menu.onclick = () => { overlay.hidden = false; };
+                        del_item.onclick = () => { overlay.hidden = true; dlg.hidden = false; };
+                        confirm_btn.onclick = () => { window.deletedCached = true; dlg.hidden = true; };
+                    </script>
+                """)
+                with patch.object(type(self.page), "url", new_callable=lambda: property(lambda _: (
+                    "https://gemini.google.com/u/4/app" if self.page.evaluate("window.deletedCached")
+                    else url
+                ))):
+                    self.assertTrue(worker._delete_current_chat(self.page))
+                self.assertEqual(worker._load_chat_cache(), [])
+
+    def test_delete_current_chat_removes_cache_when_redirected_already_gone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = os.path.join(directory, "gemini_chat_cache.json")
+            with patch.dict(os.environ, {worker.CHAT_CACHE_ENV: cache_file}):
+                url = "https://gemini.google.com/u/4/app/gone_chat_777"
+                worker._record_cached_chat(url, status="active")
+                page = Mock()
+                page.is_closed.return_value = False
+                page.url = "https://gemini.google.com/u/4/app"
+                with patch.object(worker, "_wait_ready_or_login", return_value="ready"), \
+                        patch.object(worker, "_login_in_progress", return_value=False):
+                    self.assertTrue(worker._delete_current_chat(page, url))
+                self.assertEqual(worker._load_chat_cache(), [])
+
+    def test_worker_main_handles_batch_delete_conversations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = os.path.join(directory, "gemini_chat_cache.json")
+            u1 = "https://gemini.google.com/u/4/app/batch_chat_001"
+            u2 = "https://gemini.google.com/u/4/app/batch_chat_002"
+            with patch.dict(os.environ, {worker.CHAT_CACHE_ENV: cache_file}):
+                worker._record_cached_chat(u1, status="active")
+                worker._record_cached_chat(u2, status="delete_failed")
+
+                fake_page = Mock()
+                fake_page.is_closed.return_value = False
+                fake_page.url = "https://gemini.google.com/u/4/app"
+                fake_ctx = Mock()
+                fake_ctx.pages = [fake_page]
+                fake_pw = Mock()
+                fake_sync_pw = Mock()
+                fake_sync_pw.return_value.start.return_value = fake_pw
+
+                req_line = json.dumps({
+                    "deleteConversations": True,
+                    "conversationUrls": [u1, u2],
+                    "settings": {"useSystemChromeProfile": False, "requireUltra": True},
+                }) + "\n"
+                stdout_buf = io.StringIO()
+
+                def fake_delete(_page, target_url=None):
+                    if target_url == u1:
+                        worker._remove_cached_chat(u1)
+                        return True
+                    return False
+
+                fake_pw_mod = Mock()
+                fake_pw_mod.sync_playwright = fake_sync_pw
+                with patch.dict(sys.modules, {"playwright.sync_api": fake_pw_mod}), \
+                        patch.object(worker, "_launch_context", return_value=(fake_ctx, "mock", None)), \
+                        patch.object(worker, "_prepare_page", return_value=(fake_page, None)), \
+                        patch.object(worker, "_delete_current_chat", side_effect=fake_delete), \
+                        patch.object(sys, "stdin", io.StringIO(req_line)), \
+                        patch.object(sys, "stdout", stdout_buf):
+                    rc = worker._worker_main()
+
+                self.assertEqual(rc, 0)
+                resp = json.loads(stdout_buf.getvalue().strip().splitlines()[-1])
+                self.assertEqual(resp["deleted"], [u1])
+                self.assertEqual(resp["failed"], [u2])
+                self.assertIsNone(resp["error"])
+                remaining = worker._load_chat_cache()
+                self.assertEqual([e["url"] for e in remaining], [u2])
 
 
 if __name__ == "__main__":

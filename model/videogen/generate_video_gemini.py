@@ -53,8 +53,10 @@ Prints a single JSON line to stdout:
 
 Usage: generate_video_gemini.py <prompt-file> <output-dir> <settings-json> [image-path...]
 Settings used: generationTimeoutSec (default 900),
-useSystemChromeProfile (default true), requireUltra (default true).
+useSystemChromeProfile (default true), requireUltra (default true),
+deleteChatOnFinish (default true).
 """
+import datetime
 import glob
 import hashlib
 import json
@@ -62,6 +64,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 
 from gemini_downloads import install_video_capture
@@ -69,6 +72,8 @@ from gemini_downloads import install_video_capture
 PROFILE_DIR = os.path.expanduser("~/.cache/quantumsocial/gemini-profile")
 SYSTEM_CHROME_PROFILE = os.path.expanduser("~/.config/google-chrome")
 ULTRA_CACHE = os.path.expanduser("~/.cache/quantumsocial/gemini_ultra_account.json")
+CHAT_CACHE_DEFAULT_PATH = os.path.expanduser("~/.cache/quantumsocial/gemini_chat_cache.json")
+CHAT_CACHE_ENV = "QS_GEMINI_CHAT_CACHE_PATH"
 GEMINI_URL = "https://gemini.google.com/app"
 
 LOGGED_OUT_MARKERS = ("Sign in", "Connexion", "Se connecter")
@@ -77,6 +82,17 @@ LOGIN_POLL_INTERVAL_S = 2
 
 VIDEO_TOOL_NAMES = ("Video", "Vidéo", "Veo")
 DOWNLOAD_NAMES = ("Download", "Télécharger")
+CHAT_ID_RE = re.compile(r"/app/([a-zA-Z0-9_-]{6,})")
+DELETE_ACTION_RE = re.compile(r"\b(Supprimer|Delete)\b", re.IGNORECASE)
+CANCEL_ACTION_RE = re.compile(r"\b(Annuler|Cancel)\b", re.IGNORECASE)
+SIDEBAR_TOGGLE_SELECTORS = (
+    'button[data-test-id="side-nav-menu-button"]',
+    'button[aria-label*="Menu principal" i]',
+    'button[aria-label*="Main menu" i]',
+    'button[aria-label*="Ouvrir le menu" i]',
+    'button[aria-label*="Expand menu" i]',
+    'button[aria-label="Menu"]',
+)
 
 # Gemini's own "still working on it" indicator, shown while Veo is actively
 # generating (observed live: still present after a full 5-minute stall
@@ -189,6 +205,21 @@ VIDEO_QUOTA_MARKERS = (
     "daily generation limit",
     "daily limit",
     "limite quotidienne",
+)
+
+# Transient Google Veo server saturation notices (observed live: "I'm sorry,
+# I'm experiencing unusually high traffic right now generating videos and am
+# at full capacity. Please try again later."). Unlike prompt refusals, tweaking
+# the prompt immediately wastes chats; waiting a short cooldown often unblocks
+# it, and if saturation persists it escalates as a limit/capacity pause.
+CAPACITY_MARKERS = (
+    "unusually high traffic",
+    "at full capacity",
+    "high traffic right now",
+    "trafic inhabituellement élevé",
+    "à pleine capacité",
+    "temporarily overloaded",
+    "serveurs sont surchargés",
 )
 
 # Every run traces its steps into /tmp so automation bugs can be debugged
@@ -402,14 +433,510 @@ def _wait_ready_or_login(page, timeout_s=25):
     is detected, "timeout" otherwise."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if _login_in_progress(page):
-            return "login"
-        in_existing = bool(re.search(r"/app/[a-zA-Z0-9_-]{6,}", page.url or ""))
-        _handle_tool_switch_dialog(page, action="dismiss" if in_existing else "confirm")
-        if _gemini_ready(page):
-            return "ready"
+        try:
+            if _login_in_progress(page):
+                return "login"
+            url_str = page.url if isinstance(getattr(page, "url", None), str) else ""
+            in_existing = bool(CHAT_ID_RE.search(url_str))
+            _handle_tool_switch_dialog(page, action="dismiss" if in_existing else "confirm")
+            if _gemini_ready(page):
+                return "ready"
+        except Exception as exc:
+            if _is_target_closed_error(exc):
+                raise
         time.sleep(0.5)
     return "timeout"
+
+
+def _extract_chat_id(url):
+    if not isinstance(url, str) or not url:
+        return None
+    match = CHAT_ID_RE.search(url)
+    return match.group(1) if match else None
+
+
+def _base_gemini_url(page):
+    """Preserves Google multi-account /u/<N>/app prefix (e.g. /u/4/app) when
+    opening a fresh chat so retries stay on the active Ultra account slot."""
+    url_str = page.url if page is not None and isinstance(getattr(page, "url", None), str) else ""
+    m = re.match(r"^(https://gemini\.google\.com/u/\d+/app)\b", url_str)
+    return m.group(1) if m else GEMINI_URL
+
+
+def _chat_cache_path():
+    override = os.environ.get(CHAT_CACHE_ENV, "").strip()
+    return override if override else CHAT_CACHE_DEFAULT_PATH
+
+
+def _utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _load_chat_cache():
+    path = _chat_cache_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    items = raw.get("chats", []) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+    cleaned = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        chat_id = str(item.get("chatId") or "").strip() or (_extract_chat_id(url) or "")
+        if not chat_id or not url or chat_id in seen:
+            continue
+        seen.add(chat_id)
+        cleaned.append({
+            "chatId": chat_id,
+            "url": url,
+            "createdAt": str(item.get("createdAt") or "").strip() or _utc_now_iso(),
+            "updatedAt": str(item.get("updatedAt") or item.get("createdAt") or "").strip() or _utc_now_iso(),
+            "status": str(item.get("status") or "active").strip() or "active",
+        })
+    return cleaned
+
+
+def _save_chat_cache(entries):
+    path = _chat_cache_path()
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".gemini_chat_cache_", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"chats": entries}, handle, indent=2)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except OSError as exc:
+        _log(f"chat_cache: could not save {path}: {exc}")
+
+
+def _record_cached_chat(url, status="active"):
+    """Persists a created Gemini chat link + creation timestamp so crashed or
+    failed runs can always be cleaned up later from the Workflow UI."""
+    if not isinstance(url, str):
+        return False
+    url = url.strip()
+    chat_id = _extract_chat_id(url)
+    if not chat_id:
+        return False
+    entries = _load_chat_cache()
+    now = _utc_now_iso()
+    for entry in entries:
+        if entry["chatId"] == chat_id:
+            if url:
+                entry["url"] = url
+            entry["updatedAt"] = now
+            entry["status"] = status
+            _save_chat_cache(entries)
+            return True
+    entries.insert(0, {
+        "chatId": chat_id,
+        "url": url,
+        "createdAt": now,
+        "updatedAt": now,
+        "status": status,
+    })
+    _save_chat_cache(entries)
+    _log(f"chat_cache: recorded {chat_id} ({status})")
+    return True
+
+
+def _remove_cached_chat(url_or_id):
+    if not isinstance(url_or_id, str):
+        return False
+    raw = url_or_id.strip()
+    if not raw:
+        return False
+    chat_id = _extract_chat_id(raw) or raw
+    entries = _load_chat_cache()
+    filtered = [e for e in entries if e.get("chatId") != chat_id and e.get("url") != raw]
+    if len(filtered) != len(entries):
+        _save_chat_cache(filtered)
+        _log(f"chat_cache: removed {chat_id}")
+        return True
+    return False
+
+
+def _click_delete_in_open_menu_and_confirm(page, chat_id):
+    """Clicks 'Supprimer' / 'Delete' in an already-opened Angular Material menu,
+    then confirms the deletion dialog and verifies the chat actually disappeared."""
+    had_sidebar_link_before = False
+    try:
+        had_sidebar_link_before = page.locator(f'a[href*="{chat_id}"], [href*="{chat_id}"]').count() > 0
+    except Exception:
+        pass
+
+    delete_clicked = False
+    overlay_scopes = page.locator(
+        ".cdk-overlay-pane, [role='menu'], .mat-mdc-menu-panel, mat-menu"
+    )
+    direct_del = page.locator(
+        '.cdk-overlay-pane [data-test-id="delete-button"], '
+        '[role="menu"] [data-test-id="delete-button"], '
+        '.cdk-overlay-pane [role="menuitem"]:has(mat-icon[fonticon="delete"]), '
+        '.cdk-overlay-pane [role="menuitem"]:has(mat-icon[data-mat-icon-name="delete"]), '
+        '.cdk-overlay-pane button:has(mat-icon[fonticon="delete"]), '
+        '.cdk-overlay-pane button:has(mat-icon[data-mat-icon-name="delete"])'
+    )
+    try:
+        if direct_del.count() > 0 and direct_del.first.is_visible():
+            direct_del.first.click(timeout=1500)
+            delete_clicked = True
+    except Exception:
+        pass
+
+    if not delete_clicked:
+        candidates = overlay_scopes.locator("[role='menuitem'], .mat-mdc-menu-item, button")
+        try:
+            total = candidates.count()
+            for idx in range(total):
+                item = candidates.nth(idx)
+                if not item.is_visible():
+                    continue
+                label = (
+                    (item.get_attribute("aria-label") or "")
+                    + " "
+                    + (item.inner_text() or "")
+                ).strip()
+                if DELETE_ACTION_RE.search(label) and not CANCEL_ACTION_RE.search(label):
+                    item.click(timeout=1500)
+                    delete_clicked = True
+                    break
+        except Exception:
+            pass
+
+    if not delete_clicked:
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
+        return False
+
+    page.wait_for_timeout(350)
+
+    # Confirm in the modal dialog ("Supprimer la discussion ?" / "Delete chat?")
+    confirmed = False
+    confirm_deadline = time.monotonic() + 3.5
+    while time.monotonic() < confirm_deadline and not confirmed:
+        try:
+            direct_confirm = page.locator(
+                'button[data-test-id="confirm-button"], '
+                'mat-dialog-container button[data-test-id="confirm-button"], '
+                '.mat-mdc-dialog-container button[data-test-id="confirm-button"]'
+            )
+            if direct_confirm.count() > 0 and direct_confirm.last.is_visible():
+                direct_confirm.last.click(timeout=1500)
+                confirmed = True
+                break
+        except Exception:
+            pass
+
+        dialog_btns = page.locator(
+            "mat-dialog-actions button, .mat-mdc-dialog-actions button, "
+            "message-dialog button, mat-dialog-container button, "
+            ".mat-mdc-dialog-container button, [role='dialog'] button"
+        )
+        try:
+            btn_count = dialog_btns.count()
+            for idx in range(btn_count):
+                btn = dialog_btns.nth(idx)
+                if not btn.is_visible():
+                    continue
+                label = (
+                    (btn.get_attribute("aria-label") or "")
+                    + " "
+                    + (btn.inner_text() or "")
+                ).strip()
+                if DELETE_ACTION_RE.search(label) and not CANCEL_ACTION_RE.search(label):
+                    btn.click(timeout=1500)
+                    confirmed = True
+                    break
+        except Exception:
+            pass
+
+        if not confirmed:
+            page.wait_for_timeout(150)
+
+    if not confirmed:
+        _log(f"delete_chat: clicked Delete menu item for {chat_id}, but confirmation button was not found")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+    # Verify deletion actually took effect (URL redirected away from chat_id or sidebar row removed)
+    deleted_confirmed = False
+    gone_deadline = time.monotonic() + 4.5
+    while time.monotonic() < gone_deadline:
+        try:
+            cur_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+            link_count = page.locator(f'a[href*="{chat_id}"], [href*="{chat_id}"]').count()
+            if chat_id not in cur_url:
+                deleted_confirmed = True
+                break
+            if had_sidebar_link_before and link_count == 0:
+                deleted_confirmed = True
+                break
+        except Exception:
+            break
+        page.wait_for_timeout(150)
+
+    if deleted_confirmed:
+        _log(f"delete_chat: deleted Gemini conversation {chat_id}")
+        return True
+    _log(f"delete_chat: confirmed dialog for {chat_id}, but URL/sidebar still showed {chat_id}")
+    return False
+
+
+def _try_sidebar_delete_for_chat(page, chat_id):
+    """Finds the sidebar row for chat_id (expanding the sidebar if collapsed and
+    allowing a brief settle window for newly-created chats), opens its 3-dots
+    actions menu, and deletes it."""
+    for expand_pass in range(2):
+        found_row = False
+        settle_attempts = 1 if expand_pass == 0 else 5
+        for settle_try in range(settle_attempts):
+            try:
+                found_row = bool(page.evaluate("""({ chatId, allowFirstFallback }) => {
+                    document.querySelectorAll('[data-qs-delete-target]').forEach(
+                        el => el.removeAttribute('data-qs-delete-target'));
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    const climbToRow = (node) => {
+                        if (!node) return null;
+                        let cur = node;
+                        for (let depth = 0; depth < 6 && cur && cur.parentElement; depth++) {
+                            const parent = cur.parentElement;
+                            const convLinks = parent.querySelectorAll(
+                                'a[href*="/app/"], [data-test-id="conversation"], conversations-list-item');
+                            if (convLinks.length > 1) break;
+                            if (cur.matches && cur.matches(
+                                'conversations-list-item, .conversation-items-container, li, [role="listitem"]')) {
+                                break;
+                            }
+                            if (parent.querySelector(
+                                'button[data-test-id="actions-menu-button"], conversation-actions button, '
+                                + 'button.mat-mdc-menu-trigger, mat-icon[fonticon="more_vert"], '
+                                + 'mat-icon[data-mat-icon-name="more_vert"]')) {
+                                cur = parent;
+                                break;
+                            }
+                            cur = parent;
+                        }
+                        return cur;
+                    };
+
+                    // 1) Exact chatId match (handles /app/<id>, /u/4/app/<id>, relative app/<id>, jslog)
+                    const exactCandidates = Array.from(document.querySelectorAll(
+                        `a[href*="${chatId}"], [href*="${chatId}"], [jslog*="${chatId}"]`
+                    )).filter(isVisible);
+                    if (exactCandidates.length > 0) {
+                        const row = climbToRow(exactCandidates[0]);
+                        if (row) {
+                            row.setAttribute('data-qs-delete-target', '1');
+                            return true;
+                        }
+                    }
+
+                    // 2) Active / selected conversation in sidebar when current URL matches chatId
+                    const urlMatches = (location.href || '').includes(chatId);
+                    if (urlMatches) {
+                        const navScope = document.querySelector(
+                            'conversations-list, mat-sidenav, nav, aside, [role="navigation"]');
+                        if (navScope && isVisible(navScope)) {
+                            const activeItem = navScope.querySelector(
+                                'conversations-list-item.selected, [data-test-id="conversation"].selected, '
+                                + '.conversation.selected, [aria-current="page"], [aria-selected="true"]');
+                            if (activeItem && isVisible(activeItem)) {
+                                const row = climbToRow(activeItem);
+                                if (row) {
+                                    row.setAttribute('data-qs-delete-target', '1');
+                                    return true;
+                                }
+                            }
+                            // 3) Last-resort fallback: if URL matches chatId and a user-query is rendered
+                            //    (proving this chat was just active) and no href/selected matched, pick #1 in Recent
+                            if (allowFirstFallback && document.querySelector('user-query')) {
+                                const firstItem = navScope.querySelector(
+                                    'conversations-list-item, [data-test-id="conversation"]');
+                                if (firstItem && isVisible(firstItem)) {
+                                    const row = climbToRow(firstItem);
+                                    if (row) {
+                                        row.setAttribute('data-qs-delete-target', '1');
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                }""", {"chatId": chat_id, "allowFirstFallback": (expand_pass == 1 and settle_try == settle_attempts - 1)}))
+            except Exception:
+                found_row = False
+            if found_row:
+                break
+            if settle_try + 1 < settle_attempts:
+                page.wait_for_timeout(450)
+
+        if found_row:
+            row_loc = page.locator('[data-qs-delete-target="1"]').first
+            try:
+                row_loc.scroll_into_view_if_needed(timeout=1000)
+            except Exception:
+                pass
+            try:
+                row_loc.hover(timeout=1500)
+                row_loc.dispatch_event("mouseover")
+                page.wait_for_timeout(250)
+            except Exception:
+                pass
+
+            menu_selectors = (
+                'button[data-test-id="actions-menu-button"]',
+                'conversation-actions button',
+                'button:has(mat-icon[fonticon="more_vert"])',
+                'button:has(mat-icon[data-mat-icon-name="more_vert"])',
+                'button[aria-label*="Plus d\'options" i]',
+                'button[aria-label*="More options" i]',
+                'button[aria-label*="Options" i]',
+                'button[aria-label*="More" i]',
+                'button.mat-mdc-menu-trigger',
+                'button',
+            )
+            clicked_menu = False
+            for sel in menu_selectors:
+                btn_group = row_loc.locator(sel)
+                try:
+                    if btn_group.count() == 0:
+                        continue
+                    target_btn = btn_group.last
+                    try:
+                        target_btn.click(timeout=1200)
+                    except Exception:
+                        target_btn.click(timeout=1200, force=True)
+                    clicked_menu = True
+                    break
+                except Exception:
+                    continue
+
+            if clicked_menu:
+                page.wait_for_timeout(350)
+                if _click_delete_in_open_menu_and_confirm(page, chat_id):
+                    return True
+
+        if expand_pass == 0:
+            # Sidebar may be collapsed — click the hamburger menu button and retry once
+            toggled = False
+            for toggle_sel in SIDEBAR_TOGGLE_SELECTORS:
+                try:
+                    toggle_btn = page.locator(toggle_sel).first
+                    if toggle_btn.count() > 0 and toggle_btn.is_visible():
+                        toggle_btn.click(timeout=1200)
+                        page.wait_for_timeout(550)
+                        toggled = True
+                        break
+                except Exception:
+                    continue
+            if not toggled:
+                break
+    return False
+
+
+def _delete_current_chat(page, target_url=None):
+    """Best-effort deletion of the Gemini chat identified by target_url or page.url.
+
+    Safety rule: ONLY deletes when a concrete /app/<chat_id> URL (including
+    multi-account /u/<N>/app/<chat_id> URLs) is present so an uncreated chat
+    on bare /app never deletes an unrelated conversation from the user's history."""
+    if page is None:
+        return False
+    try:
+        if hasattr(page, "is_closed") and page.is_closed():
+            return False
+    except Exception:
+        return False
+
+    page_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+    chat_id = _extract_chat_id(target_url) or _extract_chat_id(page_url)
+    if not chat_id:
+        _log("delete_chat: no active /app/<chat_id> URL — nothing to delete")
+        return False
+
+    try:
+        if chat_id not in page_url and isinstance(target_url, str) and chat_id in target_url:
+            _log(f"delete_chat: navigating to {target_url} to delete chat {chat_id}")
+            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            nav_state = _wait_ready_or_login(page, timeout_s=10)
+            page_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+            if chat_id not in page_url:
+                if nav_state == "ready" and "gemini.google.com" in page_url and not _login_in_progress(page):
+                    _log(f"delete_chat: chat {chat_id} redirected to {page_url} (already gone)")
+                    _remove_cached_chat(chat_id)
+                    return True
+                _log(f"delete_chat: chat {chat_id} redirected to {page_url} (state={nav_state})")
+                return False
+
+        # Strategy 1: Top active-conversation header actions / title menu (works even when sidebar is closed)
+        if chat_id in page_url:
+            header_triggers = (
+                'conversation-actions button[data-test-id="actions-menu-button"]',
+                'button[data-test-id="conversation-actions-menu-button"]',
+                '[data-test-id="conversation-title"]',
+                'conversation-actions button',
+                'button:has(mat-icon[fonticon="more_vert"])',
+                'button:has(mat-icon[data-mat-icon-name="more_vert"])',
+                'button[aria-label*="options de la discussion" i]',
+                'button[aria-label*="conversation options" i]',
+            )
+            for sel in header_triggers:
+                try:
+                    locs = page.locator(sel)
+                    for idx in range(locs.count()):
+                        cand = locs.nth(idx)
+                        if not cand.is_visible():
+                            continue
+                        in_header = bool(cand.evaluate("""el => {
+                            if (el.closest('nav, aside, [role="navigation"], [class*="sidenav"], [class*="sidebar"], conversations-list, user-query, model-response'))
+                                return false;
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0 && r.top < 160;
+                        }"""))
+                        if not in_header:
+                            continue
+                        cand.click(timeout=1200)
+                        page.wait_for_timeout(350)
+                        if _click_delete_in_open_menu_and_confirm(page, chat_id):
+                            _remove_cached_chat(chat_id)
+                            return True
+                        break
+                except Exception:
+                    continue
+
+        # Strategy 2: Sidebar conversation list item matching chat_id (handles /u/<N>/app/<id>)
+        if _try_sidebar_delete_for_chat(page, chat_id):
+            _remove_cached_chat(chat_id)
+            return True
+
+        _log(f"delete_chat: could not confirm deletion for chat {chat_id} (url={page_url})")
+        _dump_state(page, "delete_chat_failed")
+    except Exception as exc:  # noqa: BLE001 - cleanup must never abort a completed download
+        _log(f"delete_chat: best-effort cleanup failed for {chat_id}: {exc}")
+    return False
 
 
 def _open_plus_menu(page):
@@ -885,6 +1412,18 @@ def _video_quota_in(text):
     return None
 
 
+def _video_capacity_in(text):
+    """Returns the high-traffic/capacity notice if text indicates temporary server saturation."""
+    if not text:
+        return None
+    lowered = text.lower()
+    for marker in CAPACITY_MARKERS:
+        idx = lowered.find(marker.lower())
+        if idx >= 0:
+            return text[idx:idx + 200].split("\n")[0].strip()
+    return None
+
+
 def _video_quota_message(page):
     """Returns the quota-exhaustion notice (first line, with the reset time
     if shown) when Gemini's own "no more videos right now" wall is up, else
@@ -1206,6 +1745,12 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
                   encoding="utf-8") as handle:
             json.dump(submission_state, handle)
 
+    recorded_chat_id = None
+    initial_page_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+    if _extract_chat_id(initial_page_url):
+        _record_cached_chat(initial_page_url, status="active")
+        recorded_chat_id = _extract_chat_id(initial_page_url)
+
     _log("waiting for the video or a refusal")
 
     existing_video_srcs = set()
@@ -1219,6 +1764,11 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
         pass
 
     while time.time() < min(deadline, attempt_deadline):
+        cur_page_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+        cur_chat_id = _extract_chat_id(cur_page_url)
+        if cur_chat_id and cur_chat_id != recorded_chat_id:
+            _record_cached_chat(cur_page_url, status="active")
+            recorded_chat_id = cur_chat_id
         if capture["video"]:
             return ("video", capture["video"])
         if capture["error"]:
@@ -1274,6 +1824,11 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
         if quota_hit:
             _log(f"quota exhaustion detected: '{quota_hit}'")
             return ("quota", quota_hit)
+
+        capacity_hit = _video_capacity_in(resp_text)
+        if capacity_hit:
+            _log(f"capacity saturation detected: '{capacity_hit}'")
+            return ("capacity", capacity_hit)
 
         marker = _rejection_in(resp_text)
         if marker:
@@ -1360,6 +1915,10 @@ def _run_attempt(page, prompt, image_paths, output_dir, deadline, attempt_deadli
             if quota_hit:
                 _log(f"quota exhaustion detected: '{quota_hit}'")
                 return ("quota", quota_hit)
+            capacity_hit = _video_capacity_in(resp_text)
+            if capacity_hit:
+                _log(f"capacity saturation detected: '{capacity_hit}'")
+                return ("capacity", capacity_hit)
             marker = _rejection_in(resp_text)
             if marker:
                 return ("rejected", marker)
@@ -1669,8 +2228,13 @@ def _generate_once(context, page, prompt, image_paths, output_dir, settings,
         result, page = _generate_once_impl(context, page, prompt, image_paths, output_dir,
             settings, chat_mode, message_action, state)
     except Exception as exc:
+        browser_lost = _is_target_closed_error(exc)
+        if (not browser_lost and chat_mode != "conversation"
+                and bool(settings.get("deleteChatOnFinish", True))):
+            _delete_current_chat(page, state.get("conversationUrl"))
+            state.pop("conversationUrl", None)
         result = {"video": None, "error": str(exc), "rejected": False,
-                  "browserLost": _is_target_closed_error(exc)}
+                  "browserLost": browser_lost}
     result["promptSubmitted"] = bool(state.get("promptSubmitted"))
     if state.get("conversationUrl"):
         result["conversationUrl"] = state["conversationUrl"]
@@ -1687,17 +2251,20 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
     in_page_retries = int(settings.get("inPageRejectionRetries", 3))
     preserve_prompt = bool(settings.get("preservePrompt", False))
     stall_timeout_s = int(settings.get("attemptStallTimeoutSec", 300))
+    capacity_cooldown_s = int(settings.get("capacityCooldownSec", 30))
+    delete_chat_on_finish = bool(settings.get("deleteChatOnFinish", True))
+    keep_conversation = bool(settings.get("keepConversation", False))
+    should_cleanup_fresh_chat = delete_chat_on_finish and chat_mode != "conversation"
 
     deadline = time.time() + generation_timeout_s
     original_conversation_url = page.url if chat_mode == "conversation" else None
     last_rejection = None
+    last_capacity_note = None
     video_path = None
     for attempt in range(in_page_retries + 1):
-        if preserve_prompt:
-            # First retry in a fresh chat keeps the exact saved prompt (unblocks
-            # stochastic post-generation refusals on an already-proven prompt);
-            # subsequent retries apply light variants if Gemini keeps refusing.
-            variant = prompt.strip() if attempt <= 1 else _prompt_variant(prompt, attempt - 1)
+        if preserve_prompt or last_capacity_note:
+            # Keep the exact prompt on capacity retries (and first preservePrompt retry)
+            variant = prompt.strip() if (last_capacity_note or attempt <= 1) else _prompt_variant(prompt, attempt - 1)
         else:
             variant = _prompt_variant(prompt, attempt)
         current_action = ("edit_last" if attempt > 0 and chat_mode == "conversation"
@@ -1714,9 +2281,9 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
             else:
                 note = "unchanged prompt" if variant == prompt.strip() else "edited prompt"
                 _log(f"in-page retry {attempt}/{in_page_retries} after "
-                     f"rejection — fresh chat, {note}")
+                     f"{'capacity cooldown' if last_capacity_note else 'rejection'} — fresh chat, {note}")
                 try:
-                    page.goto(GEMINI_URL, wait_until="domcontentloaded", timeout=60000)
+                    page.goto(_base_gemini_url(page), wait_until="domcontentloaded", timeout=60000)
                     ready = _wait_ready_or_login(page) == "ready"
                 except Exception as exc:  # noqa: BLE001 - recovered below
                     if not _is_target_closed_error(exc):
@@ -1760,13 +2327,30 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
             submission_state["promptSubmitted"] = True
             if page and not page.is_closed():
                 submission_state["conversationUrl"] = page.url
+        active_chat_url = submission_state.get("conversationUrl") or (
+            page.url if page and not page.is_closed() and isinstance(getattr(page, "url", None), str) else None
+        )
+        if active_chat_url and _extract_chat_id(active_chat_url):
+            _record_cached_chat(active_chat_url, status="active")
         if status == "video":
             video_path = payload  # already saved to disk by _run_attempt
             with open(os.path.join(output_dir, "generation_prompt.txt"), "w",
                       encoding="utf-8") as handle:
                 handle.write(variant)
+            if should_cleanup_fresh_chat and not keep_conversation:
+                if _delete_current_chat(page, active_chat_url):
+                    submission_state.pop("conversationUrl", None)
+                elif active_chat_url and _extract_chat_id(active_chat_url):
+                    _record_cached_chat(active_chat_url, status="delete_failed")
+            elif active_chat_url and _extract_chat_id(active_chat_url):
+                _record_cached_chat(active_chat_url, status="kept")
             break
         if status == "quota":
+            if should_cleanup_fresh_chat:
+                if _delete_current_chat(page, active_chat_url):
+                    submission_state.pop("conversationUrl", None)
+                elif active_chat_url and _extract_chat_id(active_chat_url):
+                    _record_cached_chat(active_chat_url, status="delete_failed")
             conv_url = page.url if page and not page.is_closed() else None
             return ({"video": None,
                      "error": f"Gemini daily video quota reached: {payload}",
@@ -1774,12 +2358,47 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
                      "retryable": False,
                      "quotaExceeded": True,
                      "conversationUrl": conv_url}, page)
+        if status == "capacity":
+            if should_cleanup_fresh_chat:
+                if _delete_current_chat(page, active_chat_url):
+                    submission_state.pop("conversationUrl", None)
+                elif active_chat_url and _extract_chat_id(active_chat_url):
+                    _record_cached_chat(active_chat_url, status="delete_failed")
+            last_capacity_note = payload
+            last_rejection = payload
+            remaining_s = deadline - time.time()
+            if attempt < in_page_retries and remaining_s > 10:
+                wait_s = min(max(0, capacity_cooldown_s) * (attempt + 1), 90, int(remaining_s - 5))
+                if wait_s > 0:
+                    _log(f"capacity: waiting {wait_s}s cooldown before retrying (attempt {attempt + 1}/{in_page_retries})...")
+                    time.sleep(wait_s)
+                continue
+            conv_url = page.url if page and not page.is_closed() else None
+            return ({"video": None,
+                     "error": f"Gemini video servers at full capacity (limit reached): {payload}",
+                     "rejected": False,
+                     "retryable": False,
+                     "quotaExceeded": True,
+                     "conversationUrl": conv_url}, page)
+        last_capacity_note = None
         if status in ("error", "browser_lost"):
+            if status != "browser_lost" and should_cleanup_fresh_chat:
+                if _delete_current_chat(page, active_chat_url):
+                    submission_state.pop("conversationUrl", None)
+                elif active_chat_url and _extract_chat_id(active_chat_url):
+                    _record_cached_chat(active_chat_url, status="delete_failed")
+            elif active_chat_url and _extract_chat_id(active_chat_url):
+                _record_cached_chat(active_chat_url, status="failed")
             conv_url = page.url if page and not page.is_closed() else None
             return ({"video": None, "error": payload, "rejected": False,
                      "browserLost": status == "browser_lost",
                      "conversationUrl": conv_url}, page)
-        # "rejected" and "stalled" both retry with an edited prompt
+        # "rejected" and "stalled" both abandon this fresh chat and retry with an edited prompt
+        if should_cleanup_fresh_chat:
+            if _delete_current_chat(page, active_chat_url):
+                submission_state.pop("conversationUrl", None)
+            elif active_chat_url and _extract_chat_id(active_chat_url):
+                _record_cached_chat(active_chat_url, status="delete_failed")
         last_rejection = payload
         if time.time() >= deadline:
             break
@@ -1868,6 +2487,87 @@ def _worker_main():
                 _respond({"video": None, "rejected": False,
                           "error": f"malformed request: {exc}"})
                 continue
+            if request.get("deleteConversation"):
+                target_conv_url = request.get("conversationUrl") or ""
+                req_settings = request.get("settings") or {}
+                deleted = False
+                if context is not None and target_conv_url and bool(req_settings.get("deleteChatOnFinish", True)):
+                    try:
+                        if page is None or page.is_closed():
+                            page = context.pages[0] if context.pages else context.new_page()
+                        deleted = _delete_current_chat(page, target_conv_url)
+                    except Exception as exc:  # noqa: BLE001
+                        _log(f"worker: deleteConversation failed: {exc}")
+                _respond({"video": None, "error": None, "rejected": False, "deleted": deleted})
+                continue
+            if request.get("deleteConversations"):
+                raw_urls = request.get("conversationUrls") or []
+                urls = [str(u).strip() for u in raw_urls if isinstance(u, str) and str(u).strip()]
+                req_settings = request.get("settings") or {}
+                if not urls:
+                    _respond({"video": None, "error": None, "rejected": False,
+                              "deleted": [], "failed": []})
+                    continue
+                deleted_urls = []
+                failed_urls = []
+                err_msg = None
+                try:
+                    if context is None:
+                        context, launch_note, launch_error = _launch_context(
+                            playwright, bool(req_settings.get("useSystemChromeProfile", True)))
+                        if context is None:
+                            _respond({"video": None, "rejected": False,
+                                      "deleted": [], "failed": urls,
+                                      "error": "Could not launch a browser. If Chrome "
+                                               "is currently open with your default "
+                                               "profile, close it first. Details: "
+                                               f"{launch_error}"})
+                            continue
+                        _log(f"worker: browser ready for chat cleanup ({launch_note})")
+                    needs_ultra_account = bool(req_settings.get("requireUltra", True)) and any(
+                        not re.search(r"/u/\d+/app/", u) for u in urls
+                    )
+                    page, prepare_error = _prepare_page(
+                        context, needs_ultra_account, page, chat_mode="fresh")
+                    if prepare_error:
+                        _respond({"video": None, "rejected": False,
+                                  "deleted": [], "failed": urls,
+                                  "error": prepare_error})
+                        continue
+                    for target_url in urls:
+                        try:
+                            if page is None or page.is_closed():
+                                page = context.pages[0] if context.pages else context.new_page()
+                            if _delete_current_chat(page, target_url):
+                                _remove_cached_chat(target_url)
+                                deleted_urls.append(target_url)
+                            else:
+                                failed_urls.append(target_url)
+                        except Exception as exc:  # noqa: BLE001
+                            _log(f"worker: deleteConversations failed for {target_url}: {exc}")
+                            failed_urls.append(target_url)
+                            if _is_target_closed_error(exc):
+                                err_msg = str(exc)
+                                for rem in urls:
+                                    if rem not in deleted_urls and rem not in failed_urls:
+                                        failed_urls.append(rem)
+                                try:
+                                    if context is not None:
+                                        context.close()
+                                except Exception:
+                                    pass
+                                context = None
+                                page = None
+                                break
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"worker: deleteConversations error: {exc}")
+                    err_msg = str(exc)
+                    for rem in urls:
+                        if rem not in deleted_urls and rem not in failed_urls:
+                            failed_urls.append(rem)
+                _respond({"video": None, "error": err_msg, "rejected": False,
+                          "deleted": deleted_urls, "failed": failed_urls})
+                continue
             try:
                 prompt, output_dir, images, settings = _read_request(request)
             except ValueError as exc:
@@ -1933,12 +2633,19 @@ def _worker_main():
                     context = None
                     page = None
                 elif result.get("error") and page and not page.is_closed():
-                    # Close a dirty page after an error so the next attempt gets a fresh tab
+                    # Open a fresh tab BEFORE closing the dirty page: closing the sole
+                    # open tab in Chrome on Linux quits the entire browser process.
+                    replacement = None
+                    try:
+                        if context is not None:
+                            replacement = context.new_page()
+                    except Exception:
+                        replacement = None
                     try:
                         page.close()
                     except Exception:
                         pass
-                    page = None
+                    page = replacement
                 _respond(result)
             except Exception as exc:  # noqa: BLE001 - one bad request must not
                 # kill the worker: report it and stay alive for the next one.
@@ -1961,6 +2668,13 @@ def _worker_main():
                           "browserLost": _is_target_closed_error(exc)})
     finally:
         _log("worker: stdin closed, shutting the browser down")
+        try:
+            if page is not None and not page.is_closed():
+                page_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+                if _extract_chat_id(page_url):
+                    _delete_current_chat(page, page_url)
+        except Exception:
+            pass
         try:
             if context is not None:
                 context.close()
