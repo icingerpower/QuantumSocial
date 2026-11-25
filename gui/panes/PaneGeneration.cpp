@@ -570,6 +570,38 @@ PaneGeneration::PaneGeneration(TreeProperties *properties, TreeProperties *archi
 {
     ui->setupUi(this);
 
+    // Resumable paused Auto-Batch banner (hidden unless a batch paused on a quota/limit)
+    m_pausedBatchBanner = new QWidget(this);
+    m_pausedBatchBanner->setObjectName(QStringLiteral("widgetGenerationPausedBanner"));
+    m_pausedBatchBanner->setStyleSheet(QStringLiteral(
+        "QWidget#widgetGenerationPausedBanner { background: rgba(217, 119, 6, 0.18); "
+        "border: 1px solid rgba(251, 191, 36, 0.55); border-radius: 6px; }"));
+    auto *pausedLay = new QHBoxLayout(m_pausedBatchBanner);
+    pausedLay->setContentsMargins(10, 6, 10, 6);
+    pausedLay->setSpacing(8);
+    m_pausedBatchLabel = new QLabel(m_pausedBatchBanner);
+    m_pausedBatchLabel->setObjectName(QStringLiteral("labelGenerationPausedInfo"));
+    m_pausedBatchLabel->setWordWrap(true);
+    m_pausedBatchLabel->setStyleSheet(QStringLiteral("color: #fde68a; font-weight: 600;"));
+    m_btnResumePausedBatch = new QPushButton(tr("▶ Resume Paused Batch"), m_pausedBatchBanner);
+    m_btnResumePausedBatch->setObjectName(QStringLiteral("buttonGenerationResumePausedBatch"));
+    m_btnResumePausedBatch->setStyleSheet(QStringLiteral(
+        "QPushButton { background: #16a34a; color: white; font-weight: 700; padding: 5px 12px; border-radius: 5px; }"));
+    m_btnDiscardPausedBatch = new QPushButton(tr("⏹ Discard"), m_pausedBatchBanner);
+    m_btnDiscardPausedBatch->setObjectName(QStringLiteral("buttonGenerationDiscardPausedBatch"));
+    pausedLay->addWidget(m_pausedBatchLabel, 1);
+    pausedLay->addWidget(m_btnResumePausedBatch);
+    pausedLay->addWidget(m_btnDiscardPausedBatch);
+    m_pausedBatchBanner->setVisible(false);
+    ui->verticalLayout_3->insertWidget(0, m_pausedBatchBanner);
+    connect(m_btnResumePausedBatch, &QPushButton::clicked, this, [this]() {
+        resumePausedAutoBatch();
+    });
+    connect(m_btnDiscardPausedBatch, &QPushButton::clicked, this, [this]() {
+        discardPausedAutoBatch();
+    });
+    _loadPausedAutoBatch();
+
     // Default split: 1/4 for the project list, 3/4 for the source/generation
     // side (still user-adjustable).
     ui->splitter_3->setStretchFactor(0, 1);
@@ -5552,8 +5584,198 @@ bool PaneGeneration::startAutoBatch(const QJsonObject &batchSpec)
     }
 
     ui->toolBox->setCurrentIndex(1);
-    m_autoBatchTask = std::make_unique<QCoro::Task<void>>(_runAutoBatch(batchSpec));
+    discardPausedAutoBatch();
+    m_autoBatchTask = std::make_unique<QCoro::Task<void>>(_runAutoBatch(batchSpec, 0, 0, 0));
     return true;
+}
+
+QString PaneGeneration::_pausedAutoBatchFilePath() const
+{
+    const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+    return wd.exists() ? wd.filePath(QStringLiteral("paused_auto_batch.json")) : QString{};
+}
+
+void PaneGeneration::_loadPausedAutoBatch()
+{
+    m_pausedAutoBatch = PausedAutoBatchState{};
+    const QString path = _pausedAutoBatchFilePath();
+    if (path.isEmpty() || !QFileInfo::exists(path))
+    {
+        _refreshPausedAutoBatchBanner();
+        return;
+    }
+    QFile f{path};
+    if (!f.open(QIODevice::ReadOnly))
+    {
+        _refreshPausedAutoBatchBanner();
+        return;
+    }
+    const QJsonObject obj = QJsonDocument::fromJson(f.readAll()).object();
+    const QJsonObject spec = obj.value(QStringLiteral("batchSpec")).toObject();
+    const int total = obj.value(QStringLiteral("totalCreatives")).toInt(0);
+    const int nextProd = obj.value(QStringLiteral("nextProductIndex")).toInt(0);
+    const int nextSlot = obj.value(QStringLiteral("nextSlotIndex")).toInt(0);
+    const int productsCount = spec.value(QStringLiteral("products")).toArray().size();
+    const int perProd = qMax(1, spec.value(QStringLiteral("generationsPerProduct")).toInt(1));
+    if (!spec.isEmpty() && total > 0 && nextProd >= 0 && nextProd < productsCount
+        && nextSlot >= 0 && nextSlot < perProd)
+    {
+        m_pausedAutoBatch.active = true;
+        m_pausedAutoBatch.batchSpec = spec;
+        m_pausedAutoBatch.nextProductIndex = nextProd;
+        m_pausedAutoBatch.nextSlotIndex = nextSlot;
+        m_pausedAutoBatch.completedCreatives = qBound(0, obj.value(QStringLiteral("completedCreatives")).toInt(0), total);
+        m_pausedAutoBatch.totalCreatives = total;
+        m_pausedAutoBatch.limitReason = obj.value(QStringLiteral("limitReason")).toString();
+        m_pausedAutoBatch.pausedAt = obj.value(QStringLiteral("pausedAt")).toString();
+    }
+    _refreshPausedAutoBatchBanner();
+}
+
+void PaneGeneration::_savePausedAutoBatch() const
+{
+    const QString path = _pausedAutoBatchFilePath();
+    if (path.isEmpty())
+    {
+        return;
+    }
+    if (!m_pausedAutoBatch.active)
+    {
+        QFile::remove(path);
+        return;
+    }
+    QSaveFile sf{path};
+    if (sf.open(QIODevice::WriteOnly))
+    {
+        sf.write(QJsonDocument{QJsonObject{
+            {QStringLiteral("schemaVersion"), 1},
+            {QStringLiteral("batchSpec"), m_pausedAutoBatch.batchSpec},
+            {QStringLiteral("nextProductIndex"), m_pausedAutoBatch.nextProductIndex},
+            {QStringLiteral("nextSlotIndex"), m_pausedAutoBatch.nextSlotIndex},
+            {QStringLiteral("completedCreatives"), m_pausedAutoBatch.completedCreatives},
+            {QStringLiteral("totalCreatives"), m_pausedAutoBatch.totalCreatives},
+            {QStringLiteral("limitReason"), m_pausedAutoBatch.limitReason},
+            {QStringLiteral("pausedAt"), m_pausedAutoBatch.pausedAt}
+        }}.toJson(QJsonDocument::Indented));
+        sf.commit();
+    }
+}
+
+void PaneGeneration::_refreshPausedAutoBatchBanner()
+{
+    if (!m_pausedBatchBanner)
+    {
+        return;
+    }
+    const bool show = m_pausedAutoBatch.active && !m_autoBatchRunning;
+    m_pausedBatchBanner->setVisible(show);
+    if (show)
+    {
+        const int rem = pausedAutoBatchRemaining();
+        m_pausedBatchLabel->setText(
+            tr("⚠ Paused batch (limit reached): %1/%2 saved · %3 creative(s) remaining — %4")
+                .arg(m_pausedAutoBatch.completedCreatives)
+                .arg(m_pausedAutoBatch.totalCreatives)
+                .arg(rem)
+                .arg(m_pausedAutoBatch.limitReason));
+        m_btnResumePausedBatch->setText(tr("▶ Resume Remaining (%1)").arg(rem));
+        m_btnResumePausedBatch->setEnabled(true);
+    }
+}
+
+bool PaneGeneration::hasPausedAutoBatch() const
+{
+    return m_pausedAutoBatch.active;
+}
+
+int PaneGeneration::pausedAutoBatchCompleted() const
+{
+    return m_pausedAutoBatch.active ? m_pausedAutoBatch.completedCreatives : 0;
+}
+
+int PaneGeneration::pausedAutoBatchTotal() const
+{
+    return m_pausedAutoBatch.active ? m_pausedAutoBatch.totalCreatives : 0;
+}
+
+int PaneGeneration::pausedAutoBatchRemaining() const
+{
+    if (!m_pausedAutoBatch.active)
+    {
+        return 0;
+    }
+    const int perProd = qMax(1, m_pausedAutoBatch.batchSpec.value(QStringLiteral("generationsPerProduct")).toInt(1));
+    const int cursor = m_pausedAutoBatch.nextProductIndex * perProd + m_pausedAutoBatch.nextSlotIndex;
+    return qMax(1, m_pausedAutoBatch.totalCreatives - cursor);
+}
+
+QString PaneGeneration::pausedAutoBatchReason() const
+{
+    return m_pausedAutoBatch.active ? m_pausedAutoBatch.limitReason : QString{};
+}
+
+bool PaneGeneration::resumePausedAutoBatch(const QString &promptCliOverride,
+                                           const QString &imageCliOverride)
+{
+    if (m_autoBatchRunning || !m_pausedAutoBatch.active)
+    {
+        return false;
+    }
+    QJsonObject spec = m_pausedAutoBatch.batchSpec;
+    if (!promptCliOverride.trimmed().isEmpty())
+    {
+        spec.insert(QStringLiteral("promptCli"), promptCliOverride.trimmed());
+        setSelectedPromptCli(promptCliOverride.trimmed());
+    }
+    else
+    {
+        const QString savedPromptCli = spec.value(QStringLiteral("promptCli")).toString().trimmed();
+        if (!savedPromptCli.isEmpty())
+        {
+            setSelectedPromptCli(savedPromptCli);
+        }
+    }
+    if (!imageCliOverride.trimmed().isEmpty())
+    {
+        spec.insert(QStringLiteral("imageCli"), imageCliOverride.trimmed());
+        QSettings().setValue(QStringLiteral("generation/imageCli"), imageCliOverride.trimmed());
+    }
+    else
+    {
+        const QString savedImageCli = spec.value(QStringLiteral("imageCli")).toString().trimmed();
+        if (!savedImageCli.isEmpty())
+        {
+            QSettings().setValue(QStringLiteral("generation/imageCli"), savedImageCli);
+        }
+    }
+    if (!_promptCli() || !_imageCli())
+    {
+        return false;
+    }
+
+    const int startProd = m_pausedAutoBatch.nextProductIndex;
+    const int startSlot = m_pausedAutoBatch.nextSlotIndex;
+    const int priorDone = m_pausedAutoBatch.completedCreatives;
+    m_pausedAutoBatch.active = false;
+    _refreshPausedAutoBatchBanner();
+    emit pausedAutoBatchChanged();
+
+    ui->toolBox->setCurrentIndex(1);
+    m_autoBatchTask = std::make_unique<QCoro::Task<void>>(
+        _runAutoBatch(spec, startProd, startSlot, priorDone));
+    return true;
+}
+
+void PaneGeneration::discardPausedAutoBatch()
+{
+    const bool wasActive = m_pausedAutoBatch.active;
+    m_pausedAutoBatch = PausedAutoBatchState{};
+    _savePausedAutoBatch();
+    _refreshPausedAutoBatchBanner();
+    if (wasActive)
+    {
+        emit pausedAutoBatchChanged();
+    }
 }
 
 void PaneGeneration::cancelAutoBatch()
@@ -5620,7 +5842,10 @@ bool PaneGeneration::deleteUnpublishedCreative(const QString &shortCode, QString
     return true;
 }
 
-QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
+QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
+                                                int startProductIdx,
+                                                int startSlotIdx,
+                                                int priorCompleted)
 {
     AbstractCli *promptCli = _promptCli();
     AbstractCli *imgCli = _imageCli();
@@ -5679,13 +5904,18 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         QJsonObject reference;
         QString mediaPath;
         double measuredMedian = -1.0;
+        qint64 bestViews = 0;
+        int successCount = 0;
+        int lowPerformerCount = 0;
         bool isMeasuredWinner = false;
+        bool isRetired = false;
         QString bestStrategy;
         int swapCount = 0;
         int variantCount = 0;
         int originalRank = 0;
     };
     QList<RankedRef> rankedRefs;
+    int retiredLowPerformerRefs = 0;
     for (int i = 0; i < rawApprovedRefs.size(); ++i)
     {
         const QJsonObject item = rawApprovedRefs[i].toObject();
@@ -5699,10 +5929,20 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         {
             const auto &rp = refPerfById[refId];
             rr.measuredMedian = rp.medianScore;
+            rr.bestViews = rp.bestViews;
+            rr.successCount = rp.successCount;
+            rr.lowPerformerCount = rp.lowPerformerCount;
             rr.isMeasuredWinner = rp.isWinner;
+            rr.isRetired = rp.isRetired;
             rr.bestStrategy = rp.bestStrategy;
             rr.swapCount = rp.swapCount;
             rr.variantCount = rp.variantCount;
+        }
+        if (rr.isRetired)
+        {
+            // Stop reusing any source once it accumulates >= 2 low-performing posts
+            ++retiredLowPerformerRefs;
+            continue;
         }
         rankedRefs.append(rr);
     }
@@ -5712,13 +5952,20 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                          {
                              return a.isMeasuredWinner;
                          }
-                         if (a.isMeasuredWinner && a.measuredMedian != b.measuredMedian)
+                         if (a.isMeasuredWinner)
                          {
-                             return a.measuredMedian > b.measuredMedian;
+                             if (a.measuredMedian != b.measuredMedian)
+                             {
+                                 return a.measuredMedian > b.measuredMedian;
+                             }
+                             if (a.bestViews != b.bestViews)
+                             {
+                                 return a.bestViews > b.bestViews;
+                             }
                          }
                          if ((a.measuredMedian < 0.0) != (b.measuredMedian < 0.0))
                          {
-                             // Untested high-velocity approved refs come ahead of proven below-median refs
+                             // Untested high-velocity approved refs come ahead of 1-flop probation refs
                              return a.measuredMedian < 0.0;
                          }
                          return a.originalRank < b.originalRank;
@@ -5739,16 +5986,19 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
     }
     int winnerCursor = 0;
     int freshCursor = 0;
+    const int safeStartProd = qBound(0, startProductIdx, int(products.size()));
+    const int safeStartSlot = qBound(0, startSlotIdx, generationsPerProduct);
+    int batchSlotCounter = safeStartProd * generationsPerProduct;
     QHash<QString, int> globalRefUseCounts;
 
     const int totalCreatives = products.size() * generationsPerProduct;
-    int completedCreatives = 0;
-    int attemptedCreatives = 0;
+    int completedCreatives = qBound(0, priorCompleted, totalCreatives);
+    int attemptedCreatives = qBound(0, safeStartProd * generationsPerProduct + safeStartSlot, totalCreatives);
     m_runGenerations.clear();
     m_runVideoFormatLabel = videoFormatLabel;
     m_batchCancelled = false;
     m_autoBatchRunning = true;
-    m_autoBatchCompleted = 0;
+    m_autoBatchCompleted = completedCreatives;
     m_autoBatchTotal = totalCreatives;
 
     const bool suppressModalProgress = batchSpec.value(QStringLiteral("suppressModalProgressDialog")).toBool(false);
@@ -5784,18 +6034,29 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
     emit autoBatchStarted(totalCreatives);
 
     _logProgress(tr("Starting Auto-Batch: %1 product(s) × %2 generation(s) = %3 creative(s) "
-                    "(%4 approved reference(s) in pool · Content CLI: %5 · Image CLI: %6).")
+                    "(%4 active reference(s), %5 proven winner(s) privileged, %6 retired ≥2-flop source(s) skipped · Content CLI: %7 · Image CLI: %8).")
         .arg(products.size())
         .arg(generationsPerProduct)
         .arg(totalCreatives)
         .arg(rankedRefs.size())
+        .arg(winnerRefIndices.size())
+        .arg(retiredLowPerformerRefs)
         .arg(promptCli->getName(), imgCli->getName()));
+    if (rankedRefs.isEmpty() && retiredLowPerformerRefs > 0)
+    {
+        _logProgress(tr("⚠ All %1 approved inspiration(s) had ≥2 low-performing posts and were retired — "
+                        "generating fresh editorial A/B scenes from product photos until new inspirations are approved.")
+            .arg(retiredLowPerformerRefs));
+    }
 
     bool hitHardStopError = false;
     QString hardStopReason;
+    int pausedProductIdx = safeStartProd;
+    int pausedSlotIdx = safeStartSlot;
 
-    for (int pIdx = 0; pIdx < products.size() && !m_batchCancelled && !hitHardStopError; ++pIdx)
+    for (int pIdx = safeStartProd; pIdx < products.size() && !m_batchCancelled && !hitHardStopError; ++pIdx)
     {
+        const int firstSlotForProduct = (pIdx == safeStartProd) ? safeStartSlot : 0;
         const QJsonObject product = products[pIdx].toObject();
         const QString productId = product.value(QStringLiteral("id")).toString();
         const QString productTitle = product.value(QStringLiteral("title")).toString().trimmed();
@@ -5878,6 +6139,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
 
         for (int s = 0; s < generationsPerProduct; ++s)
         {
+            const int globalSlot = batchSlotCounter++;
             PlannedSlot slot;
             slot.kind = enabledFormats[s % enabledFormats.size()];
             slot.formatName = slot.kind == GenerationJob::Video
@@ -5885,7 +6147,16 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 : (slot.kind == GenerationJob::Slideshow
                        ? QStringLiteral("carousel")
                        : QStringLiteral("image"));
-            slot.isExploration = (s >= exploitCount);
+            // Privilege proven winners from their very 1st success across 80% of batch slots
+            // (slots 0..3 of every 5), reserving 20% (slot 4 of every 5) to explore fresh sources.
+            if (!winnerRefIndices.isEmpty() && !freshPoolIndices.isEmpty())
+            {
+                slot.isExploration = ((globalSlot % 5) == 4);
+            }
+            else
+            {
+                slot.isExploration = (s >= exploitCount);
+            }
 
             bool hasRefMedia = false;
             int totalPriorForRef = 0;
@@ -5896,7 +6167,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 int chosenRefIdx = 0;
                 if (!slot.isExploration)
                 {
-                    if (!winnerRefIndices.isEmpty() && (freshPoolIndices.isEmpty() || (s % 2 == 0)))
+                    if (!winnerRefIndices.isEmpty())
                     {
                         chosenRefIdx = winnerRefIndices[winnerCursor % winnerRefIndices.size()];
                         ++winnerCursor;
@@ -5908,7 +6179,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                     }
                     else
                     {
-                        chosenRefIdx = s % rankedRefs.size();
+                        chosenRefIdx = globalSlot % rankedRefs.size();
                     }
                 }
                 else
@@ -5920,7 +6191,8 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                     }
                     else
                     {
-                        chosenRefIdx = int(rankedRefs.size()) - 1 - ((s - exploitCount) % rankedRefs.size());
+                        chosenRefIdx = winnerRefIndices[winnerCursor % winnerRefIndices.size()];
+                        ++winnerCursor;
                     }
                 }
                 const RankedRef &picked = rankedRefs[chosenRefIdx];
@@ -6104,6 +6376,8 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
         {
             hitHardStopError = true;
             hardStopReason = friendlyCliError(promptCli, planResult);
+            pausedProductIdx = pIdx;
+            pausedSlotIdx = firstSlotForProduct;
             break;
         }
 
@@ -6330,8 +6604,8 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
             }
         }
 
-        // Execute each planned slot unattended
-        for (int s = 0; s < slotsForProduct.size() && !m_batchCancelled && !hitHardStopError; ++s)
+        // Execute each planned slot unattended (resuming at firstSlotForProduct if paused earlier)
+        for (int s = firstSlotForProduct; s < slotsForProduct.size() && !m_batchCancelled && !hitHardStopError; ++s)
         {
             ++attemptedCreatives;
             const auto &sl = slotsForProduct[s];
@@ -6439,6 +6713,8 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                         {
                             hitHardStopError = true;
                             hardStopReason = friendlyCliError(imgCli, imgRes);
+                            pausedProductIdx = pIdx;
+                            pausedSlotIdx = s;
                             break;
                         }
                         if (imgRes.processStarted && imgRes.exitCode == 0
@@ -6552,6 +6828,23 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 }
                 else
                 {
+                    const bool videoHitQuota = workflow->quotaExceeded()
+                        || videoErr.contains(QStringLiteral("quota"), Qt::CaseInsensitive)
+                        || videoErr.contains(QStringLiteral("daily limit"), Qt::CaseInsensitive)
+                        || videoErr.contains(QStringLiteral("full capacity"), Qt::CaseInsensitive)
+                        || videoErr.contains(QStringLiteral("limit reached"), Qt::CaseInsensitive);
+                    if (videoHitQuota && !m_batchCancelled)
+                    {
+                        hitHardStopError = true;
+                        hardStopReason = videoErr.isEmpty()
+                            ? tr("Gemini video limit reached.")
+                            : videoErr;
+                        pausedProductIdx = pIdx;
+                        pausedSlotIdx = s;
+                        _logProgress(tr("[%1] ⚠ Video limit reached — pausing batch here (%2/%3 saved, resumable later): %4")
+                            .arg(slotTag).arg(completedCreatives).arg(totalCreatives).arg(hardStopReason));
+                        break;
+                    }
                     _logProgress(tr("[%1] Video slot failed: %2")
                         .arg(slotTag, videoErr.isEmpty() ? tr("no video produced") : videoErr));
                 }
@@ -6647,6 +6940,16 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
                 }
                 else
                 {
+                    if (imgCli && imgCli->classifyError(imgRes.errorMessage) != CliErrorKind::Other && !m_batchCancelled)
+                    {
+                        hitHardStopError = true;
+                        hardStopReason = imgRes.errorMessage;
+                        pausedProductIdx = pIdx;
+                        pausedSlotIdx = s;
+                        _logProgress(tr("[%1] ⚠ Image/carousel limit reached — pausing batch here (%2/%3 saved): %4")
+                            .arg(slotTag).arg(completedCreatives).arg(totalCreatives).arg(hardStopReason));
+                        break;
+                    }
                     _logProgress(tr("[%1] Image/carousel slot failed: %2")
                         .arg(slotTag, imgRes.errorMessage));
                 }
@@ -6749,8 +7052,17 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
 
     if (hitHardStopError)
     {
-        _finishProgress(tr("Auto-Batch paused (%1/%2 saved): %3")
-            .arg(completedCreatives).arg(totalCreatives).arg(hardStopReason));
+        m_pausedAutoBatch.active = true;
+        m_pausedAutoBatch.batchSpec = batchSpec;
+        m_pausedAutoBatch.nextProductIndex = qBound(0, pausedProductIdx, qMax(0, int(products.size()) - 1));
+        m_pausedAutoBatch.nextSlotIndex = qBound(0, pausedSlotIdx, qMax(0, generationsPerProduct - 1));
+        m_pausedAutoBatch.completedCreatives = completedCreatives;
+        m_pausedAutoBatch.totalCreatives = totalCreatives;
+        m_pausedAutoBatch.limitReason = hardStopReason;
+        m_pausedAutoBatch.pausedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+        _savePausedAutoBatch();
+        _finishProgress(tr("Auto-Batch paused on limit (%1/%2 saved, %3 remaining): %4")
+            .arg(completedCreatives).arg(totalCreatives).arg(pausedAutoBatchRemaining()).arg(hardStopReason));
     }
     else if (m_batchCancelled)
     {
@@ -6759,10 +7071,18 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec)
     }
     else
     {
+        m_pausedAutoBatch = PausedAutoBatchState{};
+        _savePausedAutoBatch();
         _finishProgress(tr("Auto-Batch finished: %1/%2 creative(s) generated with hooks, captions, and tracking codes.")
             .arg(completedCreatives).arg(totalCreatives));
     }
     m_autoBatchRunning = false;
+    _refreshPausedAutoBatchBanner();
+    emit pausedAutoBatchChanged();
+    if (hitHardStopError)
+    {
+        emit autoBatchPausedOnLimit(completedCreatives, totalCreatives, hardStopReason);
+    }
     emit autoBatchFinished(
         completedCreatives,
         totalCreatives,

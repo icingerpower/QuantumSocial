@@ -766,6 +766,8 @@ QJsonObject SocialStatistics::ReferenceExperimentSummary::toJson() const
             {QStringLiteral("referenceId"), r.referenceId},
             {QStringLiteral("referenceUrl"), r.referenceUrl},
             {QStringLiteral("publishedCount"), r.publishedCount},
+            {QStringLiteral("successCount"), r.successCount},
+            {QStringLiteral("lowPerformerCount"), r.lowPerformerCount},
             {QStringLiteral("medianScore"), r.medianScore},
             {QStringLiteral("avgViews"), r.avgViews},
             {QStringLiteral("bestViews"), r.bestViews},
@@ -774,12 +776,15 @@ QJsonObject SocialStatistics::ReferenceExperimentSummary::toJson() const
             {QStringLiteral("variantCount"), r.variantCount},
             {QStringLiteral("variantMedianScore"), r.variantMedianScore},
             {QStringLiteral("bestStrategy"), r.bestStrategy},
-            {QStringLiteral("isWinner"), r.isWinner}
+            {QStringLiteral("isWinner"), r.isWinner},
+            {QStringLiteral("isRetired"), r.isRetired}
         });
     }
     return QJsonObject{
         {QStringLiteral("totalMeasuredPosts"), totalMeasuredPosts},
         {QStringLiteral("accountMedianScore"), accountMedianScore},
+        {QStringLiteral("accountMeanScore"), accountMeanScore},
+        {QStringLiteral("benchmarkScore"), benchmarkScore},
         {QStringLiteral("winningStrategy"), winningStrategy},
         {QStringLiteral("strategyBreakdown"), stratArr},
         {QStringLiteral("references"), refArr}
@@ -801,14 +806,20 @@ QString SocialStatistics::ReferenceExperimentSummary::humanSummary() const
                      .arg(s.count);
     }
     int winnersCount = 0;
+    int retiredCount = 0;
     for (const auto &r : references)
     {
         if (r.isWinner) ++winnersCount;
+        if (r.isRetired) ++retiredCount;
     }
-    return QStringLiteral("Reference & Variant A/B (%1 measured): %2 · %3 winning source reference(s)%4.")
+    const QString retiredNote = retiredCount > 0
+        ? QStringLiteral(" · %1 low-performing source(s) retired (≥2 flops)").arg(retiredCount)
+        : QString{};
+    return QStringLiteral("Reference & Variant A/B (%1 measured): %2 · %3 winning source reference(s)%4%5.")
         .arg(totalMeasuredPosts)
         .arg(parts.join(QStringLiteral(", ")))
         .arg(winnersCount)
+        .arg(retiredNote)
         .arg(winningStrategy.isEmpty() ? QString{} : QStringLiteral(" · leader=%1").arg(winningStrategy));
 }
 
@@ -847,11 +858,26 @@ QString SocialStatistics::ReferenceExperimentSummary::plannerPromptAddendum() co
             continue;
         }
         ++listed;
-        out += QStringLiteral("  - Proven winning source video %1: avg views=%2 (n=%3, best mode=%4)\n")
+        out += QStringLiteral("  - Proven winning source %1: avg views=%2 (wins=%3/%4, best mode=%5) — PRIVILEGE THIS SOURCE.\n")
             .arg(r.referenceUrl.isEmpty() ? r.referenceId : r.referenceUrl)
             .arg(qRound64(r.avgViews))
+            .arg(r.successCount)
             .arg(r.publishedCount)
             .arg(r.bestStrategy.isEmpty() ? QStringLiteral("reference_swap") : r.bestStrategy);
+    }
+    int retiredListed = 0;
+    for (const auto &r : references)
+    {
+        if (!r.isRetired || retiredListed >= 5)
+        {
+            continue;
+        }
+        ++retiredListed;
+        out += QStringLiteral("  - Retired low-performing source %1: avg views=%2 (%3 low-performing posts out of %4) — AVOID scheduling if better candidates exist.\n")
+            .arg(r.referenceUrl.isEmpty() ? r.referenceId : r.referenceUrl)
+            .arg(qRound64(r.avgViews))
+            .arg(r.lowPerformerCount)
+            .arg(r.publishedCount);
     }
     return out;
 }
@@ -981,6 +1007,25 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
     }
 
     summary.accountMedianScore = medianOfDoubles(allAccountScores);
+    double scoreSum = 0.0;
+    for (double sc : allAccountScores)
+    {
+        scoreSum += sc;
+    }
+    summary.accountMeanScore = allAccountScores.isEmpty()
+        ? 0.0
+        : (scoreSum / double(allAccountScores.size()));
+    if (allAccountScores.size() >= 2)
+    {
+        // Using max(median, 0.55 * mean) prevents 2 low-view flops + 1 viral hit from
+        // lowering the median to the flop level: the hit is recognized from its 1st post,
+        // and both flops are properly counted as low performers.
+        summary.benchmarkScore = qMax(summary.accountMedianScore, summary.accountMeanScore * 0.55);
+    }
+    else if (allAccountScores.size() == 1)
+    {
+        summary.benchmarkScore = 0.045; // ~100 views per 1,000 followers baseline when n=1
+    }
 
     for (auto it = stratMap.cbegin(); it != stratMap.cend(); ++it)
     {
@@ -1019,6 +1064,17 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
         rp.referenceId = it.key();
         rp.referenceUrl = ra.referenceUrl;
         rp.publishedCount = ra.allScores.size();
+        for (double sc : ra.allScores)
+        {
+            if (sc > 0.0 && sc >= summary.benchmarkScore)
+            {
+                ++rp.successCount;
+            }
+            else
+            {
+                ++rp.lowPerformerCount;
+            }
+        }
         rp.medianScore = medianOfDoubles(ra.allScores);
         rp.avgViews = ra.viewsSum / double(rp.publishedCount);
         rp.bestViews = ra.bestViews;
@@ -1047,7 +1103,9 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
         }
         rp.variantCount = nonSwapScores.size();
         rp.variantMedianScore = nonSwapScores.isEmpty() ? -1.0 : medianOfDoubles(nonSwapScores);
-        rp.isWinner = (rp.medianScore > 0.0 && rp.medianScore >= summary.accountMedianScore);
+        rp.isRetired = (rp.lowPerformerCount >= 2 && rp.lowPerformerCount > rp.successCount);
+        rp.isWinner = (!rp.isRetired && rp.successCount >= 1
+                       && rp.medianScore > 0.0 && rp.medianScore >= summary.benchmarkScore);
         summary.references.append(rp);
     }
     std::sort(summary.references.begin(), summary.references.end(),

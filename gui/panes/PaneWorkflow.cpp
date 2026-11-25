@@ -9,17 +9,24 @@
 #include "PaneGeneration.h"
 #include "PaneResearch.h"
 #include "model/FavoriteHooks.h"
+#include "model/PreferredHashtags.h"
 #include "model/TableAccounts.h"
 #include "model/TableProjects.h"
 #include "model/accounts/AbstractSocialAccount.h"
 #include "model/research/ResearchStore.h"
 #include "model/videogen/AbstractVideoGenerator.h"
+#include "model/videogen/TableGenerationSettings.h"
 #include "model/videos/SocialStatistics.h"
 #include "model/videos/TableVideos.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
+#include <QDateTime>
+#include <QDialog>
+#include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
@@ -30,6 +37,7 @@
 #include <QImage>
 #include <QImageReader>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
@@ -41,6 +49,8 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QRegularExpression>
+#include <QSaveFile>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
@@ -90,7 +100,8 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
                            TableVideos *videos,
                            const QList<AbstractCli *> &availableClis,
                            FavoriteHooks *favoriteHooks,
-                           QWidget *parent)
+                           QWidget *parent,
+                           PreferredHashtags *hashtags)
     : QWidget(parent)
     , m_accounts(accounts)
     , m_store(researchStore)
@@ -99,7 +110,9 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     , m_panePublishing(panePublishing)
     , m_videos(videos)
     , m_favoriteHooks(favoriteHooks)
+    , m_hashtags(hashtags)
     , m_clis(availableClis)
+    , m_statsSyncCancelToken(std::make_shared<bool>(false))
     , m_aiPlanCancelFlag(std::make_shared<bool>(false))
 {
     setObjectName(QStringLiteral("paneWorkflow"));
@@ -133,11 +146,21 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     m_headerSummaryLabel->setWordWrap(true);
     topContextRow->addWidget(m_headerSummaryLabel, 1);
 
+    m_btnSyncStats = new QPushButton(tr("↻ Sync Stats"), headerCard);
+    m_btnSyncStats->setObjectName(QStringLiteral("buttonWorkflowSyncStats"));
+    m_btnSyncStats->setToolTip(
+        tr("Fetch latest views, likes, and shares from your social account(s) now so winning inspirations are privileged from their 1st hit and ≥2-flop sources are retired."));
+    m_btnClearGeminiChats = new QPushButton(tr("Clear Gemini Chats"), headerCard);
+    m_btnClearGeminiChats->setObjectName(QStringLiteral("buttonWorkflowClearGeminiChats"));
+    m_btnClearGeminiChats->setToolTip(
+        tr("View and delete leftover Gemini chats saved in the local chat link cache (for example after a crash or interrupted run)."));
     auto *btnOpenResearch = new QPushButton(tr("Open Research…"), headerCard);
     btnOpenResearch->setObjectName(QStringLiteral("buttonWorkflowOpenResearch"));
     btnOpenResearch->setToolTip(tr("Switch to the Research tab to import products, edit account rules, or approve inspirations."));
     auto *btnOpenAccounts = new QPushButton(tr("Accounts…"), headerCard);
     btnOpenAccounts->setObjectName(QStringLiteral("buttonWorkflowOpenAccounts"));
+    topContextRow->addWidget(m_btnSyncStats);
+    topContextRow->addWidget(m_btnClearGeminiChats);
     topContextRow->addWidget(btnOpenResearch);
     topContextRow->addWidget(btnOpenAccounts);
     headerLayout->addLayout(topContextRow);
@@ -178,6 +201,8 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     m_stepStack->addWidget(_buildStep3Page());
     root->addWidget(m_stepStack, 1);
 
+    connect(m_btnSyncStats, &QPushButton::clicked, this, &PaneWorkflow::syncAccountStatisticsNow);
+    connect(m_btnClearGeminiChats, &QPushButton::clicked, this, &PaneWorkflow::openClearGeminiChatsDialog);
     connect(btnOpenResearch, &QPushButton::clicked, this, &PaneWorkflow::openResearchTabRequested);
     connect(btnOpenAccounts, &QPushButton::clicked, this, &PaneWorkflow::openAccountsTabRequested);
 
@@ -224,12 +249,20 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     if (m_paneGeneration)
     {
         connect(m_paneGeneration, &PaneGeneration::autoBatchStarted, this, [this](int total) {
+            if (m_limitBanner)
+            {
+                m_limitBanner->setVisible(false);
+            }
             m_genProgressBox->setVisible(true);
             m_genProgressBar->setRange(0, qMax(1, total));
             m_genProgressBar->setValue(0);
             m_btnCancelGen->setEnabled(true);
             m_btnCancelGen->setVisible(true);
             m_btnGenerateAndNext->setEnabled(false);
+        });
+        connect(m_paneGeneration, &PaneGeneration::pausedAutoBatchChanged, this, [this]() {
+            _updateLimitBanner();
+            _updateHeaderAndStepBadges();
         });
         connect(m_paneGeneration, &PaneGeneration::autoBatchProgress, this,
                 [this](int completed, int total, const QString &msg) {
@@ -254,7 +287,8 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
             m_genProgressBar->setValue(completed);
             if (!errorMsg.isEmpty())
             {
-                m_genStatusLabel->setText(tr("Paused (%1/%2 saved): %3").arg(completed).arg(total).arg(errorMsg));
+                m_genStatusLabel->setText(tr("⚠ Limit reached (%1/%2 saved): %3")
+                    .arg(completed).arg(total).arg(errorMsg));
             }
             else if (cancelled)
             {
@@ -264,10 +298,12 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
             {
                 m_genStatusLabel->setText(tr("Finished: %1/%2 creative(s) generated!").arg(completed).arg(total));
             }
+            _updateLimitBanner();
             _updateStep1SummaryAndButtons();
             _updateHeaderAndStepBadges();
 
-            const bool shouldAdvance = m_triggeredBatchFromWorkflow && completed > 0;
+            const bool hitLimitPause = !errorMsg.isEmpty() || (m_paneGeneration && m_paneGeneration->hasPausedAutoBatch());
+            const bool shouldAdvance = m_triggeredBatchFromWorkflow && completed > 0 && !cancelled && !hitLimitPause;
             m_triggeredBatchFromWorkflow = false;
             if (shouldAdvance)
             {
@@ -312,6 +348,10 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
 
 PaneWorkflow::~PaneWorkflow()
 {
+    if (m_statsSyncCancelToken)
+    {
+        *m_statsSyncCancelToken = true;
+    }
     if (m_aiPlanCancelFlag)
     {
         *m_aiPlanCancelFlag = true;
@@ -521,7 +561,63 @@ QWidget *PaneWorkflow::_buildStep1Page()
     m_chkFormatImage->setChecked(uiSettings.value(QStringLiteral("autoBatch/includeImage"), false).toBool());
     form->addRow(QString{}, m_chkFormatImage);
 
+    m_chkAutoSyncStats = new QCheckBox(
+        tr("Auto-sync latest account statistics before generating"), rightBox);
+    m_chkAutoSyncStats->setObjectName(QStringLiteral("checkWorkflowAutoSyncStats"));
+    m_chkAutoSyncStats->setToolTip(
+        tr("Automatically scans your account for newly published posts or stale (>30 min) stats before Step 1 generation so yesterday's winners are immediately privileged."));
+    m_chkAutoSyncStats->setChecked(uiSettings.value(QStringLiteral("autoBatch/autoSyncStats"), true).toBool());
+    form->addRow(QString{}, m_chkAutoSyncStats);
+
     rightLayout->addLayout(form);
+
+    // Limit reached / paused batch decision panel (hidden unless a batch paused on quota/limit)
+    m_limitBanner = new QFrame(rightBox);
+    m_limitBanner->setObjectName(QStringLiteral("widgetWorkflowLimitBanner"));
+    m_limitBanner->setFrameShape(QFrame::StyledPanel);
+    m_limitBanner->setStyleSheet(QStringLiteral(
+        "QFrame#widgetWorkflowLimitBanner { background: rgba(217, 119, 6, 0.20); "
+        "border: 1px solid rgba(251, 191, 36, 0.65); border-radius: 6px; }"));
+    auto *limitLayout = new QVBoxLayout(m_limitBanner);
+    limitLayout->setContentsMargins(10, 8, 10, 8);
+    limitLayout->setSpacing(6);
+
+    m_limitBannerLabel = new QLabel(m_limitBanner);
+    m_limitBannerLabel->setObjectName(QStringLiteral("labelWorkflowLimitReason"));
+    m_limitBannerLabel->setWordWrap(true);
+    m_limitBannerLabel->setStyleSheet(QStringLiteral("border: none; background: transparent; color: #fde68a; font-weight: 600;"));
+    limitLayout->addWidget(m_limitBannerLabel);
+
+    auto *limitBtns = new QHBoxLayout;
+    limitBtns->setSpacing(6);
+    m_btnPauseAndPublish = new QPushButton(tr("⏸ Publish Now && Resume Later →"), m_limitBanner);
+    m_btnPauseAndPublish->setObjectName(QStringLiteral("buttonWorkflowPauseAndPublish"));
+    m_btnPauseAndPublish->setToolTip(
+        tr("Move temporarily to Step 2 / Step 3 to publish already-generated creatives while keeping the remaining slots paused so you can come back and resume later."));
+    m_btnPauseAndPublish->setStyleSheet(QStringLiteral(
+        "QPushButton { background: #2563eb; color: white; font-weight: 700; padding: 5px 10px; border-radius: 5px; }"));
+
+    m_btnStopAndPublish = new QPushButton(tr("⏹ Stop Batch && Publish →"), m_limitBanner);
+    m_btnStopAndPublish->setObjectName(QStringLiteral("buttonWorkflowStopAndPublish"));
+    m_btnStopAndPublish->setToolTip(
+        tr("Stop and discard the remaining slots permanently, then move to Step 2 to publish what was already generated."));
+    m_btnStopAndPublish->setStyleSheet(QStringLiteral(
+        "QPushButton { background: rgba(220, 38, 38, 0.28); border: 1px solid rgba(248, 113, 113, 0.60); "
+        "color: #fca5a5; font-weight: 700; padding: 5px 10px; border-radius: 5px; }"));
+
+    m_btnResumeBatch = new QPushButton(tr("▶ Resume Remaining"), m_limitBanner);
+    m_btnResumeBatch->setObjectName(QStringLiteral("buttonWorkflowResumeBatch"));
+    m_btnResumeBatch->setToolTip(
+        tr("Resume generating the remaining creatives from where the batch paused (uses the currently selected CLIs above)."));
+    m_btnResumeBatch->setStyleSheet(QStringLiteral(
+        "QPushButton { background: #16a34a; color: white; font-weight: 700; padding: 5px 10px; border-radius: 5px; }"));
+
+    limitBtns->addWidget(m_btnPauseAndPublish);
+    limitBtns->addWidget(m_btnStopAndPublish);
+    limitBtns->addWidget(m_btnResumeBatch);
+    limitLayout->addLayout(limitBtns);
+    m_limitBanner->setVisible(false);
+    rightLayout->addWidget(m_limitBanner);
 
     // Inline generation progress box
     m_genProgressBox = new QWidget(rightBox);
@@ -669,11 +765,60 @@ QWidget *PaneWorkflow::_buildStep1Page()
     connect(m_chkFormatVideo, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
     connect(m_chkFormatCarousel, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
     connect(m_chkFormatImage, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
+    connect(m_chkAutoSyncStats, &QCheckBox::toggled, this, [this](bool checked) {
+        if (m_store)
+        {
+            QSettings s(m_store->directory().filePath(QStringLiteral("ui.ini")), QSettings::IniFormat);
+            s.setValue(QStringLiteral("autoBatch/autoSyncStats"), checked);
+        }
+    });
 
     connect(m_btnCancelGen, &QPushButton::clicked, this, [this]() {
+        m_statsSyncCancelled = true;
+        if (m_statsSyncCancelToken)
+        {
+            *m_statsSyncCancelToken = true;
+        }
         if (m_paneGeneration)
         {
             m_paneGeneration->cancelAutoBatch();
+        }
+    });
+    connect(m_btnPauseAndPublish, &QPushButton::clicked, this, [this]() {
+        // Keep paused batch checkpoint intact so user can return to Step 1 or Generation tab to resume later!
+        refreshStep2Candidates(false);
+        setCurrentStep(1);
+    });
+    connect(m_btnStopAndPublish, &QPushButton::clicked, this, [this]() {
+        if (m_paneGeneration)
+        {
+            m_paneGeneration->discardPausedAutoBatch();
+        }
+        _updateLimitBanner();
+        _updateHeaderAndStepBadges();
+        refreshStep2Candidates(false);
+        setCurrentStep(1);
+    });
+    connect(m_btnResumeBatch, &QPushButton::clicked, this, [this]() {
+        if (!m_paneGeneration || !m_paneGeneration->hasPausedAutoBatch() || m_paneGeneration->isAutoBatchRunning())
+        {
+            return;
+        }
+        _saveStep1Settings();
+        QString promptCliName;
+        QString imageCliName;
+        if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
+        {
+            promptCliName = pCli->getName();
+        }
+        if (auto *iCli = m_comboImageCli ? m_comboImageCli->currentData().value<AbstractCli *>() : nullptr)
+        {
+            imageCliName = iCli->getName();
+        }
+        m_triggeredBatchFromWorkflow = true;
+        if (!m_paneGeneration->resumePausedAutoBatch(promptCliName, imageCliName))
+        {
+            m_triggeredBatchFromWorkflow = false;
         }
     });
     connect(m_btnSkipToStep2, &QPushButton::clicked, this, [this]() {
@@ -682,6 +827,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
     });
     connect(m_btnGenerateAndNext, &QPushButton::clicked, this, &PaneWorkflow::startStep1Generation);
 
+    _updateLimitBanner();
     return page;
 }
 
@@ -1214,12 +1360,36 @@ void PaneWorkflow::refreshStep1Products()
     }
 
     int approvedRefCount = 0;
+    QSet<QString> approvedRefIds;
     for (const QJsonValue &v : m_store->references())
     {
         const QJsonObject r = v.toObject();
         if (jsonText(r, "accountId") == curAccount && jsonText(r, "status") == QLatin1String("approved"))
         {
             ++approvedRefCount;
+            approvedRefIds.insert(jsonText(r, "id"));
+        }
+    }
+
+    int winnerApprovedCount = 0;
+    int retiredApprovedCount = 0;
+    if (approvedRefCount > 0 && m_videos)
+    {
+        const auto refExp = SocialStatistics::summarizeReferenceExperiment(m_videos);
+        for (const auto &rp : refExp.references)
+        {
+            if (!approvedRefIds.contains(rp.referenceId))
+            {
+                continue;
+            }
+            if (rp.isWinner)
+            {
+                ++winnerApprovedCount;
+            }
+            else if (rp.isRetired)
+            {
+                ++retiredApprovedCount;
+            }
         }
     }
 
@@ -1240,10 +1410,26 @@ void PaneWorkflow::refreshStep1Products()
     }
     else if (approvedRefCount > 0)
     {
-        m_inspirationsInfoLabel->setText(
-            tr("✓ %1 approved inspiration(s) ready for this account — QuantumSocial will automatically blend "
-               "proven inspirations & measured Recorder adaptation methods (80% winners, 20% exploration).")
-                .arg(approvedRefCount));
+        const int activeApprovedCount = qMax(0, approvedRefCount - retiredApprovedCount);
+        if (winnerApprovedCount > 0 || retiredApprovedCount > 0)
+        {
+            const QString retiredPart = retiredApprovedCount > 0
+                ? tr(", %1 retired after ≥2 low performers").arg(retiredApprovedCount)
+                : QString{};
+            m_inspirationsInfoLabel->setText(
+                tr("✓ %1 active inspiration(s) ready (★ %2 proven winner(s) privileged at 80%%3) — "
+                   "privileging sources from their 1st win && stopping reuse after 2 low performers.")
+                    .arg(activeApprovedCount)
+                    .arg(winnerApprovedCount)
+                    .arg(retiredPart));
+        }
+        else
+        {
+            m_inspirationsInfoLabel->setText(
+                tr("✓ %1 approved inspiration(s) ready for this account — QuantumSocial privileges any source "
+                   "from its 1st winning post (80% winners, 20% exploration) and stops reusing sources after 2 low performers.")
+                    .arg(approvedRefCount));
+        }
     }
     else
     {
@@ -1379,7 +1565,12 @@ void PaneWorkflow::_updateStep1SummaryAndButtons()
         && m_comboImageCli->currentData().value<AbstractCli *>() != nullptr;
     const int perProd = m_spinGenPerProduct ? m_spinGenPerProduct->value() : 1;
     const int totalToGen = checkedCount * perProd;
-    const bool batchRunning = m_paneGeneration && m_paneGeneration->isAutoBatchRunning();
+    const bool batchRunning = (m_paneGeneration && m_paneGeneration->isAutoBatchRunning()) || m_syncingStats;
+
+    if (m_btnSyncStats)
+    {
+        m_btnSyncStats->setEnabled(!batchRunning && m_accounts && m_accounts->rowCount() > 0);
+    }
 
     if (m_selectedProductsLabel)
     {
@@ -1439,8 +1630,146 @@ void PaneWorkflow::_saveStep1Settings() const
     settings.setValue(QStringLiteral("autoBatch/includeCarousel"), m_chkFormatCarousel->isChecked());
     settings.setValue(QStringLiteral("autoBatch/carouselHookOverlay"), m_chkCarouselOverlay->isChecked());
     settings.setValue(QStringLiteral("autoBatch/includeImage"), m_chkFormatImage->isChecked());
+    if (m_chkAutoSyncStats)
+    {
+        settings.setValue(QStringLiteral("autoBatch/autoSyncStats"), m_chkAutoSyncStats->isChecked());
+    }
     settings.setValue(QStringLiteral("autoBatch/videoFormat"), m_comboAspectFormat->currentText());
     settings.setValue(QStringLiteral("autoBatch/videoGeneratorId"), m_comboVideoGen->currentData().toString());
+}
+
+bool PaneWorkflow::needsStatsSyncBeforeGeneration() const
+{
+    if (!m_accounts || m_accounts->rowCount() == 0 || !m_videos)
+    {
+        return false;
+    }
+    bool hasAnySupportedAccount = false;
+    for (int r = 0; r < m_accounts->rowCount(); ++r)
+    {
+        const QString typeStr = m_accounts->data(m_accounts->index(r, TableAccounts::IND_TYPE)).toString();
+        const QString urlStr = m_accounts->data(m_accounts->index(r, TableAccounts::IND_URL)).toString().trimmed();
+        AbstractSocialAccount *acc = SocialStatistics::resolveSocialAccount(typeStr);
+        if (acc && acc->supportsAccountVideoStatistics() && !urlStr.isEmpty())
+        {
+            hasAnySupportedAccount = true;
+            break;
+        }
+    }
+    if (!hasAnySupportedAccount)
+    {
+        return false;
+    }
+
+    int publishedCount = 0;
+    QDateTime latestFetchUtc;
+    for (int r = 0; r < m_videos->rowCount(); ++r)
+    {
+        const auto *rec = m_videos->recordAt(r);
+        if (!rec || (!rec->published && rec->publications.isEmpty()))
+        {
+            continue;
+        }
+        ++publishedCount;
+        if (rec->publications.isEmpty())
+        {
+            return true;
+        }
+        for (const auto &pub : rec->publications)
+        {
+            if (pub.snapshots.isEmpty())
+            {
+                return true;
+            }
+            for (const auto &snap : pub.snapshots)
+            {
+                if (snap.fetchDate.isValid())
+                {
+                    const QDateTime fUtc = snap.fetchDate.toUTC();
+                    if (!latestFetchUtc.isValid() || fUtc > latestFetchUtc)
+                    {
+                        latestFetchUtc = fUtc;
+                    }
+                }
+            }
+        }
+    }
+    if (publishedCount == 0)
+    {
+        return false;
+    }
+    if (!latestFetchUtc.isValid())
+    {
+        return true;
+    }
+    return latestFetchUtc.secsTo(QDateTime::currentDateTimeUtc()) > 1800;
+}
+
+void PaneWorkflow::syncAccountStatisticsNow()
+{
+    if (m_syncingStats || (m_paneGeneration && m_paneGeneration->isAutoBatchRunning()))
+    {
+        return;
+    }
+    m_statsSyncTask = std::make_unique<QCoro::Task<void>>(_syncStatsCoroutine(false));
+}
+
+QCoro::Task<void> PaneWorkflow::_syncStatsCoroutine(bool startGenerationAfter)
+{
+    if (!m_accounts || !m_videos || m_syncingStats)
+    {
+        co_return;
+    }
+    m_syncingStats = true;
+    m_statsSyncCancelled = false;
+    m_statsSyncCancelToken = std::make_shared<bool>(false);
+    const auto cancelToken = m_statsSyncCancelToken;
+    const QPointer<PaneWorkflow> self(this);
+
+    if (m_btnSyncStats)
+    {
+        m_btnSyncStats->setText(tr("↻ Syncing Stats…"));
+    }
+    m_genProgressBox->setVisible(true);
+    m_genProgressBar->setRange(0, 0);
+    m_btnCancelGen->setEnabled(true);
+    m_btnCancelGen->setVisible(true);
+    m_genStatusLabel->setText(tr("Syncing latest account statistics to detect winning && low-performing sources…"));
+    m_genLogConsole->appendPlainText(
+        QTime::currentTime().toString(QStringLiteral("HH:mm:ss  "))
+        + tr("↻ Syncing latest published post statistics from your social account(s)…"));
+    _updateStep1SummaryAndButtons();
+
+    co_await SocialStatistics::retrieveFromAccounts(
+        m_accounts, m_videos, nullptr, m_hashtags, m_favoriteHooks);
+
+    if (!self || (cancelToken && *cancelToken))
+    {
+        co_return;
+    }
+
+    m_syncingStats = false;
+    if (m_btnSyncStats)
+    {
+        m_btnSyncStats->setText(tr("↻ Sync Stats"));
+    }
+    m_genProgressBar->setRange(0, 1);
+    m_genProgressBar->setValue(1);
+    m_btnCancelGen->setVisible(false);
+
+    const auto refExp = SocialStatistics::summarizeReferenceExperiment(m_videos);
+    m_genLogConsole->appendPlainText(
+        QTime::currentTime().toString(QStringLiteral("HH:mm:ss  "))
+        + tr("✓ Statistics synced — %1").arg(refExp.humanSummary()));
+    m_genStatusLabel->setText(tr("Statistics synced."));
+
+    refreshStep1Products();
+    _updateHeaderAndStepBadges();
+
+    if (startGenerationAfter && !m_statsSyncCancelled)
+    {
+        _launchStep1AutoBatchNow();
+    }
 }
 
 void PaneWorkflow::startStep1Generation()
@@ -1449,13 +1778,35 @@ void PaneWorkflow::startStep1Generation()
     {
         return;
     }
-    if (m_paneGeneration->isAutoBatchRunning())
+    if (m_syncingStats || m_paneGeneration->isAutoBatchRunning())
     {
         return;
     }
     _syncResearchAccountSelection();
     _saveStep1Settings();
 
+    const QStringList chosenIds = _checkedStep1ProductIds();
+    if (chosenIds.isEmpty())
+    {
+        return;
+    }
+
+    m_genLogConsole->clear();
+    if (m_chkAutoSyncStats && m_chkAutoSyncStats->isChecked() && needsStatsSyncBeforeGeneration())
+    {
+        m_statsSyncTask = std::make_unique<QCoro::Task<void>>(_syncStatsCoroutine(true));
+        return;
+    }
+
+    _launchStep1AutoBatchNow();
+}
+
+void PaneWorkflow::_launchStep1AutoBatchNow()
+{
+    if (!m_paneResearch || !m_paneGeneration || m_paneGeneration->isAutoBatchRunning())
+    {
+        return;
+    }
     const QStringList chosenIds = _checkedStep1ProductIds();
     if (chosenIds.isEmpty())
     {
@@ -1481,7 +1832,6 @@ void PaneWorkflow::startStep1Generation()
     }
     spec.insert(QStringLiteral("suppressModalProgressDialog"), true);
 
-    m_genLogConsole->clear();
     m_triggeredBatchFromWorkflow = true;
     if (!m_paneGeneration->startAutoBatch(spec))
     {
@@ -1950,6 +2300,33 @@ void PaneWorkflow::startStep3PublishJob()
     _updateHeaderAndStepBadges();
 }
 
+void PaneWorkflow::_updateLimitBanner()
+{
+    if (!m_limitBanner)
+    {
+        return;
+    }
+    const bool hasPaused = m_paneGeneration && m_paneGeneration->hasPausedAutoBatch()
+        && !m_paneGeneration->isAutoBatchRunning();
+    m_limitBanner->setVisible(hasPaused);
+    if (!hasPaused)
+    {
+        return;
+    }
+    const int done = m_paneGeneration->pausedAutoBatchCompleted();
+    const int total = m_paneGeneration->pausedAutoBatchTotal();
+    const int rem = m_paneGeneration->pausedAutoBatchRemaining();
+    const QString reason = m_paneGeneration->pausedAutoBatchReason();
+    m_limitBannerLabel->setText(
+        tr("⚠ Limit reached — %1/%2 creative(s) saved (%3 remaining).\n%4\n"
+           "Choose to move temporarily to Publish (and resume later from Step 1 or the Generation tab), "
+           "or stop this batch and move to Publish.")
+            .arg(done).arg(total).arg(rem)
+            .arg(reason.isEmpty() ? tr("Provider quota or rate limit reached.") : reason));
+    m_btnResumeBatch->setText(tr("▶ Resume Remaining (%1)").arg(rem));
+    m_btnResumeBatch->setEnabled(!m_syncingStats);
+}
+
 void PaneWorkflow::_updateHeaderAndStepBadges()
 {
     int eligibleProducts = 0;
@@ -1989,10 +2366,32 @@ void PaneWorkflow::_updateHeaderAndStepBadges()
             tr("%1 eligible product(s) · %2 approved inspiration(s) · %3 unpublished creative(s)")
                 .arg(eligibleProducts).arg(approvedRefs).arg(unpublishedCount));
     }
+    if (m_btnClearGeminiChats)
+    {
+        const int cachedChatsCount = loadGeminiChatCache().size();
+        m_btnClearGeminiChats->setText(cachedChatsCount > 0
+            ? tr("Clear Gemini Chats (%1)").arg(cachedChatsCount)
+            : tr("Clear Gemini Chats"));
+    }
     if (m_btnStep1)
     {
-        m_btnStep1->setText(tr("1. Pick Products (%1 checked)").arg(m_checkedProductIds.size()));
+        if (m_paneGeneration && m_paneGeneration->hasPausedAutoBatch() && !m_paneGeneration->isAutoBatchRunning())
+        {
+            m_btnStep1->setText(tr("1. Pick Products (⚠ Limit · %1 left)")
+                .arg(m_paneGeneration->pausedAutoBatchRemaining()));
+            if (currentStep() != 0)
+            {
+                m_btnStep1->setStyleSheet(QStringLiteral(
+                    "QPushButton { background: rgba(217, 119, 6, 0.25); color: #fde68a; font-weight: 700; "
+                    "border: 1px solid rgba(251, 191, 36, 0.70); border-radius: 6px; padding: 6px 12px; }"));
+            }
+        }
+        else
+        {
+            m_btnStep1->setText(tr("1. Pick Products (%1 checked)").arg(m_checkedProductIds.size()));
+        }
     }
+    _updateLimitBanner();
     if (m_btnStep2)
     {
         m_btnStep2->setText(m_step2Initialized
@@ -2011,4 +2410,378 @@ void PaneWorkflow::_updateHeaderAndStepBadges()
         }
     }
     _updateStep1SummaryAndButtons();
+}
+
+QString PaneWorkflow::geminiChatCachePath()
+{
+    const QString overridePath = qEnvironmentVariable("QS_GEMINI_CHAT_CACHE_PATH").trimmed();
+    if (!overridePath.isEmpty())
+    {
+        return overridePath;
+    }
+    return QDir(QDir::homePath()).filePath(QStringLiteral(".cache/quantumsocial/gemini_chat_cache.json"));
+}
+
+QList<PaneWorkflow::GeminiCachedChat> PaneWorkflow::loadGeminiChatCache()
+{
+    QList<GeminiCachedChat> chats;
+    QFile file(geminiChatCachePath());
+    if (!file.open(QIODevice::ReadOnly))
+    {
+        return chats;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError)
+    {
+        return chats;
+    }
+    const QJsonArray arr = doc.isObject()
+        ? doc.object().value(QStringLiteral("chats")).toArray()
+        : (doc.isArray() ? doc.array() : QJsonArray{});
+
+    static const QRegularExpression chatIdRe(QStringLiteral("/app/([a-zA-Z0-9_-]{6,})"));
+    QSet<QString> seenIds;
+    for (const QJsonValue &val : arr)
+    {
+        if (!val.isObject())
+        {
+            continue;
+        }
+        const QJsonObject obj = val.toObject();
+        const QString url = obj.value(QStringLiteral("url")).toString().trimmed();
+        QString chatId = obj.value(QStringLiteral("chatId")).toString().trimmed();
+        if (chatId.isEmpty() && !url.isEmpty())
+        {
+            const auto match = chatIdRe.match(url);
+            if (match.hasMatch())
+            {
+                chatId = match.captured(1);
+            }
+        }
+        if (url.isEmpty() || chatId.isEmpty() || seenIds.contains(chatId))
+        {
+            continue;
+        }
+        seenIds.insert(chatId);
+        GeminiCachedChat item;
+        item.chatId = chatId;
+        item.url = url;
+        item.createdAt = obj.value(QStringLiteral("createdAt")).toString().trimmed();
+        item.status = obj.value(QStringLiteral("status")).toString().trimmed();
+        if (item.status.isEmpty())
+        {
+            item.status = QStringLiteral("active");
+        }
+        chats.append(item);
+    }
+
+    std::sort(chats.begin(), chats.end(), [](const GeminiCachedChat &a, const GeminiCachedChat &b) {
+        const QDateTime dtA = QDateTime::fromString(a.createdAt, Qt::ISODate);
+        const QDateTime dtB = QDateTime::fromString(b.createdAt, Qt::ISODate);
+        if (dtA.isValid() && dtB.isValid() && dtA != dtB)
+        {
+            return dtA > dtB;
+        }
+        return a.createdAt > b.createdAt;
+    });
+    return chats;
+}
+
+bool PaneWorkflow::saveGeminiChatCache(const QList<GeminiCachedChat> &chats)
+{
+    const QString path = geminiChatCachePath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QJsonArray arr;
+    for (const auto &c : chats)
+    {
+        if (c.url.trimmed().isEmpty() || c.chatId.trimmed().isEmpty())
+        {
+            continue;
+        }
+        QJsonObject obj;
+        obj.insert(QStringLiteral("chatId"), c.chatId.trimmed());
+        obj.insert(QStringLiteral("url"), c.url.trimmed());
+        obj.insert(QStringLiteral("createdAt"), c.createdAt.trimmed());
+        obj.insert(QStringLiteral("status"), c.status.trimmed().isEmpty()
+            ? QStringLiteral("active") : c.status.trimmed());
+        arr.append(obj);
+    }
+    QJsonObject root;
+    root.insert(QStringLiteral("chats"), arr);
+
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly))
+    {
+        return false;
+    }
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    return file.commit();
+}
+
+void PaneWorkflow::openClearGeminiChatsDialog()
+{
+    class ClearGeminiChatsDialog final : public QDialog
+    {
+    public:
+        explicit ClearGeminiChatsDialog(bool *busyFlag, QWidget *parent)
+            : QDialog(parent)
+            , m_busyFlag(busyFlag)
+        {
+        }
+        void reject() override
+        {
+            if (m_busyFlag && *m_busyFlag)
+            {
+                return;
+            }
+            QDialog::reject();
+        }
+    protected:
+        void closeEvent(QCloseEvent *event) override
+        {
+            if (m_busyFlag && *m_busyFlag)
+            {
+                event->ignore();
+                return;
+            }
+            QDialog::closeEvent(event);
+        }
+    private:
+        bool *m_busyFlag = nullptr;
+    };
+
+    bool deleting = false;
+    ClearGeminiChatsDialog dialog(&deleting, this);
+    dialog.setObjectName(QStringLiteral("dialogClearGeminiChats"));
+    dialog.setWindowTitle(tr("Clear Gemini Chats"));
+    dialog.setMinimumSize(780, 440);
+
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
+
+    auto *infoLabel = new QLabel(
+        tr("Gemini chats are deleted automatically once a video finishes downloading or fails.\n"
+           "Any leftover chats from crashes, forced exits, or failed cleanups appear below with their creation date."),
+        &dialog);
+    infoLabel->setWordWrap(true);
+    layout->addWidget(infoLabel);
+
+    auto *table = new QTableWidget(&dialog);
+    table->setObjectName(QStringLiteral("tableGeminiCachedChats"));
+    table->setColumnCount(3);
+    table->setHorizontalHeaderLabels({tr("Creation Date"), tr("Gemini Chat URL"), tr("Status")});
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setAlternatingRowColors(true);
+    table->verticalHeader()->setVisible(false);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    layout->addWidget(table, 1);
+
+    auto *statusLabel = new QLabel(&dialog);
+    statusLabel->setObjectName(QStringLiteral("labelClearGeminiChatsStatus"));
+    statusLabel->setWordWrap(true);
+    layout->addWidget(statusLabel);
+
+    auto *btnRow = new QHBoxLayout;
+    auto *btnDelete = new QPushButton(tr("Delete"), &dialog);
+    btnDelete->setObjectName(QStringLiteral("buttonDeleteSelectedGeminiChats"));
+    btnDelete->setToolTip(tr("Delete the selected Gemini chat(s) from Gemini and remove them from the cache."));
+    auto *btnDeleteAll = new QPushButton(tr("Delete all"), &dialog);
+    btnDeleteAll->setObjectName(QStringLiteral("buttonDeleteAllGeminiChats"));
+    btnDeleteAll->setToolTip(tr("Delete every cached Gemini chat listed above."));
+    auto *btnRefresh = new QPushButton(tr("Refresh"), &dialog);
+    btnRefresh->setObjectName(QStringLiteral("buttonRefreshGeminiChats"));
+    auto *btnClose = new QPushButton(tr("Close"), &dialog);
+    btnClose->setObjectName(QStringLiteral("buttonCloseGeminiChats"));
+
+    btnRow->addWidget(btnDelete);
+    btnRow->addWidget(btnDeleteAll);
+    btnRow->addWidget(btnRefresh);
+    btnRow->addStretch(1);
+    btnRow->addWidget(btnClose);
+    layout->addLayout(btnRow);
+
+    std::unique_ptr<QCoro::Task<void>> deleteTask;
+
+    const auto updateButtons = [&]() {
+        const bool hasRows = table->rowCount() > 0;
+        const bool hasSelection = !table->selectionModel()->selectedRows().isEmpty();
+        btnDelete->setEnabled(!deleting && hasSelection);
+        btnDeleteAll->setEnabled(!deleting && hasRows);
+        btnRefresh->setEnabled(!deleting);
+        btnClose->setEnabled(!deleting);
+    };
+
+    const auto populateTable = [&](const QString &overrideStatus = QString{}) {
+        const QList<GeminiCachedChat> chats = loadGeminiChatCache();
+        table->setRowCount(chats.size());
+        for (int i = 0; i < chats.size(); ++i)
+        {
+            const auto &chat = chats[i];
+            const QDateTime dt = QDateTime::fromString(chat.createdAt, Qt::ISODate);
+            const QString dateDisplay = dt.isValid()
+                ? dt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))
+                : (chat.createdAt.isEmpty() ? tr("Unknown date") : chat.createdAt);
+
+            auto *dateItem = new QTableWidgetItem(dateDisplay);
+            dateItem->setData(Qt::UserRole, chat.url);
+            dateItem->setData(Qt::UserRole + 1, chat.chatId);
+            auto *urlItem = new QTableWidgetItem(chat.url);
+            urlItem->setToolTip(chat.url);
+            auto *statusItem = new QTableWidgetItem(chat.status);
+
+            table->setItem(i, 0, dateItem);
+            table->setItem(i, 1, urlItem);
+            table->setItem(i, 2, statusItem);
+        }
+        if (!overrideStatus.isEmpty())
+        {
+            statusLabel->setText(overrideStatus);
+        }
+        else if (chats.isEmpty())
+        {
+            statusLabel->setText(tr("No leftover Gemini chats in cache."));
+        }
+        else
+        {
+            statusLabel->setText(tr("%1 cached Gemini chat(s). Select row(s) and click Delete, or click Delete all.")
+                .arg(chats.size()));
+        }
+        updateButtons();
+        _updateHeaderAndStepBadges();
+    };
+
+    const auto runDeletion = [&](const QStringList &urlsToDelete) {
+        if (deleting || urlsToDelete.isEmpty())
+        {
+            return;
+        }
+        if (m_paneGeneration && m_paneGeneration->isAutoBatchRunning())
+        {
+            QMessageBox::warning(&dialog, tr("Generation Running"),
+                tr("A generation batch is currently running. Wait for it to finish or cancel it before clearing Gemini chats."));
+            return;
+        }
+        AbstractVideoGenerator *generator = m_geminiGeneratorOverride
+            ? m_geminiGeneratorOverride
+            : AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(QStringLiteral("gemini-browser"));
+        if (!generator)
+        {
+            statusLabel->setText(tr("Gemini video generator backend is not available."));
+            return;
+        }
+
+        QVariantMap settings;
+        if (m_paneGeneration && m_paneGeneration->generationSettings())
+        {
+            settings = m_paneGeneration->generationSettings()->settingsFor(QStringLiteral("gemini-browser"));
+        }
+        deleting = true;
+        updateButtons();
+        statusLabel->setText(tr("Deleting %1 Gemini chat(s) in browser…").arg(urlsToDelete.size()));
+
+        QPointer<QDialog> dlgGuard(&dialog);
+        deleteTask = std::make_unique<QCoro::Task<void>>(
+            [this, generator, urlsToDelete, settings, dlgGuard, &deleting, populateTable]() -> QCoro::Task<void> {
+                const auto res = co_await generator->deleteConversations(urlsToDelete, settings);
+                if (!res.deletedUrls.isEmpty())
+                {
+                    QSet<QString> deletedSet(res.deletedUrls.begin(), res.deletedUrls.end());
+                    static const QRegularExpression chatIdRe(QStringLiteral("/app/([a-zA-Z0-9_-]{6,})"));
+                    QSet<QString> deletedIds;
+                    for (const QString &u : res.deletedUrls)
+                    {
+                        const auto m = chatIdRe.match(u);
+                        if (m.hasMatch())
+                        {
+                            deletedIds.insert(m.captured(1));
+                        }
+                    }
+                    QList<GeminiCachedChat> remaining;
+                    for (const auto &entry : loadGeminiChatCache())
+                    {
+                        if (!deletedSet.contains(entry.url) && !deletedIds.contains(entry.chatId))
+                        {
+                            remaining.append(entry);
+                        }
+                    }
+                    saveGeminiChatCache(remaining);
+                }
+
+                deleting = false;
+                if (!dlgGuard)
+                {
+                    co_return;
+                }
+                QString summary;
+                if (res.failedUrls.isEmpty() && res.errorMessage.isEmpty())
+                {
+                    summary = tr("Deleted %1 Gemini chat(s).").arg(res.deletedUrls.size());
+                }
+                else if (!res.deletedUrls.isEmpty())
+                {
+                    summary = tr("Deleted %1 chat(s); %2 could not be deleted%3")
+                        .arg(res.deletedUrls.size())
+                        .arg(res.failedUrls.size())
+                        .arg(res.errorMessage.isEmpty() ? QStringLiteral(".")
+                                                        : QStringLiteral(": ") + res.errorMessage);
+                }
+                else
+                {
+                    summary = res.errorMessage.isEmpty()
+                        ? tr("Could not delete the selected Gemini chat(s). Check your Chrome login/profile and try again.")
+                        : tr("Could not delete Gemini chat(s): %1").arg(res.errorMessage);
+                }
+                populateTable(summary);
+            }());
+    };
+
+    connect(table, &QTableWidget::itemSelectionChanged, &dialog, updateButtons);
+    connect(btnRefresh, &QPushButton::clicked, &dialog, [&]() { populateTable(); });
+    connect(btnDelete, &QPushButton::clicked, &dialog, [&]() {
+        QStringList selectedUrls;
+        const auto selectedRows = table->selectionModel()->selectedRows();
+        for (const QModelIndex &idx : selectedRows)
+        {
+            if (auto *item = table->item(idx.row(), 0))
+            {
+                const QString url = item->data(Qt::UserRole).toString().trimmed();
+                if (!url.isEmpty() && !selectedUrls.contains(url))
+                {
+                    selectedUrls.append(url);
+                }
+            }
+        }
+        runDeletion(selectedUrls);
+    });
+    connect(btnDeleteAll, &QPushButton::clicked, &dialog, [&]() {
+        QStringList allUrls;
+        for (int r = 0; r < table->rowCount(); ++r)
+        {
+            if (auto *item = table->item(r, 0))
+            {
+                const QString url = item->data(Qt::UserRole).toString().trimmed();
+                if (!url.isEmpty() && !allUrls.contains(url))
+                {
+                    allUrls.append(url);
+                }
+            }
+        }
+        runDeletion(allUrls);
+    });
+    connect(btnClose, &QPushButton::clicked, &dialog, [&]() {
+        if (!deleting)
+        {
+            dialog.accept();
+        }
+    });
+
+    populateTable();
+    dialog.exec();
+    _updateHeaderAndStepBadges();
 }

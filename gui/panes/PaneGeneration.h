@@ -90,10 +90,19 @@ public:
     void setSelectedPromptCli(const QString &cliName);
 
     TableProjects *projectsModel() const { return m_projects; }
+    TableGenerationSettings *generationSettings() const { return m_generationSettings; }
     bool createResearchProject(const QJsonObject &context, const QString &imagePath);
     bool startAutoBatch(const QJsonObject &batchSpec);
     bool isAutoBatchRunning() const { return m_autoBatchRunning; }
     void cancelAutoBatch();
+    bool hasPausedAutoBatch() const;
+    int pausedAutoBatchCompleted() const;
+    int pausedAutoBatchTotal() const;
+    int pausedAutoBatchRemaining() const;
+    QString pausedAutoBatchReason() const;
+    bool resumePausedAutoBatch(const QString &promptCliOverride = QString{},
+                               const QString &imageCliOverride = QString{});
+    void discardPausedAutoBatch();
     bool deleteUnpublishedCreative(const QString &shortCode, QString *outError = nullptr);
 
     struct GenerationPromptEntry
@@ -119,7 +128,9 @@ signals:
     void autoPublishRequested();
     void autoBatchStarted(int totalCreatives);
     void autoBatchProgress(int completedCreatives, int totalCreatives, const QString &message);
+    void autoBatchPausedOnLimit(int completedCreatives, int totalCreatives, const QString &limitReason);
     void autoBatchFinished(int completedCreatives, int totalCreatives, bool cancelled, const QString &errorMessage);
+    void pausedAutoBatchChanged();
 
 private slots:
     void _addProject();
@@ -449,7 +460,31 @@ private:
                                       const QJsonObject &product,
                                       const QJsonObject &primaryReference,
                                       const QString &primaryRefMediaPath);
-    QCoro::Task<void> _runAutoBatch(QJsonObject batchSpec);
+    struct PausedAutoBatchState
+    {
+        bool active = false;
+        QJsonObject batchSpec;
+        int nextProductIndex = 0;
+        int nextSlotIndex = 0;
+        int completedCreatives = 0;
+        int totalCreatives = 0;
+        QString limitReason;
+        QString pausedAt;
+    };
+    PausedAutoBatchState m_pausedAutoBatch;
+    QWidget *m_pausedBatchBanner = nullptr;
+    QLabel *m_pausedBatchLabel = nullptr;
+    QPushButton *m_btnResumePausedBatch = nullptr;
+    QPushButton *m_btnDiscardPausedBatch = nullptr;
+
+    QString _pausedAutoBatchFilePath() const;
+    void _loadPausedAutoBatch();
+    void _savePausedAutoBatch() const;
+    void _refreshPausedAutoBatchBanner();
+    QCoro::Task<void> _runAutoBatch(QJsonObject batchSpec,
+                                    int startProductIdx = 0,
+                                    int startSlotIdx = 0,
+                                    int priorCompleted = 0);
 };
 
 #endif // PANEGENERATION_H

@@ -126,6 +126,8 @@ class ResearchVideoBackendFixture : public AbstractVideoGenerator
 public:
     mutable QStringList prompts;
     mutable QList<QStringList> imagesPerCall;
+    mutable QStringList deletedConversations;
+    mutable int quotaOnCallNumber = 0;
     QString getId() const override { return QStringLiteral("gemini-research-test"); }
     QString getName() const override { return QStringLiteral("Gemini Research Test"); }
     QCoro::Task<Result> generate(const QString &prompt, const QStringList &images,
@@ -134,8 +136,26 @@ public:
         prompts << prompt;
         imagesPerCall << images;
         Result res;
+        if (quotaOnCallNumber > 0 && prompts.size() == quotaOnCallNumber)
+        {
+            res.quotaExceeded = true;
+            res.retryable = false;
+            res.errorMessage = QStringLiteral("Gemini daily video quota reached (test limit).");
+            co_return res;
+        }
         res.videoPath = QDir(outputDir).filePath(QStringLiteral("animated_product.mp4"));
         writeResearch(res.videoPath, "fake animated video output");
+        co_return res;
+    }
+    QCoro::Task<DeleteConversationsResult> deleteConversations(
+        const QStringList &conversationUrls, const QVariantMap &) const override
+    {
+        DeleteConversationsResult res;
+        for (const QString &u : conversationUrls)
+        {
+            deletedConversations << u;
+            res.deletedUrls << u;
+        }
         co_return res;
     }
 };
@@ -2400,12 +2420,118 @@ void checkResearch(const QDir &callerWorkingDir)
                 }
             }, genWork.path());
 
+            // Seed 3 approved inspirations for wfAccId:
+            //   1) winRefId:   1 published post that performed well (2,400 views) -> privileged from 1st win!
+            //   2) flopRefId:  2 published posts that flopped (75 & 85 views)     -> retired after 2 low performers!
+            //   3) freshRefId: 0 published posts                                  -> fresh exploration pool
+            const QString winRefId = wfStore.addReference(
+                wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/101"),
+                QStringLiteral("Winning Runway Source"), spyImgPath);
+            const QString flopRefId = wfStore.addReference(
+                wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/102"),
+                QStringLiteral("Two-Flop Weak Source"), spyImgPath);
+            const QString freshRefId = wfStore.addReference(
+                wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/103"),
+                QStringLiteral("Fresh Untested Source"), spyImgPath);
+            requireResearch(!winRefId.isEmpty() && !flopRefId.isEmpty() && !freshRefId.isEmpty()
+                                && wfStore.review({winRefId, flopRefId, freshRefId},
+                                                  QStringLiteral("approved"),
+                                                  QStringLiteral("Approved for workflow test")),
+                            "seed 3 approved references (1st-win, 2-flop, fresh) in wfStore");
+
+            const auto seedHistoricalRefPost = [&](const QString &refId,
+                                                   const QString &postUrl,
+                                                   qint64 views,
+                                                   qint64 likes,
+                                                   qint64 shares,
+                                                   bool attachSnapshotNow,
+                                                   QUuid *outVidId = nullptr) {
+                const QUuid vid = pubVideos.addVideo({}, {}, QStringLiteral("auto_batch"), pubProjects.projectId(0));
+                const auto *vRec = pubVideos.recordFromId(vid);
+                requireResearch(vRec != nullptr, "create historical ref video record");
+                const QDir gDir = pubProjects.generationDir(0, vRec->shortCode, true);
+                writeResearch(gDir.filePath("creative_dna.json"), QJsonDocument(QJsonObject{
+                    {QStringLiteral("referenceId"), refId},
+                    {QStringLiteral("referenceUrl"), QStringLiteral("https://www.tiktok.com/@inspo/video/") + refId},
+                    {QStringLiteral("strategy"), QStringLiteral("reference_swap")},
+                    {QStringLiteral("format"), QStringLiteral("video")}
+                }).toJson());
+                pubVideos.setPublished(vid, true);
+                pubVideos.addPublication(vid, QStringLiteral("tiktok"), postUrl,
+                                         QDateTime::currentDateTimeUtc(), 1200);
+                if (attachSnapshotNow)
+                {
+                    AbstractSocialAccount::VideoStatistics st;
+                    st.views = views;
+                    st.likes = likes;
+                    st.comments = 4;
+                    st.shares = shares;
+                    pubVideos.addSnapshot(vid, postUrl, AbstractSocialAccount::StatSource::PublicView, st);
+                }
+                if (outVidId)
+                {
+                    *outVidId = vid;
+                }
+            };
+
+            seedHistoricalRefPost(winRefId, QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5001"),
+                                  2400, 190, 28, true);
+            seedHistoricalRefPost(flopRefId, QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5002"),
+                                  75, 2, 0, true);
+            QUuid pendingFlopVidId;
+            const QString pendingFlopUrl = QStringLiteral("https://www.tiktok.com/@pradize.high.heel#QS-PENDING");
+            seedHistoricalRefPost(flopRefId, pendingFlopUrl, 85, 3, 0, false, &pendingFlopVidId);
+
             PaneResearch wfResearch(&pubAccounts, &wfStore, {&swapCli});
             PaneWorkflow wfPane(&pubAccounts, &wfStore, &wfResearch, &liveGenPane, &panePub,
-                                &pubVideos, {&swapCli}, &gHooks);
+                                &pubVideos, {&swapCli}, &gHooks, nullptr, &gHashtags);
             wfPane.resize(1200, 780);
             wfPane.show();
             QApplication::processEvents();
+
+            // Verify Workflow detects unmeasured newly-published posts (#QS-PENDING without snapshots),
+            // and clears needsStatsSyncBeforeGeneration() once latest snapshots are recorded!
+            auto *wfBtnSyncStats = wfPane.findChild<QPushButton *>("buttonWorkflowSyncStats");
+            auto *wfChkAutoSync = wfPane.findChild<QCheckBox *>("checkWorkflowAutoSyncStats");
+            auto *wfInspoInfo = wfPane.findChild<QLabel *>("labelWorkflowInspirationsInfo");
+            requireResearch(wfBtnSyncStats && wfChkAutoSync && wfChkAutoSync->isChecked()
+                                && wfInspoInfo && wfPane.needsStatsSyncBeforeGeneration(),
+                            "PaneWorkflow exposes Sync Stats controls and detects unmeasured published posts needing sync");
+
+            {
+                AbstractSocialAccount::VideoStatistics flop2Stats;
+                flop2Stats.views = 85;
+                flop2Stats.likes = 3;
+                flop2Stats.comments = 0;
+                flop2Stats.shares = 0;
+                pubVideos.addSnapshot(pendingFlopVidId, pendingFlopUrl,
+                                      AbstractSocialAccount::StatSource::PublicView, flop2Stats);
+            }
+            wfPane.refreshStep1Products();
+            QApplication::processEvents();
+            requireResearch(!wfPane.needsStatsSyncBeforeGeneration(),
+                            "needsStatsSyncBeforeGeneration becomes false once all published posts have fresh (<30m) stats");
+
+            const auto wfRefExp = SocialStatistics::summarizeReferenceExperiment(&pubVideos);
+            bool verifiedFirstWinPrivileged = false;
+            bool verifiedTwoFlopsRetired = false;
+            for (const auto &rp : wfRefExp.references)
+            {
+                if (rp.referenceId == winRefId)
+                {
+                    verifiedFirstWinPrivileged = (rp.publishedCount == 1 && rp.successCount == 1
+                                                  && rp.isWinner && !rp.isRetired);
+                }
+                else if (rp.referenceId == flopRefId)
+                {
+                    verifiedTwoFlopsRetired = (rp.publishedCount == 2 && rp.lowPerformerCount == 2
+                                               && rp.isRetired && !rp.isWinner);
+                }
+            }
+            requireResearch(verifiedFirstWinPrivileged && verifiedTwoFlopsRetired
+                                && wfInspoInfo->text().contains("proven winner(s) privileged")
+                                && wfInspoInfo->text().contains("retired"),
+                            "SocialStatistics privileges source from 1st win, retires source starting at 2 low performers, and displays counts in Step 1B");
 
             requireResearch(wfPane.currentStep() == 0, "PaneWorkflow opens on Step 1 (Pick Products)");
             auto *wfProdList = wfPane.findChild<QListWidget *>("listWorkflowProducts");
@@ -2442,10 +2568,58 @@ void checkResearch(const QDir &callerWorkingDir)
             requireResearch(wfBtnGen->isEnabled() && wfBtnGen->text().contains("Generate 2 Creative(s)"),
                             "Step 1 computes total creatives (2 products x 1 = 2) and enables Generate button");
 
+            // Simulate Gemini hitting video quota on the 2nd product so we verify:
+            //   1) Limit-reached banner appears in Workflow & Generation tab (1/2 saved, 1 remaining),
+            //   2) User can move temporarily to Publish (Step 2) while keeping the remaining slot paused,
+            //   3) Returning and clicking Resume completes the remaining 2nd creative seamlessly!
+            researchVideoBackend.quotaOnCallNumber = researchVideoBackend.prompts.size() + 2;
             bool sawModalDuringWorkflowGen = false;
             wfBtnGen->click();
             QElapsedTimer wfGenWait;
             wfGenWait.start();
+            while (liveGenPane.isAutoBatchRunning() && wfGenWait.elapsed() < 30000)
+            {
+                if (QApplication::activeModalWidget() != nullptr)
+                {
+                    sawModalDuringWorkflowGen = true;
+                }
+                QApplication::processEvents();
+                QThread::msleep(20);
+            }
+            QApplication::processEvents();
+
+            auto *wfLimitBanner = wfPane.findChild<QWidget *>("widgetWorkflowLimitBanner");
+            auto *wfBtnPauseAndPub = wfPane.findChild<QPushButton *>("buttonWorkflowPauseAndPublish");
+            auto *wfBtnStopAndPub = wfPane.findChild<QPushButton *>("buttonWorkflowStopAndPublish");
+            auto *wfBtnResume = wfPane.findChild<QPushButton *>("buttonWorkflowResumeBatch");
+            auto *wfBtnStep1 = wfPane.findChild<QPushButton *>("buttonWorkflowStep1");
+            auto *genPausedBanner = liveGenPane.findChild<QWidget *>("widgetGenerationPausedBanner");
+            requireResearch(!sawModalDuringWorkflowGen
+                                && wfPane.currentStep() == 0
+                                && liveGenPane.hasPausedAutoBatch()
+                                && liveGenPane.pausedAutoBatchCompleted() == 1
+                                && liveGenPane.pausedAutoBatchTotal() == 2
+                                && liveGenPane.pausedAutoBatchRemaining() == 1
+                                && QFileInfo::exists(genWork.filePath("paused_auto_batch.json"))
+                                && wfLimitBanner && wfLimitBanner->isVisible()
+                                && wfBtnPauseAndPub && wfBtnStopAndPub && wfBtnResume && wfBtnStep1
+                                && genPausedBanner && !genPausedBanner->isHidden(),
+                            "Workflow pauses cleanly on Gemini video quota limit, persists paused_auto_batch.json, and shows Limit Reached controls in both Workflow and Generation tabs");
+
+            // User chooses to move temporarily to Publish (Step 2) while keeping remaining generation paused!
+            wfBtnPauseAndPub->click();
+            QApplication::processEvents();
+            requireResearch(wfPane.currentStep() == 1
+                                && liveGenPane.hasPausedAutoBatch()
+                                && wfBtnStep1->text().contains("Limit"),
+                            "Publish Now & Resume Later moves temporarily to Step 2 while keeping remaining batch paused and flagged on Step 1");
+
+            // User comes back to Step 1 after quota resets and resumes the remaining creative!
+            wfPane.setCurrentStep(0);
+            QApplication::processEvents();
+            researchVideoBackend.quotaOnCallNumber = 0;
+            wfBtnResume->click();
+            wfGenWait.restart();
             while ((liveGenPane.isAutoBatchRunning() || wfPane.currentStep() == 0) && wfGenWait.elapsed() < 30000)
             {
                 if (QApplication::activeModalWidget() != nullptr)
@@ -2455,10 +2629,48 @@ void checkResearch(const QDir &callerWorkingDir)
                 QApplication::processEvents();
                 QThread::msleep(20);
             }
+            QApplication::processEvents();
             requireResearch(!sawModalDuringWorkflowGen
                                 && wfPane.currentStep() == 1
-                                && wfGenLog->toPlainText().contains("Saved"),
-                            "Step 1 runs Auto-Batch inline without modal progress dialog and auto-advances to Step 2");
+                                && !liveGenPane.hasPausedAutoBatch()
+                                && !QFileInfo::exists(genWork.filePath("paused_auto_batch.json"))
+                                && !wfLimitBanner->isVisible()
+                                && wfGenLog->toPlainText().contains("Saved")
+                                && wfGenLog->toPlainText().contains("1 proven winner(s) privileged, 1 retired"),
+                            "Resuming paused batch finishes remaining creative (2/2), clears checkpoint, privileges 1st-win source, and auto-advances to Step 2");
+
+            // Verify newly generated wf-prod-1 and wf-prod-2 creatives both privileged winRefId (0% flopRefId)
+            int winRefUsedCount = 0;
+            int flopRefUsedCount = 0;
+            for (int r = 0; r < pubVideos.rowCount(); ++r)
+            {
+                const auto *rec = pubVideos.recordAt(r);
+                if (!rec || rec->published)
+                {
+                    continue;
+                }
+                const int pRow = pubProjects.rowOfId(rec->projectId);
+                if (pRow < 0)
+                {
+                    continue;
+                }
+                const QDir gDir = pubProjects.generationDir(pRow, rec->shortCode, false);
+                const QString dnaPath = gDir.filePath("creative_dna.json");
+                if (!QFileInfo::exists(dnaPath))
+                {
+                    continue;
+                }
+                const QJsonObject dna = QJsonDocument::fromJson(readResearch(dnaPath)).object();
+                const QString pid = dna.value("productId").toString();
+                if (pid == QLatin1String("wf-prod-1") || pid == QLatin1String("wf-prod-2"))
+                {
+                    const QString usedRef = dna.value("referenceId").toString();
+                    if (usedRef == winRefId) ++winRefUsedCount;
+                    if (usedRef == flopRefId) ++flopRefUsedCount;
+                }
+            }
+            requireResearch(winRefUsedCount == 2 && flopRefUsedCount == 0,
+                            "Auto-Batch exploit slots privilege 1st-win source (2/2) and never reuse 2-flop retired source (0/2)");
 
             // Step 2: Review Generated Content inline (1 VIDEO + 1 SLIDESHOW)
             auto *wfCandTable = wfPane.findChild<QTableWidget *>("tableReviewCandidates");
@@ -2580,6 +2792,118 @@ void checkResearch(const QDir &callerWorkingDir)
                                 && wfQueueTable->item(0, 6)
                                 && wfQueueTable->item(0, 6)->text().contains("Dry-run OK"),
                             "Step 3 executes planned Auto-Publish job on PanePublishing and streams live status & logs");
+
+            // Verify top-bar "Clear Gemini Chats" button + dialog (shows each cached chat & creation date,
+            // supports deleting selected chat(s) via "Delete" and clearing all via "Delete all").
+            {
+                const QString testChatCachePath = genWork.filePath(QStringLiteral("test_gemini_chat_cache.json"));
+                qputenv("QS_GEMINI_CHAT_CACHE_PATH", testChatCachePath.toUtf8());
+                wfPane.setGeminiVideoGeneratorOverride(&researchVideoBackend);
+                researchVideoBackend.deletedConversations.clear();
+
+                const QList<PaneWorkflow::GeminiCachedChat> seededChats{
+                    {QStringLiteral("chat_oldest_001"),
+                     QStringLiteral("https://gemini.google.com/u/4/app/chat_oldest_001"),
+                     QStringLiteral("2026-11-23T08:15:00Z"),
+                     QStringLiteral("active")},
+                    {QStringLiteral("chat_middle_002"),
+                     QStringLiteral("https://gemini.google.com/u/4/app/chat_middle_002"),
+                     QStringLiteral("2026-11-24T12:30:00Z"),
+                     QStringLiteral("delete_failed")},
+                    {QStringLiteral("chat_newest_003"),
+                     QStringLiteral("https://gemini.google.com/u/4/app/chat_newest_003?pageId=none&pli=1"),
+                     QStringLiteral("2026-11-25T06:45:00Z"),
+                     QStringLiteral("active")},
+                };
+                requireResearch(PaneWorkflow::saveGeminiChatCache(seededChats),
+                                "seed isolated Gemini chat cache JSON");
+                wfPane.refreshAll();
+                QApplication::processEvents();
+
+                auto *btnClearChats = wfPane.findChild<QPushButton *>("buttonWorkflowClearGeminiChats");
+                requireResearch(btnClearChats && btnClearChats->isVisible()
+                                    && btnClearChats->text().contains("Clear Gemini Chats (3)"),
+                                "PaneWorkflow top bar exposes Clear Gemini Chats button with cached chat count");
+
+                bool verifiedClearChatsDialog = false;
+                QTimer clearChatsDriver;
+                clearChatsDriver.setInterval(25);
+                QObject::connect(&clearChatsDriver, &QTimer::timeout, [&]() {
+                    auto *dlg = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                    if (!dlg || dlg->objectName() != QLatin1String("dialogClearGeminiChats"))
+                    {
+                        return;
+                    }
+                    clearChatsDriver.stop();
+
+                    auto *tbl = dlg->findChild<QTableWidget *>("tableGeminiCachedChats");
+                    auto *btnDelSel = dlg->findChild<QPushButton *>("buttonDeleteSelectedGeminiChats");
+                    auto *btnDelAll = dlg->findChild<QPushButton *>("buttonDeleteAllGeminiChats");
+                    auto *btnClose = dlg->findChild<QPushButton *>("buttonCloseGeminiChats");
+                    if (tbl && btnDelSel && btnDelAll && btnClose && tbl->rowCount() == 3)
+                    {
+                        const bool initialOk =
+                            !btnDelSel->isEnabled()
+                            && btnDelAll->isEnabled()
+                            && tbl->item(0, 1)->text().contains("chat_newest_003")
+                            && !tbl->item(0, 0)->text().isEmpty()
+                            && tbl->item(2, 1)->text().contains("chat_oldest_001");
+
+                        // 1) Select row 0 (newest) and click "Delete"
+                        tbl->selectRow(0);
+                        QApplication::processEvents();
+                        const bool selEnabled = btnDelSel->isEnabled();
+                        btnDelSel->click();
+                        QElapsedTimer waitDel;
+                        waitDel.start();
+                        while (tbl->rowCount() == 3 && waitDel.elapsed() < 5000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(15);
+                        }
+                        const bool afterSingleDelOk =
+                            tbl->rowCount() == 2
+                            && researchVideoBackend.deletedConversations.size() == 1
+                            && researchVideoBackend.deletedConversations.first().contains("chat_newest_003")
+                            && PaneWorkflow::loadGeminiChatCache().size() == 2;
+
+                        // 2) Click "Delete all" to remove the remaining 2 cached chats
+                        btnDelAll->click();
+                        waitDel.restart();
+                        while (tbl->rowCount() > 0 && waitDel.elapsed() < 5000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(15);
+                        }
+                        const bool afterDeleteAllOk =
+                            tbl->rowCount() == 0
+                            && !btnDelAll->isEnabled()
+                            && researchVideoBackend.deletedConversations.size() == 3
+                            && PaneWorkflow::loadGeminiChatCache().isEmpty();
+
+                        verifiedClearChatsDialog = initialOk && selEnabled && afterSingleDelOk && afterDeleteAllOk;
+                    }
+                    if (btnClose)
+                    {
+                        btnClose->click();
+                    }
+                    else
+                    {
+                        dlg->accept();
+                    }
+                });
+                clearChatsDriver.start();
+                btnClearChats->click();
+                clearChatsDriver.stop();
+                QApplication::processEvents();
+
+                requireResearch(verifiedClearChatsDialog
+                                    && btnClearChats->text() == QLatin1String("Clear Gemini Chats")
+                                    && PaneWorkflow::loadGeminiChatCache().isEmpty(),
+                                "Clear Gemini Chats dialog lists cached chats with creation dates and supports Delete selection and Delete all");
+                wfPane.setGeminiVideoGeneratorOverride(nullptr);
+                qunsetenv("QS_GEMINI_CHAT_CACHE_PATH");
+            }
 
             wfPane.close();
         }

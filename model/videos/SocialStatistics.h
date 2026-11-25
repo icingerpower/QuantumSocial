@@ -116,6 +116,8 @@ public:
         QString referenceId;
         QString referenceUrl;
         int publishedCount = 0;
+        int successCount = 0;
+        int lowPerformerCount = 0;
         double medianScore = 0.0;
         double avgViews = 0.0;
         qint64 bestViews = 0;
@@ -125,12 +127,15 @@ public:
         double variantMedianScore = -1.0;
         QString bestStrategy; // "reference_swap", "reference_variant", or "reference_reimagine"
         bool isWinner = false;
+        bool isRetired = false; // >= 2 low-performing posts and lowPerformerCount > successCount
     };
 
     struct ReferenceExperimentSummary
     {
         int totalMeasuredPosts = 0;
         double accountMedianScore = 0.0;
+        double accountMeanScore = 0.0;
+        double benchmarkScore = 0.0;
         QString winningStrategy; // Non-empty once >= 2 strategies measured with >= 15% lead
         QList<AdaptationStrategyStats> strategyBreakdown;
         QList<ReferencePerformance> references; // Sorted by medianScore descending

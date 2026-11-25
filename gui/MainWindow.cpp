@@ -115,7 +115,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     auto *paneWorkflow = new PaneWorkflow(m_accounts, researchStore, research,
                                           paneGeneration, panePublishing, m_videos,
-                                          m_availableClis, m_favoriteHooks, this);
+                                          m_availableClis, m_favoriteHooks, this, m_hashtags);
     ui->tabWidget->insertTab(0, paneWorkflow, tr("Workflow"));
     ui->tabWidget->setCurrentIndex(0);
 

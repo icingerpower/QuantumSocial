@@ -12,11 +12,14 @@
 #include <memory>
 
 class AbstractCli;
+class AbstractVideoGenerator;
 class FavoriteHooks;
 class PaneGeneration;
 class PaneResearch;
+class PreferredHashtags;
 class QCheckBox;
 class QComboBox;
+class QFrame;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -45,14 +48,32 @@ public:
                           TableVideos *videos,
                           const QList<AbstractCli *> &availableClis,
                           FavoriteHooks *favoriteHooks = nullptr,
-                          QWidget *parent = nullptr);
+                          QWidget *parent = nullptr,
+                          PreferredHashtags *hashtags = nullptr);
     ~PaneWorkflow() override;
+
+    struct GeminiCachedChat
+    {
+        QString chatId;
+        QString url;
+        QString createdAt;
+        QString status;
+    };
+
+    static QString geminiChatCachePath();
+    static QList<GeminiCachedChat> loadGeminiChatCache();
+    static bool saveGeminiChatCache(const QList<GeminiCachedChat> &chats);
 
     int currentStep() const;
     void setCurrentStep(int stepIndex);
 
     void setUploadUrlOverride(const QString &url) { m_uploadUrlOverride = url; }
+    void setGeminiVideoGeneratorOverride(AbstractVideoGenerator *generator)
+    {
+        m_geminiGeneratorOverride = generator;
+    }
     bool deleteCreativeByShortCode(const QString &shortCode, bool askConfirmation = true);
+    bool needsStatsSyncBeforeGeneration() const;
 
 signals:
     void openResearchTabRequested();
@@ -64,6 +85,8 @@ public slots:
     void refreshStep2Candidates(bool preserveExistingSelection = false);
     void refreshStep3AccountsAndPreview();
     void runAiSelectInStep2();
+    void syncAccountStatisticsNow();
+    void openClearGeminiChatsDialog();
     void startStep1Generation();
     void startStep3PublishJob();
 
@@ -77,7 +100,10 @@ private:
     QStringList _checkedStep1ProductIds() const;
     void _updateStep1SummaryAndButtons();
     void _updateStep1ProductPreview();
+    void _updateLimitBanner();
     void _saveStep1Settings() const;
+    void _launchStep1AutoBatchNow();
+    QCoro::Task<void> _syncStatsCoroutine(bool startGenerationAfter);
 
     PanePublishing::PublishJobConfig _currentPublishConfig() const;
     void _saveStep3Settings() const;
@@ -93,11 +119,14 @@ private:
     PanePublishing *m_panePublishing = nullptr;
     TableVideos *m_videos = nullptr;
     FavoriteHooks *m_favoriteHooks = nullptr;
+    PreferredHashtags *m_hashtags = nullptr;
     QList<AbstractCli *> m_clis;
 
     // Top persistent header & stepper
     QComboBox *m_accountCombo = nullptr;
     QLabel *m_headerSummaryLabel = nullptr;
+    QPushButton *m_btnSyncStats = nullptr;
+    QPushButton *m_btnClearGeminiChats = nullptr;
     QPushButton *m_btnStep1 = nullptr;
     QPushButton *m_btnStep2 = nullptr;
     QPushButton *m_btnStep3 = nullptr;
@@ -121,7 +150,13 @@ private:
     QCheckBox *m_chkFormatCarousel = nullptr;
     QCheckBox *m_chkCarouselOverlay = nullptr;
     QCheckBox *m_chkFormatImage = nullptr;
+    QCheckBox *m_chkAutoSyncStats = nullptr;
     QComboBox *m_comboAspectFormat = nullptr;
+    QFrame *m_limitBanner = nullptr;
+    QLabel *m_limitBannerLabel = nullptr;
+    QPushButton *m_btnPauseAndPublish = nullptr;
+    QPushButton *m_btnStopAndPublish = nullptr;
+    QPushButton *m_btnResumeBatch = nullptr;
     QWidget *m_genProgressBox = nullptr;
     QLabel *m_genStatusLabel = nullptr;
     QProgressBar *m_genProgressBar = nullptr;
@@ -131,6 +166,10 @@ private:
     QPushButton *m_btnGenerateAndNext = nullptr;
     QSet<QString> m_checkedProductIds;
     bool m_triggeredBatchFromWorkflow = false;
+    bool m_syncingStats = false;
+    bool m_statsSyncCancelled = false;
+    std::shared_ptr<bool> m_statsSyncCancelToken;
+    std::unique_ptr<QCoro::Task<void>> m_statsSyncTask;
 
     // Step 2: Review Generated Content
     QSpinBox *m_spinMaxDaysOld = nullptr;
@@ -165,6 +204,7 @@ private:
     QPushButton *m_btnBackToStep2 = nullptr;
 
     QString m_uploadUrlOverride;
+    AbstractVideoGenerator *m_geminiGeneratorOverride = nullptr;
     bool m_showingCompletedPublishQueue = false;
     bool m_updatingUi = false;
 };
