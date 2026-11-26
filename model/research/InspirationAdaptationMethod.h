@@ -39,26 +39,38 @@ public:
     virtual int sortOrder() const { return 100; }
 
     virtual bool requiresReferenceMedia() const { return true; }
+    virtual bool supportsReferenceMedia() const { return requiresReferenceMedia(); }
+    virtual bool supportsWithoutReferenceMedia() const { return !requiresReferenceMedia(); }
     virtual bool usesSceneProperties() const = 0;
     virtual bool appendsPropertiesToVideoPrompt() const { return false; }
+    virtual bool isTwoStepVideoStrategy() const { return false; }
 
     virtual QString plannerSlotInstruction(const PromptContext &ctx) const = 0;
     virtual QString buildVideoStartingFramePrompt(const PromptContext &ctx) const = 0;
     virtual QString finalizeVideoAnimationPrompt(const QString &plannedPrompt,
                                                  const PromptContext &ctx) const = 0;
+    virtual QString finalizeSecondStepVideoPrompt(const QString &plannedSecondPrompt,
+                                                  const PromptContext &ctx) const
+    {
+        Q_UNUSED(plannedSecondPrompt);
+        Q_UNUSED(ctx);
+        return QString{};
+    }
     virtual QString buildStillOrCarouselPrompt(const QString &plannedPrompt,
                                                const PromptContext &ctx,
                                                bool *outAttachReferenceScene) const = 0;
 
     static const QMap<QString, const InspirationAdaptationMethod *> &all();
-    static QList<const InspirationAdaptationMethod *> orderedMethods(bool hasReferenceMedia);
+    static QList<const InspirationAdaptationMethod *> orderedMethods(
+        bool hasReferenceMedia, bool isVideoFormat = true);
     static const InspirationAdaptationMethod *selectForSlot(
         bool hasReferenceMedia,
         int slotIndex,
         int priorUsesOfReference,
         bool isExploration,
         const QString &referenceBestMethodId,
-        const QString &globalWinningMethodId);
+        const QString &globalWinningMethodId,
+        bool isVideoFormat = true);
 
     class Recorder
     {

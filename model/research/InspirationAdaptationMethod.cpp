@@ -228,10 +228,11 @@ public:
         Q_UNUSED(ctx);
         return QStringLiteral(
             "IMAGE VARIANT IN STEP 1 + PURE MOTION IN STEP 2: Step 1 will combine the inspiration's "
-            "camera angle/pose with the slot's A/B properties to generate the starting image. For "
-            "format=video, write a SHORT, SIMPLE 1-2 sentence motion-only \"prompt\" (25-45 words max, "
-            "starting with \"Generate a video: \") that animates the regenerated starting image "
-            "smoothly without contradicting its scene or subjects.");
+            "camera angle/pose with the slot's A/B properties to generate the starting image (baking any "
+            "model/hair/wardrobe/setting changes directly into the image). For format=video, write a "
+            "SHORT, SIMPLE 1-2 sentence motion-only \"prompt\" (25-45 words max, starting with "
+            "\"Generate a video: \") that animates the regenerated starting image smoothly — NEVER ask "
+            "the video model to change or morph the model's hair, identity, or outfit mid-video.");
     }
 
     QString buildVideoStartingFramePrompt(const PromptContext &ctx) const override
@@ -245,9 +246,10 @@ public:
             "winning visual hook of '%1' while introducing a tasteful sibling variation:\n"
             "- Keep from '%1': the flattering camera angle, leg/body framing, pose energy, and prominent "
             "visual focus on the featured product.\n"
-            "- Controlled variation (change 'a little more' than just the product): refresh the "
-            "complementary backdrop/setting, lighting mood, or outfit styling so this feels like a "
-            "distinct sibling creative%5.\n"
+            "- Controlled variation (bake 100% into this starting frame): refresh the backdrop/setting, "
+            "lighting mood, model appearance/hair, or outfit styling so this feels like a distinct "
+            "sibling creative%5. If any model/hair/wardrobe/setting change is requested, apply it "
+            "COMPLETELY in this image so zero conflicting traits from '%1' or '%2' remain.\n"
             "- Product accuracy (NON-NEGOTIABLE): completely replace the reference shoes/product with "
             "OUR EXACT REAL PRODUCT from '%2' — matching its exact silhouette, heel shape/height, straps, "
             "print/pattern, color, material, and hardware.\n"
@@ -359,7 +361,9 @@ public:
         Q_UNUSED(ctx);
         return QStringLiteral(
             "FULL A/B PROPERTIES SCENE + MOTION: Build a cohesive scene and smooth camera/model "
-            "motion matching ALL listed A/B properties below, inspired by the reference's hook energy.");
+            "motion matching ALL listed A/B properties below, inspired by the reference's hook energy. "
+            "Step 1 already bakes the target model/hair/wardrobe/setting into the starting image — keep "
+            "that exact subject and outfit consistent from frame 0 to the end without morphing mid-clip.");
     }
 
     QString buildVideoStartingFramePrompt(const PromptContext &ctx) const override
@@ -367,17 +371,20 @@ public:
         const QString marker = QString::fromLatin1(RASTER_IMAGE_PROMPT_MARKER) + QStringLiteral("\n");
         QString prompt = marker + QStringLiteral(
             "You are given '%1' — OUR REAL PRODUCT%2 — in the current working directory.\n"
-            "Generate a scroll-stopping %3 fashion-editorial starting frame for a social-media video "
-            "that follows EVERY ONE of these scene & styling specifications%4:\n"
-            "- Product accuracy (NON-NEGOTIABLE): feature our exact product from '%1' prominently "
-            "(matching its exact silhouette, heel shape/height, straps, print/pattern, color, material).\n"
+            "Generate a brand-new, scroll-stopping %3 fashion-editorial starting frame for a social-media "
+            "video that follows EVERY ONE of these scene & styling specifications%4:\n"
+            "- Product accuracy (NON-NEGOTIABLE): extract ONLY the product design from '%1' and feature "
+            "our exact product prominently (matching its exact silhouette, heel shape/height, straps, "
+            "print/pattern, color, material). Completely replace any original model, legs, wardrobe, or "
+            "studio backdrop that may appear in '%1' with the new scene and subject specified here.\n"
             "- Clean starting frame: full %3 canvas, zero watermarks, social icons, or text.\n")
             .arg(ctx.productImageFile,
                  ctx.productSummary.isEmpty() ? QString{} : QStringLiteral(" (%1)").arg(ctx.productSummary),
                  ctx.videoFormatLabel,
                  ctx.propertyFragments.trimmed().isEmpty()
                      ? QString{}
-                     : QStringLiteral(":\n- Scene & A/B properties: %1").arg(ctx.propertyFragments.trimmed()));
+                     : QStringLiteral(":\n- Scene & A/B properties (bake 100% into this image): %1")
+                           .arg(ctx.propertyFragments.trimmed()));
         if (!ctx.adaptationNotes.trimmed().isEmpty())
         {
             prompt += QStringLiteral("- Adaptation notes: %1\n").arg(ctx.adaptationNotes.trimmed());
@@ -495,15 +502,221 @@ public:
     }
 };
 
+// Method 5 ("two_step_reveal"):
+// Works both WITH Research inspirations and WITHOUT reference media (using A/B Properties):
+// - Step 0 (Image CLI): Regenerates a clean neck-down (collarbone-to-shoes, faceless) 9:16 editorial
+//   starting frame that bakes in the complete target outfit, model styling, lighting, setting, and
+//   exact catalog product (avoiding Veo's real-person face filter AND eliminating any 1-2s flash of
+//   an un-updated model).
+// - Step 1 Video (~10s, fresh Gemini chat kept open): Slow-motion close-up camera reveal rising
+//   smoothly from the shoes/heels at the bottom up to the collarbone/neck.
+// - Step 2 Video (~10s continuation in the same Gemini chat, 0 uploaded images): Dynamic multi-camera
+//   cuts alternating between crisp shoe close-ups in motion and full-body shots of the model in full.
+class TwoStepRevealMethod final : public InspirationAdaptationMethod
+{
+public:
+    QString id() const override
+    {
+        return QStringLiteral("two_step_reveal");
+    }
+
+    QString name() const override
+    {
+        return QStringLiteral("2-Step Reveal: Slow-Mo Bottom-to-Top + Multi-Angle Full Look");
+    }
+
+    QString description() const override
+    {
+        return QStringLiteral(
+            "2-step multi-video sequence: (1) slow-motion close-up reveal rising from the product at "
+            "the bottom up to the neck, followed in the same Gemini conversation by (2) dynamic "
+            "camera cuts alternating crisp close-ups and the model in full.");
+    }
+
+    int sortOrder() const override
+    {
+        return 95;
+    }
+
+    bool requiresReferenceMedia() const override
+    {
+        return false;
+    }
+
+    bool supportsReferenceMedia() const override
+    {
+        return true;
+    }
+
+    bool supportsWithoutReferenceMedia() const override
+    {
+        return true;
+    }
+
+    bool usesSceneProperties() const override
+    {
+        return true;
+    }
+
+    bool appendsPropertiesToVideoPrompt() const override
+    {
+        return false;
+    }
+
+    bool isTwoStepVideoStrategy() const override
+    {
+        return true;
+    }
+
+    QString plannerSlotInstruction(const PromptContext &ctx) const override
+    {
+        Q_UNUSED(ctx);
+        return QStringLiteral(
+            "TWO-STEP MULTI-VIDEO REVEAL (Step 1 Slow-Mo Bottom-to-Top Close-Up -> Step 2 Alternating "
+            "Close-Up & Full-Body Views): Step 0 regenerates a neck-down (collarbone-to-shoes, no face) "
+            "starting frame baking in all A/B properties, outfit, and our exact product. Write BOTH:\n"
+            "    * \"prompt\" (Step 1 video, ~10s): starting with \"Generate a video: \", describe a "
+            "slow-motion close-up bottom-to-top camera reveal of the woman walking gracefully forward, "
+            "starting tightly framed on the shoes/feet at the bottom and gliding smoothly upward along "
+            "the legs and outfit up to the collarbone/neck (never morphing model/outfit mid-clip).\n"
+            "    * \"step2Prompt\" (Step 2 continuation in same chat, ~10s): starting with "
+            "\"Generate a video: In the next video, \", describe 3 dynamic alternating camera views of "
+            "her walking — alternating between crisp low-angle close-ups of the shoes in motion and "
+            "full-body head-to-toe shots of the stylish model in full outfit and heels, keeping the "
+            "exact same shoes, outfit, lighting, and setting.");
+    }
+
+    QString buildVideoStartingFramePrompt(const PromptContext &ctx) const override
+    {
+        const QString marker = QString::fromLatin1(RASTER_IMAGE_PROMPT_MARKER) + QStringLiteral("\n");
+        const QString prodLabel = ctx.productSummary.isEmpty()
+            ? QString{}
+            : QStringLiteral(" (%1)").arg(ctx.productSummary);
+        QString prompt = marker;
+        if (!ctx.referenceSceneFile.isEmpty())
+        {
+            prompt += QStringLiteral(
+                "You are given TWO image files in the current working directory:\n"
+                "1. '%1' — the REFERENCE SCENE (use for luxury mood, floor/runway vibe, and styling energy).\n"
+                "2. '%2' — OUR REAL PRODUCT%3. This is the EXACT product that must appear on the model's feet.\n\n")
+                .arg(ctx.referenceSceneFile, ctx.productImageFile, prodLabel);
+        }
+        else
+        {
+            prompt += QStringLiteral(
+                "You are given '%1' — OUR REAL PRODUCT%2 — in the current working directory.\n\n")
+                .arg(ctx.productImageFile, prodLabel);
+        }
+
+        prompt += QStringLiteral(
+            "Generate a brand-new, scroll-stopping %1 fashion-editorial starting frame for a 2-step "
+            "reveal video:\n"
+            "- Framing & refusal-safe composition (CRITICAL): frame the stylish woman walking forward "
+            "from COLLARBONE / NECK DOWN TO HER SHOES (neck-to-toe framing — NO face or head visible in "
+            "this starting image) so both the complete outfit silhouette AND the featured shoes at the "
+            "bottom are clearly established for video continuation.\n"
+            "- Bake ALL subject & scene updates into this image: completely generate a fresh model and "
+            "outfit%2 — leave ZERO trace of any prior model, original legs, or unwanted wardrobe from "
+            "the input file(s).\n"
+            "- Product accuracy (NON-NEGOTIABLE): feature OUR EXACT REAL PRODUCT from '%3' on her feet "
+            "in crisp focus — matching its exact silhouette, heel shape and height, straps/closures, "
+            "print/pattern, color, material, and hardware.\n"
+            "- Clean starting frame: full %1 canvas, zero social UI icons, watermarks, logos, or text.\n")
+            .arg(ctx.videoFormatLabel,
+                 ctx.propertyFragments.trimmed().isEmpty()
+                     ? QString{}
+                     : QStringLiteral(" matching these A/B scene & styling properties: %1")
+                           .arg(ctx.propertyFragments.trimmed()),
+                 ctx.productImageFile);
+
+        if (!ctx.adaptationNotes.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Adaptation notes: %1\n").arg(ctx.adaptationNotes.trimmed());
+        }
+        if (!ctx.refinementFixNote.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Specific refinement adjustment: %1\n").arg(ctx.refinementFixNote.trimmed());
+        }
+        prompt += QStringLiteral(
+            "Save the result in the current working directory as exactly '%1'.\n"
+            "Do not modify the input files. Reply with just the output file name.")
+            .arg(ctx.outputImageFile);
+        return prompt;
+    }
+
+    QString finalizeVideoAnimationPrompt(const QString &plannedPrompt,
+                                         const PromptContext &ctx) const override
+    {
+        const QString productLabel = ctx.productSummary.isEmpty()
+            ? QStringLiteral("high heels")
+            : ctx.productSummary;
+        const QString trimmed = plannedPrompt.trimmed();
+        const bool hasBottomUpCue =
+            trimmed.contains(QLatin1String("slow"), Qt::CaseInsensitive)
+            && (trimmed.contains(QLatin1String("up"), Qt::CaseInsensitive)
+                || trimmed.contains(QLatin1String("neck"), Qt::CaseInsensitive)
+                || trimmed.contains(QLatin1String("bottom"), Qt::CaseInsensitive));
+        if (!trimmed.isEmpty() && hasBottomUpCue)
+        {
+            return ensureTrailingPeriod(ensureVideoPrefix(trimmed));
+        }
+        return QStringLiteral(
+            "Generate a video: Slow-motion close-up bottom-to-top camera reveal of the stylish woman "
+            "walking gracefully forward wearing the exact featured %1. Begin tightly framed at the "
+            "bottom on her feet and heels stepping in crisp slow motion, then smoothly glide and tilt "
+            "the camera upward from the shoes along her legs and outfit up to her collarbone and neck, "
+            "keeping the exact shoe design, outfit, and lighting unchanged with no text.")
+            .arg(productLabel);
+    }
+
+    QString finalizeSecondStepVideoPrompt(const QString &plannedSecondPrompt,
+                                          const PromptContext &ctx) const override
+    {
+        const QString productLabel = ctx.productSummary.isEmpty()
+            ? QStringLiteral("heels")
+            : ctx.productSummary;
+        QString trimmed = plannedSecondPrompt.trimmed();
+        if (!trimmed.isEmpty())
+        {
+            if (trimmed.startsWith(QLatin1String("Generate a video:"), Qt::CaseInsensitive))
+            {
+                trimmed = trimmed.mid(17).trimmed();
+            }
+            if (!trimmed.startsWith(QLatin1String("In the next video"), Qt::CaseInsensitive))
+            {
+                trimmed = QStringLiteral("In the next video, ") + trimmed;
+            }
+            return ensureTrailingPeriod(ensureVideoPrefix(trimmed));
+        }
+        return QStringLiteral(
+            "Generate a video: In the next video, we see her walking confidently across 3 different "
+            "dynamic camera views, alternating between a full-body wide shot showing the stylish model "
+            "in full head-to-toe outfit and heels, a crisp low-angle close-up tracking the %1 in "
+            "motion, and a sleek full-length editorial angle — keeping the exact same shoe design, "
+            "outfit, lighting, and setting throughout with no text.")
+            .arg(productLabel);
+    }
+
+    QString buildStillOrCarouselPrompt(const QString &plannedPrompt,
+                                       const PromptContext &ctx,
+                                       bool *outAttachReferenceScene) const override
+    {
+        return PropertiesGuidedFullMethod{}.buildStillOrCarouselPrompt(
+            plannedPrompt, ctx, outAttachReferenceScene);
+    }
+};
+
 const DirectSwapAnimateMethod directSwapMethod;
 const VariantInImageThenAnimateMethod variantInImageMethod;
 const PropertiesGuidedFullMethod propertiesFullMethod;
 const EditorialPropertiesOnlyMethod editorialOnlyMethod;
+const TwoStepRevealMethod twoStepRevealMethod;
 
 const InspirationAdaptationMethod::Recorder directSwapRecorder(&directSwapMethod);
 const InspirationAdaptationMethod::Recorder variantInImageRecorder(&variantInImageMethod);
 const InspirationAdaptationMethod::Recorder propertiesFullRecorder(&propertiesFullMethod);
 const InspirationAdaptationMethod::Recorder editorialOnlyRecorder(&editorialOnlyMethod);
+const InspirationAdaptationMethod::Recorder twoStepRevealRecorder(&twoStepRevealMethod);
 } // namespace
 
 const QMap<QString, const InspirationAdaptationMethod *> &InspirationAdaptationMethod::all()
@@ -519,7 +732,8 @@ InspirationAdaptationMethod::Recorder::Recorder(const InspirationAdaptationMetho
     }
 }
 
-QList<const InspirationAdaptationMethod *> InspirationAdaptationMethod::orderedMethods(bool hasReferenceMedia)
+QList<const InspirationAdaptationMethod *> InspirationAdaptationMethod::orderedMethods(
+    bool hasReferenceMedia, bool isVideoFormat)
 {
     QList<const InspirationAdaptationMethod *> list;
     for (const InspirationAdaptationMethod *m : registry())
@@ -528,11 +742,15 @@ QList<const InspirationAdaptationMethod *> InspirationAdaptationMethod::orderedM
         {
             continue;
         }
-        if (m->requiresReferenceMedia() && !hasReferenceMedia)
+        if (hasReferenceMedia && !m->supportsReferenceMedia())
         {
             continue;
         }
-        if (!m->requiresReferenceMedia() && hasReferenceMedia)
+        if (!hasReferenceMedia && !m->supportsWithoutReferenceMedia())
+        {
+            continue;
+        }
+        if (!isVideoFormat && m->isTwoStepVideoStrategy())
         {
             continue;
         }
@@ -555,9 +773,10 @@ const InspirationAdaptationMethod *InspirationAdaptationMethod::selectForSlot(
     int priorUsesOfReference,
     bool isExploration,
     const QString &referenceBestMethodId,
-    const QString &globalWinningMethodId)
+    const QString &globalWinningMethodId,
+    bool isVideoFormat)
 {
-    const QList<const InspirationAdaptationMethod *> candidates = orderedMethods(hasReferenceMedia);
+    const QList<const InspirationAdaptationMethod *> candidates = orderedMethods(hasReferenceMedia, isVideoFormat);
     if (candidates.isEmpty())
     {
         return registry().value(QStringLiteral("editorial_ab"), nullptr);

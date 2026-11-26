@@ -219,6 +219,7 @@ void VideoGenerationWorkflow::start(const Request &request)
     m_promptSubmitted = false;
     m_quotaExceeded = false;
     m_lastConversationUrl.clear();
+    m_nativeMergedVideoPath.clear();
     m_task = _run(request);
 }
 
@@ -591,17 +592,20 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             continue; // next round
         }
 
+        m_nativeMergedVideoPath.clear();
         if (request.multiVideoContinuation)
         {
             emit progress(tr("Preparing the new video segment..."));
             const double duration = generator->continuationDurationSeconds(request.settings);
-            const auto clip = co_await VideoClipProcessing::trimTail(videoPath, duration);
+            const auto clip = co_await VideoClipProcessing::prepareContinuation(
+                videoPath, request.previousStepVideoPath, duration);
             if (!clip.error.isEmpty())
             {
                 _finish({}, tr("Could not prepare the video segment: %1").arg(clip.error));
                 co_return;
             }
             videoPath = clip.path;
+            m_nativeMergedVideoPath = clip.nativeMergedPath;
         }
 
         // --- A video exists: extract key frames and judge the clip. ---
@@ -731,6 +735,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             _finish(videoPath, {});
             co_return;
         }
+        m_nativeMergedVideoPath.clear();
         const QString rejectedPath = QDir(request.outputDir).absoluteFilePath(
             QStringLiteral("rejected_round%1.mp4").arg(round));
         QFile::remove(rejectedPath);

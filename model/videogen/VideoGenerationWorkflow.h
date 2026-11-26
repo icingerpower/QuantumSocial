@@ -86,6 +86,7 @@ public:
         QString messageAction = QStringLiteral("new"); // "new" or "edit_last"
         QString conversationUrl;
         bool multiVideoContinuation = false;
+        QString previousStepVideoPath; // Optional prior step clip for exact prefix-overlap detection
     };
 
     explicit VideoGenerationWorkflow(QObject *parent = nullptr);
@@ -97,6 +98,7 @@ public:
     void cancel();
 
     QString lastConversationUrl() const { return m_lastConversationUrl; }
+    QString nativeMergedVideoPath() const { return m_nativeMergedVideoPath; }
     bool promptSubmitted() const { return m_promptSubmitted; }
     bool quotaExceeded() const { return m_quotaExceeded; }
 
@@ -109,6 +111,7 @@ private:
     bool m_running = false;
     bool m_cancelled = false;
     QString m_lastConversationUrl;
+    QString m_nativeMergedVideoPath;
     bool m_promptSubmitted = false;
     bool m_quotaExceeded = false;
     QCoro::Task<void> m_task;

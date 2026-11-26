@@ -6,6 +6,7 @@
 #include "PaneGeneration.h"
 #include "model/research/InspirationAdaptationMethod.h"
 #include "model/research/ResearchProject.h"
+#include "model/videogen/VideoClipProcessing.h"
 #include "model/videos/SocialStatistics.h"
 #include "ui_PaneGeneration.h"
 
@@ -5595,6 +5596,24 @@ QString PaneGeneration::_pausedAutoBatchFilePath() const
     return wd.exists() ? wd.filePath(QStringLiteral("paused_auto_batch.json")) : QString{};
 }
 
+namespace
+{
+int enabledFormatCountForSpec(const QJsonObject &spec)
+{
+    int count = 0;
+    if (spec.value(QStringLiteral("includeImage")).toBool(true)) ++count;
+    if (spec.value(QStringLiteral("includeCarousel")).toBool(true)) ++count;
+    if (spec.value(QStringLiteral("includeVideo")).toBool(true)) ++count;
+    return qMax(1, count);
+}
+
+int slotsPerProductForSpec(const QJsonObject &spec)
+{
+    const int perFormat = qMax(1, spec.value(QStringLiteral("generationsPerProduct")).toInt(1));
+    return perFormat * enabledFormatCountForSpec(spec);
+}
+} // namespace
+
 void PaneGeneration::_loadPausedAutoBatch()
 {
     m_pausedAutoBatch = PausedAutoBatchState{};
@@ -5616,9 +5635,9 @@ void PaneGeneration::_loadPausedAutoBatch()
     const int nextProd = obj.value(QStringLiteral("nextProductIndex")).toInt(0);
     const int nextSlot = obj.value(QStringLiteral("nextSlotIndex")).toInt(0);
     const int productsCount = spec.value(QStringLiteral("products")).toArray().size();
-    const int perProd = qMax(1, spec.value(QStringLiteral("generationsPerProduct")).toInt(1));
+    const int slotsPerProd = slotsPerProductForSpec(spec);
     if (!spec.isEmpty() && total > 0 && nextProd >= 0 && nextProd < productsCount
-        && nextSlot >= 0 && nextSlot < perProd)
+        && nextSlot >= 0 && nextSlot < slotsPerProd)
     {
         m_pausedAutoBatch.active = true;
         m_pausedAutoBatch.batchSpec = spec;
@@ -5704,8 +5723,8 @@ int PaneGeneration::pausedAutoBatchRemaining() const
     {
         return 0;
     }
-    const int perProd = qMax(1, m_pausedAutoBatch.batchSpec.value(QStringLiteral("generationsPerProduct")).toInt(1));
-    const int cursor = m_pausedAutoBatch.nextProductIndex * perProd + m_pausedAutoBatch.nextSlotIndex;
+    const int slotsPerProd = slotsPerProductForSpec(m_pausedAutoBatch.batchSpec);
+    const int cursor = m_pausedAutoBatch.nextProductIndex * slotsPerProd + m_pausedAutoBatch.nextSlotIndex;
     return qMax(1, m_pausedAutoBatch.totalCreatives - cursor);
 }
 
@@ -5859,7 +5878,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
     const QJsonObject profile = batchSpec.value(QStringLiteral("profile")).toObject();
     const QJsonArray products = batchSpec.value(QStringLiteral("products")).toArray();
     const QJsonArray rawApprovedRefs = batchSpec.value(QStringLiteral("approvedReferences")).toArray();
-    const int generationsPerProduct = qMax(1, batchSpec.value(QStringLiteral("generationsPerProduct")).toInt(10));
+    const int generationsPerFormat = qMax(1, batchSpec.value(QStringLiteral("generationsPerProduct")).toInt(2));
     const bool includeImage = batchSpec.value(QStringLiteral("includeImage")).toBool(true);
     const bool includeCarousel = batchSpec.value(QStringLiteral("includeCarousel")).toBool(true);
     const bool includeVideo = batchSpec.value(QStringLiteral("includeVideo")).toBool(true);
@@ -5888,6 +5907,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
     {
         co_return;
     }
+    const int generationsPerProduct = generationsPerFormat * enabledFormats.size();
 
     // Score approved references AND adaptation modes ("reference_swap" = strict product swap vs
     // "reference_variant" = product + subtle scene/style variation vs "reference_reimagine")
@@ -6033,10 +6053,11 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
 
     emit autoBatchStarted(totalCreatives);
 
-    _logProgress(tr("Starting Auto-Batch: %1 product(s) × %2 generation(s) = %3 creative(s) "
-                    "(%4 active reference(s), %5 proven winner(s) privileged, %6 retired ≥2-flop source(s) skipped · Content CLI: %7 · Image CLI: %8).")
+    _logProgress(tr("Starting Auto-Batch: %1 product(s) × %2 per format × %3 format(s) = %4 creative(s) "
+                    "(%5 active reference(s), %6 proven winner(s) privileged, %7 retired ≥2-flop source(s) skipped · Content CLI: %8 · Image CLI: %9).")
         .arg(products.size())
-        .arg(generationsPerProduct)
+        .arg(generationsPerFormat)
+        .arg(enabledFormats.size())
         .arg(totalCreatives)
         .arg(rankedRefs.size())
         .arg(winnerRefIndices.size())
@@ -6127,6 +6148,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             QList<PropertySampler::SampledValue> sampledProps;
             QList<QUuid> keptValueIds;
             QString prompt;
+            QString step2Prompt;
             QString hook;
             QString description;
             QString hookCategory;
@@ -6136,12 +6158,15 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         QList<PlannedSlot> slotsForProduct;
         QHash<QString, QStringList> cachedPlanFramesByRefId;
         QHash<QString, int> refUseCounts;
+        int videoSlotCounter = 0;
 
         for (int s = 0; s < generationsPerProduct; ++s)
         {
             const int globalSlot = batchSlotCounter++;
             PlannedSlot slot;
             slot.kind = enabledFormats[s % enabledFormats.size()];
+            const bool isVideoSlot = (slot.kind == GenerationJob::Video);
+            const int methodSlotIndex = isVideoSlot ? videoSlotCounter++ : s;
             slot.formatName = slot.kind == GenerationJob::Video
                 ? QStringLiteral("video")
                 : (slot.kind == GenerationJob::Slideshow
@@ -6225,11 +6250,12 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
 
             slot.method = InspirationAdaptationMethod::selectForSlot(
                 hasRefMedia,
-                s,
+                methodSlotIndex,
                 totalPriorForRef,
                 slot.isExploration,
                 refBestMethodId,
-                refExp.winningStrategy);
+                refExp.winningStrategy,
+                isVideoSlot);
             slot.strategy = slot.method ? slot.method->id() : QStringLiteral("editorial_ab");
 
             if (!slot.method || slot.method->usesSceneProperties())
@@ -6343,7 +6369,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         planPrompt += QStringLiteral(
             "\nUsing your file tools, write ONE valid JSON object (no markdown fences) to '%1' "
             "in the current working directory with this exact shape:\n"
-            "{\"slots\": [{\"slot\": 0, \"prompt\": \"...\", \"hook\": \"...\", "
+            "{\"slots\": [{\"slot\": 0, \"prompt\": \"...\", \"step2Prompt\": \"\", \"hook\": \"...\", "
             "\"description\": \"...\", \"hookCategory\": \"curiosity|contrarian|transformation|style_question|direct_value\", "
             "\"slideTexts\": [\"Slide 1 hook\", \"Slide 2 point\", \"Slide 3 detail\", \"Slide 4 CTA\"]}], "
             "\"hooks\": [{\"hook\": \"...\", \"description\": \"...\"}]%2}\n"
@@ -6351,8 +6377,10 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             "- \"hooks\": 10 catchy hook + post description pairs (each ending with up to 5 optimized hashtags) "
             "so the user also has 10 ready-to-pick alternatives in the Hooks dialog.\n"
             "- For format=video: start \"prompt\" with \"Generate a video: \" describing smooth motion "
-            "starting from the regenerated frame (matching reference frames when mode=reference_swap, "
-            "or fresh dynamic motion otherwise).\n"
+            "starting from the regenerated frame (never ask the video model to morph/change the model's "
+            "hair or outfit mid-video; Step 1 image generation already bakes those in). When method=two_step_reveal, "
+            "also populate \"step2Prompt\" starting with \"Generate a video: In the next video, \" for Step 2's "
+            "multi-angle alternating close-up / full-model continuation.\n"
             "- For format=carousel: describe a cohesive 4-slide story showcasing the exact product "
             "(opening hook pose, full outfit styling, close-up product detail, confident stride), "
             "and populate \"slideTexts\" with 4 short, punchy on-slide overlay captions (4-9 words each) "
@@ -6527,6 +6555,11 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             if (sl.kind == GenerationJob::Video && sl.method)
             {
                 sl.prompt = sl.method->finalizeVideoAnimationPrompt(basePrompt, finalizeCtx);
+                if (sl.method->isTwoStepVideoStrategy())
+                {
+                    sl.step2Prompt = sl.method->finalizeSecondStepVideoPrompt(
+                        so.value(QStringLiteral("step2Prompt")).toString(), finalizeCtx);
+                }
             }
             else if (sl.method && sl.method->appendsPropertiesToVideoPrompt())
             {
@@ -6745,16 +6778,23 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                         break;
                     }
 
-                    // Automatic AI vision check across ALL video modes: verify our exact product design & clean frame
+                    // Automatic AI vision check across ALL video modes: verify our exact product design,
+                    // clean frame, AND that any requested model/hair/wardrobe/scene overrides are already
+                    // baked into generation_source.png (preventing 1-2s flashes of an un-updated model).
+                    const QString stylingReq = !variantDirection.isEmpty()
+                        ? QStringLiteral(" (3) Are ALL requested scene/model/styling properties (%1) already "
+                                         "fully applied in '%2' with zero conflicting traits left over from the input photo(s)?")
+                              .arg(variantDirection, GENERATED_IMAGE_NAME)
+                        : QString{};
                     const QString verifyPrompt = QStringLiteral(
                         "Inspect '%1' (generated starting frame) against '%2' (our real product: %3) "
                         "in the current working directory.\n"
                         "Check: (1) Does the featured product accurately match our exact real product "
                         "(silhouette, heel shape/height, straps, color/pattern)? "
-                        "(2) Is the frame crisp and free of watermarks, social icons, text, and garbled anatomy?\n"
+                        "(2) Is the frame crisp and free of watermarks, social icons, text, and garbled anatomy?%4\n"
                         "Reply with STRICT JSON only:\n"
                         "{\"ok\": true|false, \"fix\": \"<concise fix instruction if ok is false>\"}")
-                        .arg(GENERATED_IMAGE_NAME, stagedProdName, productSummary);
+                        .arg(GENERATED_IMAGE_NAME, stagedProdName, productSummary, stylingReq);
                     CliRunResult verifyRes;
                     verifyRes = co_await promptCli->runPrompt(verifyPrompt, slotStaging.absolutePath());
                     const QJsonObject vObj = parseFirstJsonObject(verifyRes.output);
@@ -6774,79 +6814,296 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                 }
 
                 const QString frameToAnimate = haveStartingFrame ? swappedTarget : stagedProdPath;
-                _logProgress(tr("[%1] Step 2/2 — Animating frame into video...").arg(slotTag));
+                const bool isTwoStepVideo = slotMethod && slotMethod->isTwoStepVideoStrategy();
 
-                VideoGenerationWorkflow::Request req;
-                req.generatorId = videoGeneratorId;
-                req.prompt = ensureImperativeVideoPrefix(sl.prompt);
-                req.imagePath = frameToAnimate;
-                req.outputDir = slotStaging.absolutePath();
-                req.contextSummary = QStringLiteral("%1 — %2").arg(productSummary, sl.hook);
-                req.videoFormatLabel = videoFormatLabel;
-                req.settings = m_generationSettings->settingsFor(videoGeneratorId);
-                req.decisionCli = promptCli;
-                req.imageCli = imgCli;
-                req.knownPitfalls = m_promptLessons->asPromptSection();
-                req.recordLesson = [this](const QString &lesson) {
-                    m_promptLessons->addLesson(lesson);
+                auto isVideoQuotaFailure = [](const VideoGenerationWorkflow *wf, const QString &err) {
+                    return (wf && wf->quotaExceeded())
+                        || err.contains(QStringLiteral("quota"), Qt::CaseInsensitive)
+                        || err.contains(QStringLiteral("daily limit"), Qt::CaseInsensitive)
+                        || err.contains(QStringLiteral("full capacity"), Qt::CaseInsensitive)
+                        || err.contains(QStringLiteral("limit reached"), Qt::CaseInsensitive);
                 };
 
-                auto workflow = std::make_unique<VideoGenerationWorkflow>();
-                if (m_progress.cancelBtn)
+                if (isTwoStepVideo)
                 {
-                    connect(m_progress.cancelBtn, &QPushButton::clicked,
-                            workflow.get(), &VideoGenerationWorkflow::cancel);
-                }
-                connect(workflow.get(), &VideoGenerationWorkflow::progress,
-                        this, [this, slotTag](const QString &msg) {
-                    _logProgress(QStringLiteral("[%1] %2").arg(slotTag, msg));
-                });
+                    const QDir step1Dir{slotStaging.absoluteFilePath(QStringLiteral("two_step_1"))};
+                    const QDir step2Dir{slotStaging.absoluteFilePath(QStringLiteral("two_step_2"))};
+                    QDir{}.mkpath(step1Dir.absolutePath());
+                    QDir{}.mkpath(step2Dir.absolutePath());
 
-                QString generatedVideoPath;
-                QString videoErr;
-                bool videoDone = false;
-                connect(workflow.get(), &VideoGenerationWorkflow::finished,
-                        this, [&generatedVideoPath, &videoErr, &videoDone](const QString &vp, const QString &err) {
-                    generatedVideoPath = vp;
-                    videoErr = err;
-                    videoDone = true;
-                });
+                    _logProgress(tr("[%1] Video Step 1/2 — Slow-motion bottom-to-top close-up reveal...").arg(slotTag));
 
-                workflow->start(req);
-                while (!videoDone)
-                {
-                    if (m_batchCancelled)
+                    VideoGenerationWorkflow::Request req1;
+                    req1.generatorId = videoGeneratorId;
+                    req1.prompt = ensureImperativeVideoPrefix(sl.prompt);
+                    req1.imagePath = frameToAnimate;
+                    req1.outputDir = step1Dir.absolutePath();
+                    req1.contextSummary = QStringLiteral("%1 — Step 1 slow-mo bottom-to-top reveal (%2)").arg(productSummary, sl.hook);
+                    req1.videoFormatLabel = videoFormatLabel;
+                    req1.settings = m_generationSettings->settingsFor(videoGeneratorId);
+                    req1.settings.insert(QStringLiteral("keepConversation"), true);
+                    req1.chatMode = QStringLiteral("fresh");
+                    req1.messageAction = QStringLiteral("new");
+                    req1.decisionCli = promptCli;
+                    req1.imageCli = imgCli;
+                    req1.knownPitfalls = m_promptLessons->asPromptSection();
+                    req1.recordLesson = [this](const QString &lesson) {
+                        m_promptLessons->addLesson(lesson);
+                    };
+
+                    auto workflow1 = std::make_unique<VideoGenerationWorkflow>();
+                    if (m_progress.cancelBtn)
                     {
-                        workflow->cancel();
+                        connect(m_progress.cancelBtn, &QPushButton::clicked,
+                                workflow1.get(), &VideoGenerationWorkflow::cancel);
                     }
-                    co_await QCoro::sleepFor(std::chrono::milliseconds(50));
-                }
+                    connect(workflow1.get(), &VideoGenerationWorkflow::progress,
+                            this, [this, slotTag](const QString &msg) {
+                        _logProgress(QStringLiteral("[%1 · Step 1/2] %2").arg(slotTag, msg));
+                    });
 
-                if (!generatedVideoPath.isEmpty() && QFileInfo::exists(generatedVideoPath))
-                {
-                    producedOutputs << generatedVideoPath;
+                    QString step1VideoPath;
+                    QString step1Err;
+                    bool step1Done = false;
+                    connect(workflow1.get(), &VideoGenerationWorkflow::finished,
+                            this, [&step1VideoPath, &step1Err, &step1Done](const QString &vp, const QString &err) {
+                        step1VideoPath = vp;
+                        step1Err = err;
+                        step1Done = true;
+                    });
+
+                    workflow1->start(req1);
+                    while (!step1Done)
+                    {
+                        if (m_batchCancelled)
+                        {
+                            workflow1->cancel();
+                        }
+                        co_await QCoro::sleepFor(std::chrono::milliseconds(50));
+                    }
+
+                    const QString step1ConvUrl = workflow1->lastConversationUrl();
+
+                    if (step1VideoPath.isEmpty() || !QFileInfo::exists(step1VideoPath))
+                    {
+                        if (!step1ConvUrl.isEmpty() && req1.settings.value(QStringLiteral("deleteChatOnFinish"), true).toBool())
+                        {
+                            if (auto *vGen = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(videoGeneratorId))
+                            {
+                                co_await vGen->deleteConversation(step1ConvUrl, req1.settings);
+                            }
+                        }
+                        if (isVideoQuotaFailure(workflow1.get(), step1Err) && !m_batchCancelled)
+                        {
+                            hitHardStopError = true;
+                            hardStopReason = step1Err.isEmpty() ? tr("Gemini video limit reached.") : step1Err;
+                            pausedProductIdx = pIdx;
+                            pausedSlotIdx = s;
+                            _logProgress(tr("[%1] ⚠ Video limit reached on Step 1 — pausing batch here (%2/%3 saved, resumable later): %4")
+                                .arg(slotTag).arg(completedCreatives).arg(totalCreatives).arg(hardStopReason));
+                            break;
+                        }
+                        _logProgress(tr("[%1] 2-step video failed at Step 1: %2")
+                            .arg(slotTag, step1Err.isEmpty() ? tr("no video produced") : step1Err));
+                    }
+                    else if (!m_batchCancelled)
+                    {
+                        _logProgress(tr("[%1] Video Step 2/2 — Alternating close-up & full-model camera views in same chat...").arg(slotTag));
+
+                        InspirationAdaptationMethod::PromptContext s2Ctx;
+                        s2Ctx.productImageFile = stagedProdName;
+                        s2Ctx.productSummary = productSummary;
+                        s2Ctx.videoFormatLabel = videoFormatLabel;
+                        const QString step2PromptText = sl.step2Prompt.isEmpty()
+                            ? slotMethod->finalizeSecondStepVideoPrompt(QString{}, s2Ctx)
+                            : sl.step2Prompt;
+
+                        VideoGenerationWorkflow::Request req2;
+                        req2.generatorId = videoGeneratorId;
+                        req2.prompt = ensureImperativeVideoPrefix(step2PromptText);
+                        req2.imagePath.clear(); // Zero image upload in Step 2 preserves Gemini Veo scene continuity
+                        req2.outputDir = step2Dir.absolutePath();
+                        req2.contextSummary = QStringLiteral("%1 — Step 2 alternating close-up & full-body views (%2)").arg(productSummary, sl.hook);
+                        req2.videoFormatLabel = videoFormatLabel;
+                        req2.settings = m_generationSettings->settingsFor(videoGeneratorId);
+                        req2.chatMode = QStringLiteral("conversation");
+                        req2.messageAction = QStringLiteral("new");
+                        req2.conversationUrl = step1ConvUrl;
+                        req2.multiVideoContinuation = true;
+                        req2.previousStepVideoPath = step1VideoPath;
+                        req2.decisionCli = promptCli;
+                        req2.imageCli = nullptr;
+                        req2.knownPitfalls = m_promptLessons->asPromptSection();
+                        req2.recordLesson = [this](const QString &lesson) {
+                            m_promptLessons->addLesson(lesson);
+                        };
+
+                        auto workflow2 = std::make_unique<VideoGenerationWorkflow>();
+                        if (m_progress.cancelBtn)
+                        {
+                            connect(m_progress.cancelBtn, &QPushButton::clicked,
+                                    workflow2.get(), &VideoGenerationWorkflow::cancel);
+                        }
+                        connect(workflow2.get(), &VideoGenerationWorkflow::progress,
+                                this, [this, slotTag](const QString &msg) {
+                            _logProgress(QStringLiteral("[%1 · Step 2/2] %2").arg(slotTag, msg));
+                        });
+
+                        QString step2VideoPath;
+                        QString step2Err;
+                        bool step2Done = false;
+                        connect(workflow2.get(), &VideoGenerationWorkflow::finished,
+                                this, [&step2VideoPath, &step2Err, &step2Done](const QString &vp, const QString &err) {
+                            step2VideoPath = vp;
+                            step2Err = err;
+                            step2Done = true;
+                        });
+
+                        workflow2->start(req2);
+                        while (!step2Done)
+                        {
+                            if (m_batchCancelled)
+                            {
+                                workflow2->cancel();
+                            }
+                            co_await QCoro::sleepFor(std::chrono::milliseconds(50));
+                        }
+
+                        const QString finalConvUrl = !workflow2->lastConversationUrl().isEmpty()
+                            ? workflow2->lastConversationUrl()
+                            : step1ConvUrl;
+                        if (!finalConvUrl.isEmpty() && req2.settings.value(QStringLiteral("deleteChatOnFinish"), true).toBool())
+                        {
+                            if (auto *vGen = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(videoGeneratorId))
+                            {
+                                co_await vGen->deleteConversation(finalConvUrl, req2.settings);
+                            }
+                        }
+
+                        if (!step2VideoPath.isEmpty() && QFileInfo::exists(step2VideoPath))
+                        {
+                            const QDir takesBackupDir{slotStaging.absoluteFilePath(QStringLiteral("takes"))};
+                            QDir{}.mkpath(takesBackupDir.absolutePath());
+                            QFile::copy(step1VideoPath, takesBackupDir.absoluteFilePath(QStringLiteral("01_step1_reveal.mp4")));
+                            QFile::copy(step2VideoPath, takesBackupDir.absoluteFilePath(QStringLiteral("02_step2_angles.mp4")));
+
+                            const QString finalVideoPath = slotStaging.absoluteFilePath(QStringLiteral("final_video.mp4"));
+                            QFile::remove(finalVideoPath);
+                            const QString nativeMerged = workflow2->nativeMergedVideoPath();
+                            if (!nativeMerged.isEmpty() && QFileInfo::exists(nativeMerged))
+                            {
+                                _logProgress(tr("[%1] Using Gemini's native merged 2-step video (prefix verified, lossless).").arg(slotTag));
+                                if (QFile::copy(nativeMerged, finalVideoPath))
+                                {
+                                    producedOutputs << finalVideoPath;
+                                }
+                            }
+                            if (producedOutputs.isEmpty())
+                            {
+                                _logProgress(tr("[%1] Merging Step 1 + Step 2 clips into final video...").arg(slotTag));
+                                const QStringList clipsToMerge{step1VideoPath, step2VideoPath};
+                                const std::function<bool()> alwaysCurrent{};
+                                VideoClipProcessing::Result mergeRes;
+                                mergeRes = co_await VideoClipProcessing::merge(
+                                    clipsToMerge, finalVideoPath, alwaysCurrent);
+                                if (mergeRes.error.isEmpty() && QFileInfo::exists(mergeRes.path))
+                                {
+                                    producedOutputs << mergeRes.path;
+                                }
+                                else
+                                {
+                                    _logProgress(tr("[%1] Could not merge 2-step clips: %2").arg(slotTag, mergeRes.error));
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (isVideoQuotaFailure(workflow2.get(), step2Err) && !m_batchCancelled)
+                            {
+                                hitHardStopError = true;
+                                hardStopReason = step2Err.isEmpty() ? tr("Gemini video limit reached.") : step2Err;
+                                pausedProductIdx = pIdx;
+                                pausedSlotIdx = s;
+                                _logProgress(tr("[%1] ⚠ Video limit reached on Step 2 — pausing batch here (%2/%3 saved, resumable later): %4")
+                                    .arg(slotTag).arg(completedCreatives).arg(totalCreatives).arg(hardStopReason));
+                                break;
+                            }
+                            _logProgress(tr("[%1] 2-step video failed at Step 2: %2")
+                                .arg(slotTag, step2Err.isEmpty() ? tr("no video produced") : step2Err));
+                        }
+                    }
                 }
                 else
                 {
-                    const bool videoHitQuota = workflow->quotaExceeded()
-                        || videoErr.contains(QStringLiteral("quota"), Qt::CaseInsensitive)
-                        || videoErr.contains(QStringLiteral("daily limit"), Qt::CaseInsensitive)
-                        || videoErr.contains(QStringLiteral("full capacity"), Qt::CaseInsensitive)
-                        || videoErr.contains(QStringLiteral("limit reached"), Qt::CaseInsensitive);
-                    if (videoHitQuota && !m_batchCancelled)
+                    _logProgress(tr("[%1] Step 2/2 — Animating frame into video...").arg(slotTag));
+
+                    VideoGenerationWorkflow::Request req;
+                    req.generatorId = videoGeneratorId;
+                    req.prompt = ensureImperativeVideoPrefix(sl.prompt);
+                    req.imagePath = frameToAnimate;
+                    req.outputDir = slotStaging.absolutePath();
+                    req.contextSummary = QStringLiteral("%1 — %2").arg(productSummary, sl.hook);
+                    req.videoFormatLabel = videoFormatLabel;
+                    req.settings = m_generationSettings->settingsFor(videoGeneratorId);
+                    req.decisionCli = promptCli;
+                    req.imageCli = imgCli;
+                    req.knownPitfalls = m_promptLessons->asPromptSection();
+                    req.recordLesson = [this](const QString &lesson) {
+                        m_promptLessons->addLesson(lesson);
+                    };
+
+                    auto workflow = std::make_unique<VideoGenerationWorkflow>();
+                    if (m_progress.cancelBtn)
                     {
-                        hitHardStopError = true;
-                        hardStopReason = videoErr.isEmpty()
-                            ? tr("Gemini video limit reached.")
-                            : videoErr;
-                        pausedProductIdx = pIdx;
-                        pausedSlotIdx = s;
-                        _logProgress(tr("[%1] ⚠ Video limit reached — pausing batch here (%2/%3 saved, resumable later): %4")
-                            .arg(slotTag).arg(completedCreatives).arg(totalCreatives).arg(hardStopReason));
-                        break;
+                        connect(m_progress.cancelBtn, &QPushButton::clicked,
+                                workflow.get(), &VideoGenerationWorkflow::cancel);
                     }
-                    _logProgress(tr("[%1] Video slot failed: %2")
-                        .arg(slotTag, videoErr.isEmpty() ? tr("no video produced") : videoErr));
+                    connect(workflow.get(), &VideoGenerationWorkflow::progress,
+                            this, [this, slotTag](const QString &msg) {
+                        _logProgress(QStringLiteral("[%1] %2").arg(slotTag, msg));
+                    });
+
+                    QString generatedVideoPath;
+                    QString videoErr;
+                    bool videoDone = false;
+                    connect(workflow.get(), &VideoGenerationWorkflow::finished,
+                            this, [&generatedVideoPath, &videoErr, &videoDone](const QString &vp, const QString &err) {
+                        generatedVideoPath = vp;
+                        videoErr = err;
+                        videoDone = true;
+                    });
+
+                    workflow->start(req);
+                    while (!videoDone)
+                    {
+                        if (m_batchCancelled)
+                        {
+                            workflow->cancel();
+                        }
+                        co_await QCoro::sleepFor(std::chrono::milliseconds(50));
+                    }
+
+                    if (!generatedVideoPath.isEmpty() && QFileInfo::exists(generatedVideoPath))
+                    {
+                        producedOutputs << generatedVideoPath;
+                    }
+                    else
+                    {
+                        if (isVideoQuotaFailure(workflow.get(), videoErr) && !m_batchCancelled)
+                        {
+                            hitHardStopError = true;
+                            hardStopReason = videoErr.isEmpty()
+                                ? tr("Gemini video limit reached.")
+                                : videoErr;
+                            pausedProductIdx = pIdx;
+                            pausedSlotIdx = s;
+                            _logProgress(tr("[%1] ⚠ Video limit reached — pausing batch here (%2/%3 saved, resumable later): %4")
+                                .arg(slotTag).arg(completedCreatives).arg(totalCreatives).arg(hardStopReason));
+                            break;
+                        }
+                        _logProgress(tr("[%1] Video slot failed: %2")
+                            .arg(slotTag, videoErr.isEmpty() ? tr("no video produced") : videoErr));
+                    }
                 }
             }
             else
@@ -6997,7 +7254,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             {
                 propUuidArray.append(uid.toString(QUuid::WithoutBraces));
             }
-            const QJsonObject dna{
+            QJsonObject dna{
                 {QStringLiteral("schemaVersion"), 1},
                 {QStringLiteral("shortCode"), shortCode},
                 {QStringLiteral("createdAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
@@ -7017,6 +7274,11 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                 {QStringLiteral("prompt"), sl.prompt},
                 {QStringLiteral("propertyValueIds"), propUuidArray}
             };
+            if (sl.kind == GenerationJob::Video && sl.method && sl.method->isTwoStepVideoStrategy())
+            {
+                dna.insert(QStringLiteral("multiStepCount"), 2);
+                dna.insert(QStringLiteral("step2Prompt"), sl.step2Prompt);
+            }
             {
                 QSaveFile dnaFile{genDir.filePath(QStringLiteral("creative_dna.json"))};
                 if (dnaFile.open(QIODevice::WriteOnly))

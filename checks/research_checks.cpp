@@ -60,8 +60,10 @@
 #include <QTimer>
 #include <QToolBox>
 #include <QTreeWidget>
+#include <QCoro/QCoroTimer>
 #include <QEventLoop>
 #include <QProcess>
+#include <chrono>
 #include <stdexcept>
 #include <iostream>
 
@@ -148,10 +150,16 @@ public:
         co_return res;
     }
     QCoro::Task<DeleteConversationsResult> deleteConversations(
-        const QStringList &conversationUrls, const QVariantMap &) const override
+        const QStringList &conversationUrls, const QVariantMap &settings) const override
     {
+        // Suspend across the Qt event loop and read settings AFTER co_await to
+        // catch dangling C++20 coroutine-lambda captures or references!
+        const QStringList urlsCopy = conversationUrls;
+        co_await QCoro::sleepFor(std::chrono::milliseconds(15));
+        const bool closeOnFinish = settings.value(QStringLiteral("closeBrowserOnFinish"), true).toBool();
+        Q_UNUSED(closeOnFinish);
         DeleteConversationsResult res;
-        for (const QString &u : conversationUrls)
+        for (const QString &u : urlsCopy)
         {
             deletedConversations << u;
             res.deletedUrls << u;
@@ -1488,7 +1496,7 @@ void checkResearch(const QDir &callerWorkingDir)
 
     const QJsonObject autoBatchSpec = pane.buildAutoBatchSpec(
         {product.value("id").toString()},
-        3,
+        1,     // 1 of each checked format -> 1 Image + 1 Carousel + 1 Video = 3 creatives
         true,  // includeImage
         true,  // includeCarousel
         true,  // includeVideo
@@ -1755,10 +1763,58 @@ void checkResearch(const QDir &callerWorkingDir)
                             && registeredMethods.contains("reference_variant")
                             && registeredMethods.contains("reference_properties_full")
                             && registeredMethods.contains("editorial_ab")
+                            && registeredMethods.contains("two_step_reveal")
                             && !registeredMethods.value("reference_swap")->usesSceneProperties()
                             && registeredMethods.value("reference_variant")->usesSceneProperties()
-                            && registeredMethods.value("reference_properties_full")->usesSceneProperties(),
-                        "InspirationAdaptationMethod::Recorder registers both property-skipping and property-using methods");
+                            && registeredMethods.value("reference_properties_full")->usesSceneProperties()
+                            && registeredMethods.value("two_step_reveal")->usesSceneProperties()
+                            && registeredMethods.value("two_step_reveal")->isTwoStepVideoStrategy()
+                            && registeredMethods.value("two_step_reveal")->supportsReferenceMedia()
+                            && registeredMethods.value("two_step_reveal")->supportsWithoutReferenceMedia(),
+                        "InspirationAdaptationMethod::Recorder registers single-step and two-step methods");
+
+        // Verify orderedMethods includes two_step_reveal for video slots both with and without reference media,
+        // and excludes 2-step video strategies from static image/carousel slots.
+        const auto withRefVideoMethods = InspirationAdaptationMethod::orderedMethods(true, true);
+        const auto withoutRefVideoMethods = InspirationAdaptationMethod::orderedMethods(false, true);
+        const auto withRefStillMethods = InspirationAdaptationMethod::orderedMethods(true, false);
+        bool sawTwoStepWithRef = false;
+        bool sawTwoStepWithoutRef = false;
+        bool sawEditorialWithoutRef = false;
+        bool sawTwoStepInStill = false;
+        for (const auto *m : withRefVideoMethods) if (m->id() == QLatin1String("two_step_reveal")) sawTwoStepWithRef = true;
+        for (const auto *m : withoutRefVideoMethods)
+        {
+            if (m->id() == QLatin1String("two_step_reveal")) sawTwoStepWithoutRef = true;
+            if (m->id() == QLatin1String("editorial_ab")) sawEditorialWithoutRef = true;
+        }
+        for (const auto *m : withRefStillMethods) if (m->id() == QLatin1String("two_step_reveal")) sawTwoStepInStill = true;
+        requireResearch(sawTwoStepWithRef && sawTwoStepWithoutRef && sawEditorialWithoutRef && !sawTwoStepInStill,
+                        "two_step_reveal participates in video rotation with & without references and is skipped for static stills/carousels");
+
+        // Verify starting-frame prompt for two_step_reveal bakes properties + neck-down faceless framing
+        {
+            InspirationAdaptationMethod::PromptContext tsCtx;
+            tsCtx.productImageFile = QStringLiteral("my_product.jpg");
+            tsCtx.productSummary = QStringLiteral("Pradize · Red · Sequined Slingback Heels");
+            tsCtx.videoFormatLabel = QStringLiteral("vertical (9:16)");
+            tsCtx.outputImageFile = QStringLiteral("generation_source.png");
+            tsCtx.propertyFragments = QStringLiteral("blonde model in crimson evening gown; warm luxury runway lighting");
+            const auto *tsMethod = registeredMethods.value(QStringLiteral("two_step_reveal"));
+            const QString startImgPrompt = tsMethod->buildVideoStartingFramePrompt(tsCtx);
+            const QString step1VidPrompt = tsMethod->finalizeVideoAnimationPrompt(QString{}, tsCtx);
+            const QString step2VidPrompt = tsMethod->finalizeSecondStepVideoPrompt(QString{}, tsCtx);
+            requireResearch(startImgPrompt.contains("COLLARBONE / NECK DOWN", Qt::CaseInsensitive)
+                                && startImgPrompt.contains("NO face", Qt::CaseInsensitive)
+                                && startImgPrompt.contains("blonde model in crimson evening gown")
+                                && step1VidPrompt.startsWith("Generate a video:")
+                                && step1VidPrompt.contains("Slow-motion", Qt::CaseInsensitive)
+                                && step1VidPrompt.contains("bottom-to-top", Qt::CaseInsensitive)
+                                && step2VidPrompt.startsWith("Generate a video: In the next video")
+                                && step2VidPrompt.contains("alternating", Qt::CaseInsensitive)
+                                && step2VidPrompt.contains("full-body", Qt::CaseInsensitive),
+                            "two_step_reveal builds faceless neck-down starting frame with baked properties, slow-mo bottom-up Step 1, and alternating multi-angle Step 2");
+        }
 
         QSet<QString> seenFormats;
         bool sawSkippedPropsMethod = false;
@@ -2552,6 +2608,20 @@ void checkResearch(const QDir &callerWorkingDir)
 
             auto *wfComboVideoGen = wfPane.findChild<QComboBox *>("comboWorkflowVideoGenerator");
             wfCheckAll->click();
+            // Verify per-format multiplication: 2 products × 2 per format × 2 checked formats = 8 creatives,
+            // and 2 products × 2 per format × 3 checked formats = 12 creatives!
+            wfSpinPerProd->setValue(2);
+            wfChkVideo->setChecked(true);
+            wfChkCarousel->setChecked(true);
+            wfChkImage->setChecked(false);
+            QApplication::processEvents();
+            requireResearch(wfBtnGen->isEnabled() && wfBtnGen->text().contains("Generate 8 Creative(s)"),
+                            "Step 1 multiplies count per format across checked formats (2 products x 2 x 2 formats = 8)");
+            wfChkImage->setChecked(true);
+            QApplication::processEvents();
+            requireResearch(wfBtnGen->isEnabled() && wfBtnGen->text().contains("Generate 12 Creative(s)"),
+                            "Step 1 multiplies count per format across all 3 checked formats (2 products x 2 x 3 formats = 12)");
+
             wfSpinPerProd->setValue(1);
             wfChkVideo->setChecked(true);
             if (wfComboVideoGen)
@@ -2906,6 +2976,201 @@ void checkResearch(const QDir &callerWorkingDir)
             }
 
             wfPane.close();
+
+            // End-to-end Auto-Batch test for two_step_reveal across BOTH Gemini continuation modes:
+            //   - Mode A: Gemini outputs a server-merged 2.0s clip (1.0s red Step 1 + 1.0s blue Step 2)
+            //   - Mode B: Gemini outputs a standalone 1.0s green Step 2 clip (merged locally with Step 1)
+            {
+                class TwoStepGeminiBackendFixture final : public AbstractVideoGenerator
+                {
+                public:
+                    struct CallRecord
+                    {
+                        QString prompt;
+                        QStringList images;
+                        QVariantMap settings;
+                    };
+                    mutable QList<CallRecord> calls;
+                    mutable QStringList deletedConversations;
+                    mutable int continuationCount = 0;
+
+                    QString getId() const override { return QStringLiteral("gemini-twostep-test"); }
+                    QString getName() const override { return QStringLiteral("Gemini Two-Step Test"); }
+                    double continuationDurationSeconds(const QVariantMap &) const override { return 1.0; }
+
+                    static void runFfmpeg(const QStringList &args)
+                    {
+                        QProcess proc;
+                        proc.start(QStandardPaths::findExecutable(QStringLiteral("ffmpeg")), args);
+                        requireResearch(proc.waitForFinished(30000) && proc.exitCode() == 0,
+                                        "ffmpeg fixture clip generation succeeded");
+                    }
+
+                    QCoro::Task<Result> generate(const QString &prompt, const QStringList &images,
+                                                 const QString &outputDir, const QVariantMap &settings) const override
+                    {
+                        calls.append({prompt, images, settings});
+                        Result res;
+                        const QString chatMode = settings.value(QStringLiteral("chatMode")).toString();
+                        if (chatMode == QLatin1String("conversation"))
+                        {
+                            ++continuationCount;
+                            res.conversationUrl = settings.value(QStringLiteral("conversationUrl")).toString();
+                            res.videoPath = QDir(outputDir).filePath(QStringLiteral("step2_raw.mp4"));
+                            if (continuationCount == 1)
+                            {
+                                // Mode A: Gemini prepends 1.0s red Step 1 + appends 1.0s blue Step 2 = 2.0s merged MP4
+                                runFfmpeg({QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-y"),
+                                           QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"), QStringLiteral("color=red:s=160x284:d=1.0:r=30"),
+                                           QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"), QStringLiteral("color=blue:s=160x284:d=1.0:r=30"),
+                                           QStringLiteral("-filter_complex"), QStringLiteral("[0:v][1:v]concat=n=2:v=1:a=0[v]"),
+                                           QStringLiteral("-map"), QStringLiteral("[v]"), QStringLiteral("-c:v"), QStringLiteral("libx264"),
+                                           res.videoPath});
+                            }
+                            else
+                            {
+                                // Mode B: Gemini outputs standalone 1.0s green Step 2 MP4 (no Gemini-side merge)
+                                runFfmpeg({QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-y"),
+                                           QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"), QStringLiteral("color=green:s=160x284:d=1.0:r=30"),
+                                           QStringLiteral("-c:v"), QStringLiteral("libx264"),
+                                           res.videoPath});
+                            }
+                        }
+                        else
+                        {
+                            const int chatNum = calls.size();
+                            res.conversationUrl = QStringLiteral("https://gemini.google.com/app/twostep_chat_%1").arg(chatNum);
+                            res.videoPath = QDir(outputDir).filePath(QStringLiteral("step1_raw.mp4"));
+                            runFfmpeg({QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-y"),
+                                       QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"), QStringLiteral("color=red:s=160x284:d=1.0:r=30"),
+                                       QStringLiteral("-c:v"), QStringLiteral("libx264"),
+                                       res.videoPath});
+                        }
+                        co_return res;
+                    }
+
+                    QCoro::Task<void> deleteConversation(const QString &conversationUrl, const QVariantMap &) const override
+                    {
+                        deletedConversations << conversationUrl;
+                        co_return;
+                    }
+                };
+
+                QTemporaryDir tsWorkTmp;
+                const QDir tsWork(tsWorkTmp.path());
+                WorkingDirectoryManager::instance()->setWorkingDir(tsWork);
+
+                TwoStepGeminiBackendFixture tsBackend;
+                AbstractVideoGenerator::Recorder tsBackendReg(&tsBackend);
+
+                TreeProperties tsProps(tsWork.filePath("props.json"));
+                const QModelIndex tsPropIdx = tsProps.addProperty(QStringLiteral("Model Hair"));
+                tsProps.addValue(tsPropIdx, QStringLiteral("Blonde"), QStringLiteral("blonde hair model"));
+                TreeProperties tsArch(tsWork.filePath("arch.json"));
+                TableVideos tsVideos(tsWork.path());
+                TableGenerationSettings tsSettings(tsWork.path());
+                PreferredHashtags tsHashtags(tsWork.path());
+                PromptLessons tsLessons(tsWork.path());
+                FavoriteHooks tsHooks(tsWork.path());
+                FavoriteVideoPrompts tsFavPrompts(tsWork.path());
+                SavedPrompts tsSaved(tsWork.path());
+
+                PaneGeneration tsGenPane(&tsProps, &tsArch, &tsVideos, &tsSettings, &tsHashtags,
+                                         &tsLessons, &tsHooks, &tsFavPrompts, &tsSaved);
+                tsGenPane.setAvailableClis({&swapCli});
+
+                // 4 video generations without reference media -> rotates [editorial_ab, two_step_reveal, editorial_ab, two_step_reveal],
+                // exercising two_step_reveal twice (Mode A native 2.0s merge + Mode B standalone 1.0s + 1.0s local merge)!
+                const QJsonObject tsBatchSpec{
+                    {QStringLiteral("accountId"), wfAccId},
+                    {QStringLiteral("accountLabel"), QStringLiteral("TikTok · @pradize.high.heel")},
+                    {QStringLiteral("profile"), QJsonObject{
+                        {QStringLiteral("brands"), QJsonArray{QStringLiteral("Pradize")}},
+                        {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}}
+                    }},
+                    {QStringLiteral("products"), QJsonArray{
+                        QJsonObject{
+                            {QStringLiteral("id"), QStringLiteral("ts-prod-1")},
+                            {QStringLiteral("title"), QStringLiteral("Pradize Ruby Sequined Stiletto")},
+                            {QStringLiteral("color"), QStringLiteral("Ruby")},
+                            {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                            {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                            {QStringLiteral("localImage"), spyImgPath}
+                        }
+                    }},
+                    {QStringLiteral("approvedReferences"), QJsonArray{}},
+                    {QStringLiteral("generationsPerProduct"), 4},
+                    {QStringLiteral("includeImage"), false},
+                    {QStringLiteral("includeCarousel"), false},
+                    {QStringLiteral("includeVideo"), true},
+                    {QStringLiteral("videoGeneratorId"), tsBackend.getId()},
+                    {QStringLiteral("suppressModalProgressDialog"), true}
+                };
+
+                requireResearch(tsGenPane.startAutoBatch(tsBatchSpec), "launch two_step_reveal Auto-Batch");
+                QElapsedTimer tsWait;
+                tsWait.start();
+                while (tsGenPane.isAutoBatchRunning() && tsWait.elapsed() < 45000)
+                {
+                    QApplication::processEvents();
+                    QThread::msleep(20);
+                }
+                requireResearch(!tsGenPane.isAutoBatchRunning() && tsVideos.rowCount() == 4,
+                                "Auto-Batch completes all 4 video creatives (2 editorial_ab + 2 two_step_reveal)");
+                requireResearch(tsBackend.continuationCount == 2 && tsBackend.deletedConversations.size() == 2,
+                                "Both two_step_reveal slots ran Step 2 in Step 1's conversation and deleted the kept Gemini chat on finish");
+
+                // Inspect backend call sequence for the two_step_reveal continuation calls
+                int verifiedConvCalls = 0;
+                for (int ci = 0; ci < tsBackend.calls.size(); ++ci)
+                {
+                    const auto &call = tsBackend.calls[ci];
+                    if (call.settings.value("chatMode").toString() == QLatin1String("conversation"))
+                    {
+                        requireResearch(ci > 0
+                                            && tsBackend.calls[ci - 1].settings.value("keepConversation").toBool()
+                                            && !tsBackend.calls[ci - 1].images.isEmpty()
+                                            && tsBackend.calls[ci - 1].images.first().endsWith("generation_source.png")
+                                            && call.images.isEmpty()
+                                            && !call.settings.value("conversationUrl").toString().isEmpty()
+                                            && call.prompt.contains("In the next video", Qt::CaseInsensitive),
+                                        "Step 1 uses regenerated generation_source.png with keepConversation=true and Step 2 continues in same URL with 0 uploaded images");
+                        ++verifiedConvCalls;
+                    }
+                }
+                requireResearch(verifiedConvCalls == 2, "verified both two_step_reveal Step 1 -> Step 2 call pairs");
+
+                // Verify both saved two_step_reveal final_video.mp4 files (~2.0s each, Mode A red->blue & Mode B red->green)
+                int twoStepSavedCount = 0;
+                for (int r = 0; r < tsVideos.rowCount(); ++r)
+                {
+                    const auto *rec = tsVideos.recordAt(r);
+                    const QDir gDir = tsGenPane.projectsModel()->generationDir(0, rec->shortCode, false);
+                    const QJsonObject dna = QJsonDocument::fromJson(readResearch(gDir.filePath("creative_dna.json"))).object();
+                    if (dna.value("strategy").toString() != QLatin1String("two_step_reveal"))
+                    {
+                        continue;
+                    }
+                    ++twoStepSavedCount;
+                    requireResearch(dna.value("multiStepCount").toInt() == 2
+                                        && !dna.value("step2Prompt").toString().isEmpty(),
+                                    "two_step_reveal creative_dna.json records multiStepCount=2 and step2Prompt");
+                    const QString finalVid = gDir.filePath("final_video.mp4");
+                    requireResearch(QFileInfo::exists(finalVid), "two_step_reveal saves final_video.mp4");
+
+                    QProcess probe;
+                    probe.start(QStandardPaths::findExecutable("ffprobe"),
+                                {"-v", "error", "-show_entries", "format=duration",
+                                 "-of", "default=noprint_wrappers=1:nokey=1", finalVid});
+                    requireResearch(probe.waitForFinished(10000) && probe.exitCode() == 0, "ffprobe final_video.mp4");
+                    const double dur = QString::fromUtf8(probe.readAllStandardOutput()).trimmed().toDouble();
+                    requireResearch(qAbs(dur - 2.0) < 0.18,
+                                    "two_step_reveal final_video.mp4 has full ~2.0s combined duration in both merged and standalone modes");
+                }
+                requireResearch(twoStepSavedCount == 2, "both two_step_reveal creatives saved and verified");
+
+                WorkingDirectoryManager::instance()->setWorkingDir(genWork);
+            }
         }
 
         liveGenPane.close();

@@ -556,10 +556,16 @@ QCoro::Task<void> ProductShowcaseMultiVideoWorkflow::_runWorkflow()
             for (const auto &previous : m_takes)
             {
                 if (previous.stepIndex == take.stepIndex - 1
-                    && previous.takeIndex == selectedTakeIndex(previous.stepIndex)
-                    && !previous.conversationUrl.isEmpty())
+                    && previous.takeIndex == selectedTakeIndex(previous.stepIndex))
                 {
-                    m_conversationUrl = previous.conversationUrl;
+                    if (!previous.filePath.isEmpty() && QFileInfo::exists(previous.filePath))
+                    {
+                        request.previousStepVideoPath = previous.filePath;
+                    }
+                    if (!previous.conversationUrl.isEmpty())
+                    {
+                        m_conversationUrl = previous.conversationUrl;
+                    }
                     break;
                 }
             }

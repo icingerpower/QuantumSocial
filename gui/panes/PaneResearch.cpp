@@ -3544,8 +3544,8 @@ void PaneResearch::openAutoBatchDialog()
     auto *countSpin = new QSpinBox;
     countSpin->setObjectName(QStringLiteral("autoBatchCountPerProduct"));
     countSpin->setRange(1, 50);
-    countSpin->setValue(settings.value(QStringLiteral("autoBatch/countPerProduct"), 10).toInt());
-    form->addRow(tr("2. Generations per product:"), countSpin);
+    countSpin->setValue(settings.value(QStringLiteral("autoBatch/countPerProduct"), 3).toInt());
+    form->addRow(tr("2. Generations per product (each format):"), countSpin);
 
     const bool isTikTokAccount = m_account->currentText().contains(
         QLatin1String("tiktok"), Qt::CaseInsensitive);
@@ -3627,12 +3627,15 @@ void PaneResearch::openAutoBatchDialog()
             if (prodList->item(i)->checkState() == Qt::Checked) ++checkedProducts;
         }
         onlySelectedChk->setText(tr("Show only selected (%1)").arg(checkedProducts));
-        const bool anyFormat = chkImage->isChecked() || chkCarousel->isChecked() || chkVideo->isChecked();
-        const int totalCreatives = checkedProducts * countSpin->value();
+        const int formatCount = (chkImage->isChecked() ? 1 : 0)
+            + (chkCarousel->isChecked() ? 1 : 0)
+            + (chkVideo->isChecked() ? 1 : 0);
+        const bool anyFormat = formatCount > 0;
+        const int totalCreatives = checkedProducts * countSpin->value() * formatCount;
         summaryLabel->setText(
             (checkedProducts > 0 && anyFormat)
-                ? tr("Ready: %1 product(s) × %2 = %3 total creative(s) — zero popups while running.")
-                    .arg(checkedProducts).arg(countSpin->value()).arg(totalCreatives)
+                ? tr("Ready: %1 product(s) × %2 per format × %3 format(s) = %4 total creative(s) — zero popups while running.")
+                    .arg(checkedProducts).arg(countSpin->value()).arg(formatCount).arg(totalCreatives)
                 : tr("Check at least 1 product and 1 creative format."));
         if (auto *okBtn = buttons->button(QDialogButtonBox::Ok))
         {

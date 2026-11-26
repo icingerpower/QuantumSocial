@@ -891,6 +891,54 @@ static void checkVideoClips(const QDir &root)
     require(awaitMedia(VideoClipProcessing::trimTail(red, 2.0)).path == red, "short clip unchanged");
     require(awaitMedia(VideoClipProcessing::trimTail(combined, 0)).path == combined, "disabled trim unchanged");
 
+    // Smart prefix-overlap continuation preparation (standalone vs 2-step Gemini merge vs 3-turn cumulative):
+    const QString standaloneJitter = root.filePath("standalone_jitter.mp4");
+    const QString standaloneLong = root.filePath("standalone_long_green.mp4");
+    const QString mergedUneven = root.filePath("merged_uneven.mp4");
+    const QString mergedThreeTurns = root.filePath("merged_three_turns.mp4");
+    mediaCommand("ffmpeg", {"-v", "error", "-y", "-f", "lavfi", "-i", "color=green:s=160x120:d=1.02:r=30",
+        "-c:v", "libx264", standaloneJitter});
+    mediaCommand("ffmpeg", {"-v", "error", "-y", "-f", "lavfi", "-i", "color=green:s=160x120:d=2.0:r=30",
+        "-c:v", "libx264", standaloneLong});
+    mediaCommand("ffmpeg", {"-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=red:s=160x120:d=1.0:r=30",
+        "-f", "lavfi", "-i", "color=blue:s=160x120:d=0.7:r=30",
+        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]", "-c:v", "libx264", mergedUneven});
+    mediaCommand("ffmpeg", {"-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=red:s=160x120:d=1.0:r=30",
+        "-f", "lavfi", "-i", "color=green:s=160x120:d=1.0:r=30",
+        "-f", "lavfi", "-i", "color=blue:s=160x120:d=1.0:r=30",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]", "-map", "[v]", "-c:v", "libx264", mergedThreeTurns});
+
+    // 1) Standalone ~1.02s clip (minor muxer jitter): untouched, no re-encode
+    const auto prepStandalone = awaitMedia(VideoClipProcessing::prepareContinuation(standaloneJitter, red, 1.0));
+    require(prepStandalone.error.isEmpty() && !prepStandalone.hadPrependedPrefix
+            && prepStandalone.nativeMergedPath.isEmpty() && prepStandalone.path == standaloneJitter,
+            "standalone continuation clip with minor duration jitter kept untouched");
+
+    // 2) Standalone 2.0s clip whose opening frames do NOT match Step 1 (low SSIM): never trimmed!
+    const auto prepLongStandalone = awaitMedia(VideoClipProcessing::prepareContinuation(standaloneLong, red, 1.0));
+    require(prepLongStandalone.error.isEmpty() && !prepLongStandalone.hadPrependedPrefix
+            && prepLongStandalone.nativeMergedPath.isEmpty() && prepLongStandalone.path == standaloneLong,
+            "standalone >fallbackSeconds clip with non-matching prefix is kept whole without chopping start");
+
+    // 3) Direct 2-step Gemini merge (1.0s red + 0.7s blue = 1.7s, where blind trimTail(1.0) would leave 0.3s duplicate red):
+    const auto prepMerged2 = awaitMedia(VideoClipProcessing::prepareContinuation(mergedUneven, red, 1.0));
+    require(prepMerged2.error.isEmpty() && prepMerged2.hadPrependedPrefix
+            && prepMerged2.nativeMergedPath == mergedUneven
+            && qAbs(videoDuration(prepMerged2.path) - 0.7) < 0.12
+            && videoPixel(prepMerged2.path, 0.08).blue() > 200
+            && videoPixel(prepMerged2.path, 0.08).red() < 50,
+            "direct 2-step merge slices at exact Step 1 duration (zero red overlap) and exposes nativeMergedPath");
+
+    // 4) Cumulative 3-turn merge (1.0s red + 1.0s green + 1.0s blue = 3.0s): extracts trailing blue without nativeMergedPath
+    const auto prepMerged3 = awaitMedia(VideoClipProcessing::prepareContinuation(mergedThreeTurns, red, 1.0));
+    require(prepMerged3.error.isEmpty() && prepMerged3.hadPrependedPrefix
+            && prepMerged3.nativeMergedPath.isEmpty()
+            && qAbs(videoDuration(prepMerged3.path) - 1.0) < 0.12
+            && videoPixel(prepMerged3.path, 0.2).blue() > 200,
+            "cumulative 3-turn merge extracts trailing segment and clears nativeMergedPath");
+
     ProductShowcaseMultiVideoWorkflow workflow;
     workflow.configure(2, "Intro", 1, "Continuation", 2);
     auto json = workflow.toJson();

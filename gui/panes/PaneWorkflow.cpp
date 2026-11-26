@@ -61,6 +61,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <functional>
 
 namespace {
 
@@ -444,8 +445,11 @@ QWidget *PaneWorkflow::_buildStep1Page()
     m_spinGenPerProduct = new QSpinBox(rightBox);
     m_spinGenPerProduct->setObjectName(QStringLiteral("spinWorkflowGenPerProduct"));
     m_spinGenPerProduct->setRange(1, 50);
-    m_spinGenPerProduct->setValue(uiSettings.value(QStringLiteral("autoBatch/generationsPerProduct"), 6).toInt());
-    form->addRow(tr("Generations per product:"), m_spinGenPerProduct);
+    m_spinGenPerProduct->setToolTip(
+        tr("Number of creatives generated for EACH checked format below per selected product "
+           "(e.g. 2 with Video + Carousel checked = 2 videos + 2 carousels per product)."));
+    m_spinGenPerProduct->setValue(uiSettings.value(QStringLiteral("autoBatch/generationsPerProduct"), 2).toInt());
+    form->addRow(tr("Generations per product (each format):"), m_spinGenPerProduct);
 
     m_comboPromptCli = new QComboBox(rightBox);
     m_comboPromptCli->setObjectName(QStringLiteral("comboWorkflowPromptCli"));
@@ -1556,15 +1560,17 @@ QStringList PaneWorkflow::_checkedStep1ProductIds() const
 void PaneWorkflow::_updateStep1SummaryAndButtons()
 {
     const int checkedCount = m_checkedProductIds.size();
-    const bool anyFormat = (m_chkFormatVideo && m_chkFormatVideo->isChecked())
-        || (m_chkFormatCarousel && m_chkFormatCarousel->isChecked())
-        || (m_chkFormatImage && m_chkFormatImage->isChecked());
+    int formatCount = 0;
+    if (m_chkFormatVideo && m_chkFormatVideo->isChecked()) ++formatCount;
+    if (m_chkFormatCarousel && m_chkFormatCarousel->isChecked()) ++formatCount;
+    if (m_chkFormatImage && m_chkFormatImage->isChecked()) ++formatCount;
+    const bool anyFormat = formatCount > 0;
     const bool hasPromptCli = m_comboPromptCli
         && m_comboPromptCli->currentData().value<AbstractCli *>() != nullptr;
     const bool hasImageCli = m_comboImageCli
         && m_comboImageCli->currentData().value<AbstractCli *>() != nullptr;
-    const int perProd = m_spinGenPerProduct ? m_spinGenPerProduct->value() : 1;
-    const int totalToGen = checkedCount * perProd;
+    const int perFormat = m_spinGenPerProduct ? m_spinGenPerProduct->value() : 1;
+    const int totalToGen = checkedCount * perFormat * formatCount;
     const bool batchRunning = (m_paneGeneration && m_paneGeneration->isAutoBatchRunning()) || m_syncingStats;
 
     if (m_btnSyncStats)
@@ -1575,8 +1581,8 @@ void PaneWorkflow::_updateStep1SummaryAndButtons()
     if (m_selectedProductsLabel)
     {
         m_selectedProductsLabel->setText(
-            tr("Selected: %1 product(s) × %2 generation(s) = %3 creative(s) to generate")
-                .arg(checkedCount).arg(perProd).arg(totalToGen));
+            tr("Selected: %1 product(s) × %2 per format × %3 format(s) = %4 creative(s) to generate")
+                .arg(checkedCount).arg(perFormat).arg(formatCount).arg(totalToGen));
         m_selectedProductsLabel->setStyleSheet(checkedCount > 0
             ? QStringLiteral("color: #8fd19e; font-weight: 600;")
             : QStringLiteral("color: #e89774; font-weight: 600;"));
@@ -2685,10 +2691,18 @@ void PaneWorkflow::openClearGeminiChatsDialog()
         updateButtons();
         statusLabel->setText(tr("Deleting %1 Gemini chat(s) in browser…").arg(urlsToDelete.size()));
 
-        QPointer<QDialog> dlgGuard(&dialog);
-        deleteTask = std::make_unique<QCoro::Task<void>>(
-            [this, generator, urlsToDelete, settings, dlgGuard, &deleting, populateTable]() -> QCoro::Task<void> {
-                const auto res = co_await generator->deleteConversations(urlsToDelete, settings);
+        // IMPORTANT: C++20 coroutine lambdas with captures are destroyed at the
+        // semicolon after the first co_await, leaving captured values dangling.
+        // Use a stateless coroutine lambda taking every needed value by parameter
+        // so everything lives inside the heap-allocated coroutine frame.
+        static const auto runDeleteCoroutine =
+            [](AbstractVideoGenerator *gen,
+               QStringList urls,
+               QVariantMap cfg,
+               QPointer<QDialog> dlg,
+               std::function<void(const AbstractVideoGenerator::DeleteConversationsResult &)> onFinished)
+            -> QCoro::Task<void> {
+                const auto res = co_await gen->deleteConversations(urls, cfg);
                 if (!res.deletedUrls.isEmpty())
                 {
                     QSet<QString> deletedSet(res.deletedUrls.begin(), res.deletedUrls.end());
@@ -2712,12 +2726,16 @@ void PaneWorkflow::openClearGeminiChatsDialog()
                     }
                     saveGeminiChatCache(remaining);
                 }
-
-                deleting = false;
-                if (!dlgGuard)
+                if (dlg && onFinished)
                 {
-                    co_return;
+                    onFinished(res);
                 }
+            };
+
+        QPointer<QDialog> dlgGuard(&dialog);
+        std::function<void(const AbstractVideoGenerator::DeleteConversationsResult &)> onFinished =
+            [&deleting, &populateTable](const AbstractVideoGenerator::DeleteConversationsResult &res) {
+                deleting = false;
                 QString summary;
                 if (res.failedUrls.isEmpty() && res.errorMessage.isEmpty())
                 {
@@ -2738,7 +2756,9 @@ void PaneWorkflow::openClearGeminiChatsDialog()
                         : tr("Could not delete Gemini chat(s): %1").arg(res.errorMessage);
                 }
                 populateTable(summary);
-            }());
+            };
+        deleteTask = std::make_unique<QCoro::Task<void>>(
+            runDeleteCoroutine(generator, urlsToDelete, settings, dlgGuard, std::move(onFinished)));
     };
 
     connect(table, &QTableWidget::itemSelectionChanged, &dialog, updateButtons);
