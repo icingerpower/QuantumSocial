@@ -2,6 +2,7 @@
 #define RESEARCHSTORE_H
 
 #include <QObject>
+#include <QHash>
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QDir>
@@ -25,6 +26,8 @@ public:
     bool attachMedia(const QString &id, const QString &localMedia, bool resetStatus = true);
     bool removeReferences(const QStringList &ids);
     bool review(const QStringList &ids, const QString &status, const QString &reason);
+    int autoDiscardReferences(const QHash<QString, QString> &reasonsByRefId);
+    bool reloadIfChangedOnDisk();
     bool isRejectedUrl(const QString &accountId, const QString &url) const;
     QStringList excludedSpyUrls(const QString &accountId) const;
     QJsonObject spyContextPayload(const QString &accountId, const QString &platformId = {}) const;

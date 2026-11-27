@@ -137,15 +137,17 @@ MainWindow::MainWindow(QWidget *parent)
         ui->tabWidget->setCurrentWidget(paneGeneration);
         paneGeneration->startAutoBatch(batchSpec);
     });
-    ui->tabWidget->addTab(new PaneProperties(m_properties, m_archive, m_videos, m_accounts, this),
+    ui->tabWidget->addTab(new PaneProperties(m_properties, m_archive, m_videos, m_accounts, this, researchStore),
                           tr("Properties"));
     ui->tabWidget->addTab(new PaneStatistics(m_videos, m_scheduler, m_accounts,
                                              paneGeneration->projectsModel(), this,
-                                             m_hashtags, m_favoriteHooks),
+                                             m_hashtags, m_favoriteHooks, researchStore),
                           tr("Statistics"));
     ui->tabWidget->addTab(new PaneSettings(m_generationSettings, m_availableCliTable,
                                           this),
                           tr("Settings"));
+
+    paneWorkflow->scheduleStartupStatisticsCheck();
 }
 
 MainWindow::~MainWindow()

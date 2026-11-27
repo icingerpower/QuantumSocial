@@ -649,6 +649,7 @@ QWidget *PaneResearch::buildReferences()
         {QStringLiteral("pending"), tr("Pending")},
         {QStringLiteral("approved"), tr("Approved")},
         {QStringLiteral("rejected"), tr("Rejected")},
+        {QStringLiteral("auto_discarded"), tr("Auto-discarded")},
         {QString{}, tr("All")}
     };
     for (const auto &spec : filterSpecs)
@@ -1012,6 +1013,16 @@ void PaneResearch::refreshProducts()
     const auto products = m_store->products();
     if (m_lastProducts == products && m_lastProfile == profile && m_lastOnlyAllowed == m_onlyAllowed->isChecked()) return;
     m_lastProducts = products; m_lastProfile = profile; m_lastOnlyAllowed = m_onlyAllowed->isChecked();
+    QSet<QString> validProductIds;
+    for (const auto &value : products)
+    {
+        const QString pid = text(value.toObject(), "id");
+        if (!pid.isEmpty())
+        {
+            validProductIds.insert(pid);
+        }
+    }
+    m_checkedProductIds.intersect(validProductIds);
     m_refreshing = true;
     m_products->removeRows(0, m_products->rowCount());
     for (const auto &value : products)
@@ -1130,6 +1141,7 @@ void PaneResearch::refreshReferences()
     int pendingCount = 0;
     int approvedCount = 0;
     int rejectedCount = 0;
+    int autoDiscardedCount = 0;
     QList<QJsonObject> filteredRefs;
 
     for (const auto &v : m_store->references())
@@ -1143,6 +1155,7 @@ void PaneResearch::refreshReferences()
         const QString st = text(r, "status");
         if (st == QLatin1String("approved")) ++approvedCount;
         else if (st == QLatin1String("rejected")) ++rejectedCount;
+        else if (st == QLatin1String("auto_discarded")) ++autoDiscardedCount;
         else ++pendingCount;
 
         if (!filter.isEmpty() && st != filter) continue;
@@ -1159,6 +1172,7 @@ void PaneResearch::refreshReferences()
     if (auto *b = m_filterButtons.value(QStringLiteral("pending"))) b->setText(tr("Pending (%1)").arg(pendingCount));
     if (auto *b = m_filterButtons.value(QStringLiteral("approved"))) b->setText(tr("Approved (%1)").arg(approvedCount));
     if (auto *b = m_filterButtons.value(QStringLiteral("rejected"))) b->setText(tr("Rejected (%1)").arg(rejectedCount));
+    if (auto *b = m_filterButtons.value(QStringLiteral("auto_discarded"))) b->setText(tr("Auto-discarded (%1)").arg(autoDiscardedCount));
     if (auto *b = m_filterButtons.value(QString{})) b->setText(tr("All (%1)").arg(totalForAccount));
 
     if (sortMode == QLatin1String("newest"))
@@ -1232,21 +1246,26 @@ void PaneResearch::refreshReferences()
         }
 
         const int humanDecided = approvedCount + rejectedCount;
+        const QString autoDiscPart = autoDiscardedCount > 0
+            ? tr(" · %1 auto-discarded (≥4 flops, ≥2 products)").arg(autoDiscardedCount)
+            : QString{};
         if (humanDecided > 0)
         {
             const double humanRejectPct = 100.0 * double(rejectedCount) / double(humanDecided);
-            summaryLines << tr("Review queue: %1 total — %2 pending · %3 approved · %4 rejected (%5% human reject rate)")
+            summaryLines << tr("Review queue: %1 total — %2 pending · %3 approved · %4 rejected (%5% human reject rate)%6")
                 .arg(totalForAccount)
                 .arg(pendingCount)
                 .arg(approvedCount)
                 .arg(rejectedCount)
-                .arg(QString::number(humanRejectPct, 'f', 1));
+                .arg(QString::number(humanRejectPct, 'f', 1),
+                     autoDiscPart);
         }
         else if (totalForAccount > 0)
         {
-            summaryLines << tr("Review queue: %1 total — %2 pending · 0 approved · 0 rejected")
+            summaryLines << tr("Review queue: %1 total — %2 pending · 0 approved · 0 rejected%3")
                 .arg(totalForAccount)
-                .arg(pendingCount);
+                .arg(pendingCount)
+                .arg(autoDiscPart);
         }
 
         m_metricsSummary->setVisible(!summaryLines.isEmpty());
@@ -1322,7 +1341,10 @@ void PaneResearch::refreshReferences()
         {
             statusLine += QStringLiteral(" · video");
         }
-        statusLine += QStringLiteral(" · ") + st;
+        const QString statusLabelText = (st == QLatin1String("auto_discarded"))
+            ? tr("⚡ auto-discarded (≥4 flops, ≥2 products)")
+            : st;
+        statusLine += QStringLiteral(" · ") + statusLabelText;
         if (usedCount > 0)
         {
             statusLine += tr(" · Used for %1 product(s)").arg(usedCount);
@@ -1336,6 +1358,10 @@ void PaneResearch::refreshReferences()
         caption->installEventFilter(this);
         caption->setTextFormat(Qt::PlainText);
         caption->setWordWrap(true);
+        if (st == QLatin1String("auto_discarded"))
+        {
+            caption->setStyleSheet(QStringLiteral("color: #f59e0b; font-weight: 600;"));
+        }
         layout->addWidget(caption);
 
         auto *actions = new QHBoxLayout;
@@ -1413,8 +1439,14 @@ void PaneResearch::refreshReferences()
             const auto up = m_store->product(pidVal.toString());
             if (!up.isEmpty()) usedNames << (text(up, "color") + QStringLiteral(" — ") + text(up, "title")).left(60);
         }
+        const QString curStatusStr = text(current, "status");
+        const QString statusExplain = (curStatusStr == QLatin1String("auto_discarded"))
+            ? tr("auto_discarded (Automatically discarded after ≥4 low-performing posts across ≥2 products)")
+            : ((curStatusStr == QLatin1String("rejected"))
+                   ? tr("rejected (Rejected by human)")
+                   : curStatusStr);
         QString evidence = tr("Status: %1\nSource: %2\nCreated: %3\nStatistics: %4\nProjects created for: %5\nReview: %6")
-            .arg(text(current, "status"),
+            .arg(statusExplain,
                  text(current, "url"),
                  createdDisplay,
                  statsSummary.isEmpty() ? tr("—") : statsSummary,
@@ -1782,6 +1814,185 @@ void PaneResearch::editProfile()
     report(m_store->setProfile(id, updated), tr("Account rules saved."));
 }
 
+bool PaneResearch::hasConfiguredProductDirectory() const
+{
+    return m_directory && !m_directory->text().trimmed().isEmpty();
+}
+
+void PaneResearch::_showNewlyImportedProductsDialog(const QList<QJsonObject> &newProducts, int totalCatalogCount)
+{
+    if (newProducts.isEmpty())
+    {
+        return;
+    }
+
+    const QJsonObject profile = m_store ? m_store->profile(accountId()) : QJsonObject{};
+    const bool rulesConfigured = hasAccountRules(profile);
+    QStringList allowedNewIds;
+    for (const QJsonObject &p : newProducts)
+    {
+        const QString pid = text(p, "id");
+        if (pid.isEmpty())
+        {
+            continue;
+        }
+        if (!rulesConfigured || ResearchStore::productRestriction(p, profile).isEmpty())
+        {
+            allowedNewIds << pid;
+        }
+    }
+
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("dialogNewlyImportedProducts"));
+    dlg.setWindowTitle(tr("New Products Imported (%1)").arg(newProducts.size()));
+    dlg.resize(880, 620);
+
+    auto *rootLayout = new QVBoxLayout(&dlg);
+    rootLayout->setContentsMargins(14, 14, 14, 14);
+    rootLayout->setSpacing(10);
+
+    auto *summaryLabel = new QLabel(&dlg);
+    summaryLabel->setObjectName(QStringLiteral("labelNewProductsSummary"));
+    summaryLabel->setWordWrap(true);
+    summaryLabel->setStyleSheet(QStringLiteral("font-size: 13px; font-weight: 600; color: #8fd19e;"));
+    summaryLabel->setText(rulesConfigured
+        ? tr("✨ Found %1 new A+ product/color group(s) (%2 allowed for this account · %3 total in catalog).")
+              .arg(newProducts.size()).arg(allowedNewIds.size()).arg(totalCatalogCount)
+        : tr("✨ Found %1 new A+ product/color group(s) (%2 total in catalog).")
+              .arg(newProducts.size()).arg(totalCatalogCount));
+    rootLayout->addWidget(summaryLabel);
+
+    auto *scroll = new QScrollArea(&dlg);
+    scroll->setObjectName(QStringLiteral("scrollNewProducts"));
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+
+    auto *gridHost = new QWidget(scroll);
+    gridHost->setObjectName(QStringLiteral("gridNewProducts"));
+    auto *grid = new QGridLayout(gridHost);
+    grid->setContentsMargins(2, 2, 2, 2);
+    grid->setSpacing(10);
+    const int kColumns = 3;
+    for (int c = 0; c < kColumns; ++c)
+    {
+        grid->setColumnStretch(c, 1);
+    }
+
+    const int maxVisualCards = 120;
+    const int shownCount = qMin(int(newProducts.size()), maxVisualCards);
+    for (int i = 0; i < shownCount; ++i)
+    {
+        const QJsonObject &p = newProducts.at(i);
+        const QString pid = text(p, "id");
+        const QString title = text(p, "title");
+        const QString color = text(p, "color");
+        const QString brand = text(p, "brand");
+        const QString asin = text(p, "asin");
+        const QString imgPath = text(p, "localImage");
+        const QStringList cats = strings(p.value(QStringLiteral("categories")).toArray());
+        const int variantCount = qMax(1, int(p.value(QStringLiteral("variants")).toArray().size()));
+        const QString restriction = rulesConfigured ? ResearchStore::productRestriction(p, profile) : QString{};
+        const bool isAllowed = restriction.isEmpty();
+
+        auto *card = new QFrame(gridHost);
+        card->setObjectName(QStringLiteral("newProductCard_") + pid);
+        card->setFrameShape(QFrame::StyledPanel);
+        card->setStyleSheet(isAllowed
+            ? QStringLiteral("QFrame { background: rgba(30, 38, 54, 0.72); border: 1px solid rgba(74, 222, 128, 0.42); border-radius: 8px; }")
+            : QStringLiteral("QFrame { background: rgba(30, 34, 44, 0.55); border: 1px solid rgba(148, 163, 184, 0.28); border-radius: 8px; }"));
+        auto *cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(8, 8, 8, 8);
+        cardLayout->setSpacing(5);
+
+        auto *imgLbl = new QLabel(card);
+        imgLbl->setObjectName(QStringLiteral("newProductImage_") + pid);
+        imgLbl->setAlignment(Qt::AlignCenter);
+        imgLbl->setMinimumSize(180, 180);
+        imgLbl->setMaximumHeight(200);
+        imgLbl->setStyleSheet(QStringLiteral("background: #11151d; border: 1px solid #262e40; border-radius: 6px;"));
+        previewImage(imgLbl, imgPath, QSize(220, 185), tr("No image"));
+        cardLayout->addWidget(imgLbl);
+
+        auto *badgeLbl = new QLabel(card);
+        badgeLbl->setWordWrap(true);
+        badgeLbl->setStyleSheet(isAllowed
+            ? QStringLiteral("border: none; background: transparent; color: #86efac; font-size: 11px; font-weight: 600;")
+            : QStringLiteral("border: none; background: transparent; color: #fbbf24; font-size: 11px;"));
+        badgeLbl->setText(isAllowed
+            ? tr("✓ Allowed for account")
+            : tr("⚠ Filtered by account rules"));
+        if (!restriction.isEmpty())
+        {
+            badgeLbl->setToolTip(restriction);
+        }
+        cardLayout->addWidget(badgeLbl);
+
+        const QString heading = color.isEmpty() ? title : QStringLiteral("%1 — %2").arg(color, title);
+        auto *titleLbl = new QLabel(heading, card);
+        titleLbl->setWordWrap(true);
+        titleLbl->setStyleSheet(QStringLiteral("border: none; background: transparent; font-weight: 700; font-size: 12px;"));
+        titleLbl->setToolTip(heading);
+        cardLayout->addWidget(titleLbl);
+
+        QStringList metaParts;
+        if (!brand.isEmpty()) metaParts << brand;
+        if (!cats.isEmpty()) metaParts << cats.join(QStringLiteral(", "));
+        if (!asin.isEmpty()) metaParts << asin;
+        metaParts << tr("%1 variant(s)").arg(variantCount);
+        auto *metaLbl = new QLabel(metaParts.join(QStringLiteral(" · ")), card);
+        metaLbl->setWordWrap(true);
+        metaLbl->setStyleSheet(QStringLiteral("border: none; background: transparent; color: #9ca3af; font-size: 11px;"));
+        cardLayout->addWidget(metaLbl);
+        cardLayout->addStretch();
+
+        grid->addWidget(card, i / kColumns, i % kColumns);
+    }
+    if (newProducts.size() > maxVisualCards)
+    {
+        auto *moreLbl = new QLabel(
+            tr("+ %1 additional new product(s) imported into the catalog.")
+                .arg(newProducts.size() - maxVisualCards),
+            gridHost);
+        moreLbl->setStyleSheet(QStringLiteral("color: #93c5fd; font-weight: 600; padding: 6px;"));
+        grid->addWidget(moreLbl, (shownCount + kColumns - 1) / kColumns, 0, 1, kColumns);
+    }
+
+    scroll->setWidget(gridHost);
+    rootLayout->addWidget(scroll, 1);
+
+    auto *btnRow = new QHBoxLayout;
+    btnRow->addStretch();
+    if (!allowedNewIds.isEmpty())
+    {
+        auto *btnCheckNew = new QPushButton(
+            tr("✓ Check New Products (%1)").arg(allowedNewIds.size()), &dlg);
+        btnCheckNew->setObjectName(QStringLiteral("buttonCheckNewProducts"));
+        btnCheckNew->setMinimumHeight(34);
+        btnCheckNew->setStyleSheet(QStringLiteral(
+            "QPushButton { background: #16a34a; color: white; font-weight: 700; padding: 6px 14px; border-radius: 6px; }"));
+        connect(btnCheckNew, &QPushButton::clicked, &dlg, [this, &dlg, allowedNewIds]() {
+            for (const QString &pid : allowedNewIds)
+            {
+                m_checkedProductIds.insert(pid);
+            }
+            m_lastProducts = QJsonArray{};
+            refreshProducts();
+            emit newlyImportedProductsChecked(allowedNewIds);
+            dlg.accept();
+        });
+        btnRow->addWidget(btnCheckNew);
+    }
+    auto *btnClose = new QPushButton(tr("Close"), &dlg);
+    btnClose->setObjectName(QStringLiteral("buttonCloseNewProducts"));
+    btnClose->setMinimumHeight(34);
+    btnClose->setDefault(true);
+    connect(btnClose, &QPushButton::clicked, &dlg, &QDialog::accept);
+    btnRow->addWidget(btnClose);
+    rootLayout->addLayout(btnRow);
+
+    dlg.exec();
+}
+
 void PaneResearch::importProducts()
 {
     const QString directory = m_directory->text().trimmed();
@@ -1793,6 +2004,17 @@ void PaneResearch::importProducts()
         QMessageBox::warning(this, tr("Invalid working directory"), result.error);
         return;
     }
+
+    QSet<QString> existingIds;
+    for (const QJsonValue &v : m_store->products())
+    {
+        const QString pid = text(v.toObject(), "id");
+        if (!pid.isEmpty())
+        {
+            existingIds.insert(pid);
+        }
+    }
+
     const QString canonicalDir = QFileInfo(directory).canonicalFilePath();
     if (!m_store->replaceProducts(result.products, canonicalDir))
     {
@@ -1804,6 +2026,17 @@ void PaneResearch::importProducts()
     QSettings settings(m_store->directory().filePath("ui.ini"), QSettings::IniFormat);
     settings.setValue("productDirectory", canonicalDir);
 
+    QList<QJsonObject> newlyImported;
+    for (const QJsonValue &v : result.products)
+    {
+        const QJsonObject p = v.toObject();
+        const QString pid = text(p, "id");
+        if (!pid.isEmpty() && !existingIds.contains(pid))
+        {
+            newlyImported.append(p);
+        }
+    }
+
     const auto profile = m_store->profile(accountId());
     if (!hasAccountRules(profile) && m_onlyAllowed->isChecked())
     {
@@ -1813,21 +2046,30 @@ void PaneResearch::importProducts()
     m_lastProducts = QJsonArray{};
     refreshProducts();
 
+    const QString newSummaryTag = newlyImported.isEmpty()
+        ? tr("no new products")
+        : tr("%1 new").arg(newlyImported.size());
+
     if (!hasAccountRules(profile))
     {
-        report(true, tr("Imported %1 A+ product/color groups (excluded %2 archived, %3 without A+ / high-res photos). Showing all A+ products — click \"Account rules…\" to allow brands and categories for this account.")
-            .arg(result.products.size()).arg(result.archivedRecords).arg(result.skippedWithoutAPlus));
+        report(true, tr("Imported %1 A+ product/color groups (%2 · excluded %3 archived, %4 without A+ / high-res photos). Showing all A+ products — click \"Account rules…\" to allow brands and categories for this account.")
+            .arg(result.products.size()).arg(newSummaryTag).arg(result.archivedRecords).arg(result.skippedWithoutAPlus));
     }
     else
     {
-        report(true, tr("Imported %1 A+ product/color groups (excluded %2 archived, %3 without A+ / high-res photos); %4 allowed for this account.")
-            .arg(result.products.size()).arg(result.archivedRecords).arg(result.skippedWithoutAPlus).arg(m_products->rowCount()));
-        if (m_onlyAllowed->isChecked() && m_products->rowCount() == 0 && !result.products.isEmpty())
-        {
-            QMessageBox::information(this, tr("No matching products for account rules"),
-                tr("Imported %1 A+ product/color groups, but none match the current Account rules.\n\nUpdate \"Account rules…\" or uncheck \"Allowed for this account\" to view all imported A+ products.")
-                    .arg(result.products.size()));
-        }
+        report(true, tr("Imported %1 A+ product/color groups (%2 · excluded %3 archived, %4 without A+ / high-res photos); %5 allowed for this account.")
+            .arg(result.products.size()).arg(newSummaryTag).arg(result.archivedRecords).arg(result.skippedWithoutAPlus).arg(m_products->rowCount()));
+    }
+
+    if (!newlyImported.isEmpty())
+    {
+        _showNewlyImportedProductsDialog(newlyImported, result.products.size());
+    }
+    else if (hasAccountRules(profile) && m_onlyAllowed->isChecked() && m_products->rowCount() == 0 && !result.products.isEmpty())
+    {
+        QMessageBox::information(this, tr("No matching products for account rules"),
+            tr("Imported %1 A+ product/color groups, but none match the current Account rules.\n\nUpdate \"Account rules…\" or uncheck \"Allowed for this account\" to view all imported A+ products.")
+                .arg(result.products.size()));
     }
 }
 

@@ -404,6 +404,92 @@ bool ResearchStore::review(const QStringList &ids, const QString &status, const 
     return save(next);
 }
 
+int ResearchStore::autoDiscardReferences(const QHash<QString, QString> &reasonsByRefId)
+{
+    if (m_readOnly || reasonsByRefId.isEmpty())
+    {
+        return 0;
+    }
+    auto next = m_data;
+    auto refs = references();
+    int discardedCount = 0;
+    for (int i = 0; i < refs.size(); ++i)
+    {
+        auto r = refs[i].toObject();
+        const QString id = r.value("id").toString();
+        if (!reasonsByRefId.contains(id))
+        {
+            continue;
+        }
+        const QString curStatus = r.value("status").toString();
+        // Never overwrite human rejection ("rejected") and keep already auto-discarded items idempotent
+        if (curStatus == QLatin1String("rejected") || curStatus == QLatin1String("auto_discarded"))
+        {
+            continue;
+        }
+        const QString reason = reasonsByRefId.value(id).trimmed();
+        const QString ts = now();
+        auto history = r.value("history").toArray();
+        history.append(QJsonObject{
+            {"status", QStringLiteral("auto_discarded")},
+            {"reason", reason},
+            {"at", ts},
+            {"actor", QStringLiteral("auto_stats")}
+        });
+        r.insert("history", history);
+        r.insert("status", QStringLiteral("auto_discarded"));
+        r.insert("reviewReason", reason);
+        r.insert("autoDiscardedAt", ts);
+        r.insert("updatedAt", ts);
+        refs[i] = r;
+        ++discardedCount;
+    }
+    if (discardedCount == 0)
+    {
+        return 0;
+    }
+    next.insert("references", refs);
+    return save(next) ? discardedCount : 0;
+}
+
+bool ResearchStore::reloadIfChangedOnDisk()
+{
+    if (m_readOnly)
+    {
+        return false;
+    }
+    QFile file(m_dir.filePath("research.json"));
+    if (!file.exists())
+    {
+        return false;
+    }
+    if (!file.open(QIODevice::ReadOnly))
+    {
+        return false;
+    }
+    const QByteArray bytes = file.readAll();
+    const QByteArray diskRev = digest(bytes);
+    if (diskRev == m_revision)
+    {
+        return false;
+    }
+    QJsonParseError parseErr;
+    const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseErr);
+    const QJsonObject obj = doc.object();
+    if (parseErr.error != QJsonParseError::NoError || !doc.isObject()
+        || obj.value("schemaVersion").toInt() != 1
+        || !obj.value("profiles").isObject()
+        || !obj.value("products").isArray()
+        || !obj.value("references").isArray())
+    {
+        return false;
+    }
+    m_data = obj;
+    m_revision = diskRev;
+    emit changed();
+    return true;
+}
+
 bool ResearchStore::isRejectedUrl(const QString &accountId, const QString &url) const
 {
     const QString norm = canonicalUrl(url);
@@ -421,8 +507,9 @@ bool ResearchStore::isRejectedUrl(const QString &accountId, const QString &url) 
     for (const auto &v : references())
     {
         const auto r = v.toObject();
+        const QString st = r.value("status").toString();
         if (r.value("accountId").toString() == accountId
-            && r.value("status").toString() == QLatin1String("rejected")
+            && (st == QLatin1String("rejected") || st == QLatin1String("auto_discarded"))
             && canonicalUrl(r.value("url").toString()) == norm)
         {
             return true;
@@ -487,7 +574,8 @@ QJsonObject ResearchStore::spyContextPayload(const QString &accountId, const QSt
             {
                 continue;
             }
-            if (r.value("status").toString() == QLatin1String("rejected"))
+            const QString st = r.value("status").toString();
+            if (st == QLatin1String("rejected") || st == QLatin1String("auto_discarded"))
             {
                 rejectedSet.insert(u);
             }

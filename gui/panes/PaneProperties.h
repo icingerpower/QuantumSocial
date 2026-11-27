@@ -11,6 +11,7 @@ QT_END_NAMESPACE
 
 class QPushButton;
 class QTreeView;
+class ResearchStore;
 class TableAccounts;
 class TableVideos;
 class TreeProperties;
@@ -37,7 +38,8 @@ public:
                             QWidget *parent = nullptr);
     explicit PaneProperties(TreeProperties *properties, TreeProperties *archive,
                             TableVideos *videos, TableAccounts *accounts,
-                            QWidget *parent = nullptr);
+                            QWidget *parent = nullptr,
+                            ResearchStore *researchStore = nullptr);
     ~PaneProperties();
 
 private slots:
@@ -57,6 +59,7 @@ private:
     TreeProperties *m_archive;
     TableVideos *m_videos;
     TableAccounts *m_accounts;
+    ResearchStore *m_researchStore = nullptr;
     QTreeView *m_treeActive;
     QTreeView *m_treeArchive;
     QPushButton *m_buttonRetrieveStatistics = nullptr;

@@ -11,6 +11,7 @@ QT_END_NAMESPACE
 
 class FavoriteHooks;
 class PreferredHashtags;
+class ResearchStore;
 class StatisticsScheduler;
 class TableAccounts;
 class TableProjects;
@@ -28,7 +29,8 @@ public:
                             TableAccounts *accounts, TableProjects *projects = nullptr,
                             QWidget *parent = nullptr,
                             PreferredHashtags *hashtags = nullptr,
-                            FavoriteHooks *favoriteHooks = nullptr);
+                            FavoriteHooks *favoriteHooks = nullptr,
+                            ResearchStore *researchStore = nullptr);
     ~PaneStatistics();
 
     TableVideoStatistics *statisticsModel() const;
@@ -41,6 +43,7 @@ private:
     TableProjects *m_projects;
     PreferredHashtags *m_hashtags = nullptr;
     FavoriteHooks *m_favoriteHooks = nullptr;
+    ResearchStore *m_researchStore = nullptr;
     TableVideoStatistics *m_model;
     QCoro::Task<void> m_retrieveStatisticsTask;
 

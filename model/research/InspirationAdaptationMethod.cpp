@@ -2,6 +2,9 @@
 
 #include "AbstractCli.h"
 
+#include <QJsonArray>
+#include <QLocale>
+#include <QRegularExpression>
 #include <algorithm>
 
 namespace
@@ -126,6 +129,10 @@ public:
                  ctx.productImageFile,
                  ctx.productSummary.isEmpty() ? QString{} : QStringLiteral(" (%1)").arg(ctx.productSummary),
                  ctx.videoFormatLabel);
+        if (!ctx.seasonalGuidance.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Seasonal & weather coherence: %1\n").arg(ctx.seasonalGuidance.trimmed());
+        }
         if (!ctx.adaptationNotes.trimmed().isEmpty())
         {
             prompt += QStringLiteral("- Adaptation notes: %1\n").arg(ctx.adaptationNotes.trimmed());
@@ -171,11 +178,16 @@ public:
         {
             *outAttachReferenceScene = !ctx.referenceSceneFile.isEmpty();
         }
-        return QStringLiteral(
+        QString out = QStringLiteral(
             "Recreate the exact scene composition, pose, lighting, and setting of '%1' (removing any "
             "text or UI icons), completely replacing its featured product with our exact real product "
             "shown in '%2' (%3). %4")
             .arg(ctx.referenceSceneFile, ctx.productImageFile, ctx.productSummary, plannedPrompt.trimmed());
+        if (!ctx.seasonalGuidance.trimmed().isEmpty())
+        {
+            out += QStringLiteral(" ") + ensureTrailingPeriod(ctx.seasonalGuidance);
+        }
+        return out.trimmed();
     }
 };
 
@@ -262,6 +274,10 @@ public:
                  ctx.propertyFragments.trimmed().isEmpty()
                      ? QString{}
                      : QStringLiteral(" guided by: %1").arg(ctx.propertyFragments.trimmed()));
+        if (!ctx.seasonalGuidance.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Seasonal & weather coherence: %1\n").arg(ctx.seasonalGuidance.trimmed());
+        }
         if (!ctx.adaptationNotes.trimmed().isEmpty())
         {
             prompt += QStringLiteral("- Adaptation notes: %1\n").arg(ctx.adaptationNotes.trimmed());
@@ -307,6 +323,10 @@ public:
         if (!ctx.propertyFragments.trimmed().isEmpty())
         {
             out += QStringLiteral(" ") + ensureTrailingPeriod(ctx.propertyFragments);
+        }
+        if (!ctx.seasonalGuidance.trimmed().isEmpty())
+        {
+            out += QStringLiteral(" ") + ensureTrailingPeriod(ctx.seasonalGuidance);
         }
         return out;
     }
@@ -385,6 +405,10 @@ public:
                      ? QString{}
                      : QStringLiteral(":\n- Scene & A/B properties (bake 100% into this image): %1")
                            .arg(ctx.propertyFragments.trimmed()));
+        if (!ctx.seasonalGuidance.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Seasonal & weather coherence: %1\n").arg(ctx.seasonalGuidance.trimmed());
+        }
         if (!ctx.adaptationNotes.trimmed().isEmpty())
         {
             prompt += QStringLiteral("- Adaptation notes: %1\n").arg(ctx.adaptationNotes.trimmed());
@@ -428,6 +452,10 @@ public:
         if (!ctx.propertyFragments.trimmed().isEmpty())
         {
             out += QStringLiteral(" ") + ensureTrailingPeriod(ctx.propertyFragments);
+        }
+        if (!ctx.seasonalGuidance.trimmed().isEmpty())
+        {
+            out += QStringLiteral(" ") + ensureTrailingPeriod(ctx.seasonalGuidance);
         }
         return out.trimmed();
     }
@@ -629,6 +657,10 @@ public:
                            .arg(ctx.propertyFragments.trimmed()),
                  ctx.productImageFile);
 
+        if (!ctx.seasonalGuidance.trimmed().isEmpty())
+        {
+            prompt += QStringLiteral("- Seasonal & weather coherence: %1\n").arg(ctx.seasonalGuidance.trimmed());
+        }
         if (!ctx.adaptationNotes.trimmed().isEmpty())
         {
             prompt += QStringLiteral("- Adaptation notes: %1\n").arg(ctx.adaptationNotes.trimmed());
@@ -818,4 +850,217 @@ const InspirationAdaptationMethod *InspirationAdaptationMethod::selectForSlot(
     }
 
     return preferred;
+}
+
+QDate InspirationAdaptationMethod::effectiveCurrentDate()
+{
+    const QString overrideStr = qEnvironmentVariable("QS_CURRENT_DATE_OVERRIDE").trimmed();
+    if (!overrideStr.isEmpty())
+    {
+        const QDate parsed = QDate::fromString(overrideStr.left(10), Qt::ISODate);
+        if (parsed.isValid())
+        {
+            return parsed;
+        }
+    }
+    return QDate::currentDate();
+}
+
+QString InspirationAdaptationMethod::currentSeasonLabel(const QDate &date)
+{
+    const QDate d = date.isValid() ? date : QDate::currentDate();
+    const QString monthName = QLocale::c().monthName(d.month());
+    switch (d.month())
+    {
+    case 12:
+    case 1:
+    case 2:
+        return QStringLiteral("Winter (%1 %2)").arg(monthName).arg(d.year());
+    case 3:
+    case 4:
+    case 5:
+        return QStringLiteral("Spring (%1 %2)").arg(monthName).arg(d.year());
+    case 6:
+    case 7:
+    case 8:
+        return QStringLiteral("Summer (%1 %2)").arg(monthName).arg(d.year());
+    case 9:
+    case 10:
+        return QStringLiteral("Autumn (%1 %2)").arg(monthName).arg(d.year());
+    case 11:
+    default:
+        return QStringLiteral("Late Autumn / Early Winter (%1 %2)").arg(monthName).arg(d.year());
+    }
+}
+
+namespace
+{
+bool isOpenSummerFootwear(const QString &productText)
+{
+    static const QRegularExpression openFootwearRe(
+        QStringLiteral("\\b(sandals?|open[-\\s]?toe|espadrilles?|flip[-\\s]?flops?|slides?|thong\\s+heels?|strappy\\s+sandals?)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    return openFootwearRe.match(productText).hasMatch();
+}
+
+bool isWinterBootFootwear(const QString &productText)
+{
+    static const QRegularExpression bootRe(
+        QStringLiteral("\\b(boots?|booties|snow\\s*boots?|fur[-\\s]?lined|ankle\\s+boots?|knee[-\\s]?high\\s+boots?)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    return bootRe.match(productText).hasMatch();
+}
+} // namespace
+
+QString InspirationAdaptationMethod::seasonalGuardrailInstruction(const QString &productSummary,
+                                                                  const QDate &date)
+{
+    const QDate d = date.isValid() ? date : effectiveCurrentDate();
+    const QString seasonLbl = currentSeasonLabel(d);
+    const bool openFootwear = isOpenSummerFootwear(productSummary);
+    const bool bootFootwear = isWinterBootFootwear(productSummary);
+    const int m = d.month();
+
+    QString rule = QStringLiteral("Current calendar season is %1. ").arg(seasonLbl);
+    if (m == 11 || m == 12 || m == 1 || m == 2)
+    {
+        rule += QStringLiteral(
+            "Avoid out-of-season midsummer beach, poolside, swimsuit, or tropical resort backdrops. ");
+        if (openFootwear)
+        {
+            rule += QStringLiteral(
+                "Because this product is open-toe / sandal footwear in %1, style it EXCLUSIVELY in warm, "
+                "plush INDOOR evening/party/luxury settings (marble hotel lobby, candlelit dinner lounge, "
+                "holiday gala, chic boutique interior, carpeted penthouse) — NEVER outdoors in snow, ice, "
+                "slush, frost, or paired with heavy winter parkas.")
+                .arg(seasonLbl);
+        }
+        else
+        {
+            rule += QStringLiteral(
+                "Use crisp autumn/winter city streets, upscale indoor hotel lobbies, boutiques, or evening venues "
+                "(never pair delicate evening heels with deep snowbanks or ski gear).");
+        }
+    }
+    else if (m >= 6 && m <= 8)
+    {
+        rule += QStringLiteral(
+            "NEVER depict snow, frost, ice, winter blizzards, holiday/Christmas decor, or heavy winter coats/scarves/parkas in %1. ")
+            .arg(seasonLbl);
+        if (bootFootwear)
+        {
+            rule += QStringLiteral(
+                "Because this product is a boot being shown in Summer, style it in a sleek season-neutral indoor "
+                "runway/studio/boutique or chic transitional evening look — NEVER in snow or heavy winter outerwear.");
+        }
+        else
+        {
+            rule += QStringLiteral(
+                "Favor warm sunlit city terraces, golden-hour avenues, garden courtyards, or airy luxury interiors.");
+        }
+    }
+    else if (m >= 3 && m <= 5)
+    {
+        rule += QStringLiteral(
+            "Avoid winter snow/ice/blizzards, Christmas decor, or heavy fur parkas in %1; favor fresh spring "
+            "daylight, cafés, city avenues, galleries, or refined indoor settings (and never place sandals in snow).")
+            .arg(seasonLbl);
+    }
+    else
+    {
+        rule += QStringLiteral(
+            "Avoid midsummer beach/swimwear scenes and avoid deep winter blizzards; favor golden-hour autumn "
+            "boulevards, cafés, or warm luxury indoor venues (style open-toe sandals indoors rather than cold outdoor streets).");
+    }
+    return rule.trimmed();
+}
+
+bool InspirationAdaptationMethod::hasTextSeasonalClash(const QString &sceneText,
+                                                       const QString &productText,
+                                                       const QDate &date,
+                                                       QString *outReason)
+{
+    const QString s = sceneText.trimmed();
+    if (s.isEmpty())
+    {
+        return false;
+    }
+    const QDate d = date.isValid() ? date : effectiveCurrentDate();
+    const int m = d.month();
+
+    static const QRegularExpression winterSnowRe(
+        QStringLiteral("\\b(snow|snowy|snowing|snowfall|snowbank|blizzard|frosty|icy\\s+street|icicles|ski\\s+slope|apres[-\\s]?ski|winter\\s+wonderland|christmas\\s+tree|xmas|puffer\\s+coat|heavy\\s+parka)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression summerBeachRe(
+        QStringLiteral("\\b(beach|poolside|swimming\\s+pool|bikini|swimsuit|swimwear|tropical\\s+island|ocean\\s+surf|palm\\s+beach|summer\\s+heatwave)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+
+    const auto snowMatch = winterSnowRe.match(s);
+    const auto beachMatch = summerBeachRe.match(s);
+    const bool openFootwear = isOpenSummerFootwear(productText);
+    const bool bootFootwear = isWinterBootFootwear(productText);
+
+    if (snowMatch.hasMatch() && openFootwear)
+    {
+        if (outReason)
+        {
+            *outReason = QStringLiteral("open-toe/sandal product clashes with wintry/snowy scene (\"%1\")")
+                             .arg(snowMatch.captured(0));
+        }
+        return true;
+    }
+    if (beachMatch.hasMatch() && bootFootwear)
+    {
+        if (outReason)
+        {
+            *outReason = QStringLiteral("boot footwear clashes with beach/poolside scene (\"%1\")")
+                             .arg(beachMatch.captured(0));
+        }
+        return true;
+    }
+    if (snowMatch.hasMatch() && (m >= 3 && m <= 9))
+    {
+        if (outReason)
+        {
+            *outReason = QStringLiteral("wintry/snowy scene (\"%1\") is out of season for %2")
+                             .arg(snowMatch.captured(0), currentSeasonLabel(d));
+        }
+        return true;
+    }
+    if (beachMatch.hasMatch() && (m == 11 || m == 12 || m == 1 || m == 2))
+    {
+        if (outReason)
+        {
+            *outReason = QStringLiteral("summer beach/poolside scene (\"%1\") is out of season for %2")
+                             .arg(beachMatch.captured(0), currentSeasonLabel(d));
+        }
+        return true;
+    }
+    return false;
+}
+
+bool InspirationAdaptationMethod::hasReferenceSeasonalClash(const QJsonObject &reference,
+                                                            const QJsonObject &product,
+                                                            const QDate &date,
+                                                            QString *outReason)
+{
+    QStringList sceneParts{
+        reference.value(QStringLiteral("title")).toString(),
+        reference.value(QStringLiteral("notes")).toString(),
+        reference.value(QStringLiteral("url")).toString()
+    };
+    QStringList prodParts{
+        product.value(QStringLiteral("title")).toString(),
+        product.value(QStringLiteral("category")).toString(),
+        product.value(QStringLiteral("color")).toString()
+    };
+    for (const QJsonValue &cv : product.value(QStringLiteral("categories")).toArray())
+    {
+        prodParts << cv.toString();
+    }
+    return hasTextSeasonalClash(
+        sceneParts.join(QLatin1Char(' ')),
+        prodParts.join(QLatin1Char(' ')),
+        date,
+        outReason);
 }

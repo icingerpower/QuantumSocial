@@ -75,10 +75,13 @@ public:
         bool carouselHookOverlay = false,
         const QString &videoFormatLabel = QStringLiteral("vertical (9:16)"),
         const QString &videoGeneratorId = {}) const;
+    bool hasConfiguredProductDirectory() const;
+    void importProducts();
 
 signals:
     void createProjectRequested(const QJsonObject &context, const QString &imagePath);
     void autoBatchRequested(const QJsonObject &batchSpec);
+    void newlyImportedProductsChecked(const QStringList &productIds);
 
 private:
     TableAccounts *m_accounts;
@@ -154,7 +157,7 @@ private:
     void showProduct();
     void showReference();
     void editProfile();
-    void importProducts();
+    void _showNewlyImportedProductsDialog(const QList<QJsonObject> &newProducts, int totalCatalogCount);
     void scrollAndSave();
     void addUrls();
     void addFiles();

@@ -30,7 +30,8 @@ PaneStatistics::PaneStatistics(TableVideos *videos, StatisticsScheduler *schedul
                                TableAccounts *accounts, TableProjects *projects,
                                QWidget *parent,
                                PreferredHashtags *hashtags,
-                               FavoriteHooks *favoriteHooks)
+                               FavoriteHooks *favoriteHooks,
+                               ResearchStore *researchStore)
     : QWidget(parent)
     , ui(new Ui::PaneStatistics)
     , m_videos(videos)
@@ -39,6 +40,7 @@ PaneStatistics::PaneStatistics(TableVideos *videos, StatisticsScheduler *schedul
     , m_projects(projects)
     , m_hashtags(hashtags)
     , m_favoriteHooks(favoriteHooks)
+    , m_researchStore(researchStore)
     , m_model(nullptr)
 {
     ui->setupUi(this);
@@ -102,7 +104,7 @@ TableVideoStatistics *PaneStatistics::statisticsModel() const
 QCoro::Task<void> PaneStatistics::_retrieveStatistics()
 {
     co_await SocialStatistics::retrieveFromAccounts(
-        m_accounts, m_videos, this, m_hashtags, m_favoriteHooks);
+        m_accounts, m_videos, this, m_hashtags, m_favoriteHooks, m_researchStore);
 }
 
 void PaneStatistics::_openSelectedPostInBrowser()

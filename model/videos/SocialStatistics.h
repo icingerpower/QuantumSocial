@@ -14,6 +14,7 @@ class FavoriteHooks;
 class PreferredHashtags;
 class QHeaderView;
 class QWidget;
+class ResearchStore;
 class TableAccounts;
 
 // Shared abstraction for social-media video statistics across PaneProperties
@@ -118,6 +119,9 @@ public:
         int publishedCount = 0;
         int successCount = 0;
         int lowPerformerCount = 0;
+        int distinctProductCount = 0;
+        int failedProductCount = 0;
+        QStringList failedProductIds;
         double medianScore = 0.0;
         double avgViews = 0.0;
         qint64 bestViews = 0;
@@ -127,7 +131,8 @@ public:
         double variantMedianScore = -1.0;
         QString bestStrategy; // "reference_swap", "reference_variant", or "reference_reimagine"
         bool isWinner = false;
-        bool isRetired = false; // >= 2 low-performing posts and lowPerformerCount > successCount
+        bool isAutoDiscardCandidate = false; // >= 4 low-performing posts across >= 2 distinct products
+        bool isRetired = false;              // Same threshold as isAutoDiscardCandidate
     };
 
     struct ReferenceExperimentSummary
@@ -145,14 +150,29 @@ public:
         QString plannerPromptAddendum() const;
     };
 
+    static constexpr qint64 kAutoStatsSyncIntervalSeconds = 12 * 3600;
+
     static ReferenceExperimentSummary summarizeReferenceExperiment(
         const TableVideos *videos);
+
+    static int applyAutoDiscardFromExperiment(
+        ResearchStore *researchStore,
+        const ReferenceExperimentSummary &summary);
+
+    static QString statsSyncStateFilePath();
+    static QDateTime lastStatisticsRetrievalUtc(const TableVideos *fallbackVideos = nullptr);
+    static void recordStatisticsRetrievalCompleted(int autoDiscardedCount = 0);
+    static bool isStatisticsRetrievalDue(
+        const TableAccounts *accounts,
+        qint64 maxAgeSeconds = kAutoStatsSyncIntervalSeconds,
+        const TableVideos *fallbackVideos = nullptr);
 
     static QCoro::Task<void> retrieveFromAccounts(TableAccounts *accounts,
                                                   TableVideos *videos,
                                                   QWidget *parentWidget = nullptr,
                                                   PreferredHashtags *hashtags = nullptr,
-                                                  FavoriteHooks *favoriteHooks = nullptr);
+                                                  FavoriteHooks *favoriteHooks = nullptr,
+                                                  ResearchStore *researchStore = nullptr);
 };
 
 #endif // SOCIALSTATISTICS_H

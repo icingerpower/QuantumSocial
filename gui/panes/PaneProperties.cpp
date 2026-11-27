@@ -40,13 +40,15 @@ PaneProperties::PaneProperties(TreeProperties *properties, TreeProperties *archi
 
 PaneProperties::PaneProperties(TreeProperties *properties, TreeProperties *archive,
                                TableVideos *videos, TableAccounts *accounts,
-                               QWidget *parent)
+                               QWidget *parent,
+                               ResearchStore *researchStore)
     : QWidget(parent)
     , ui(new Ui::PaneProperties)
     , m_properties(properties)
     , m_archive(archive)
     , m_videos(videos)
     , m_accounts(accounts)
+    , m_researchStore(researchStore)
 {
     ui->setupUi(this);
 
@@ -141,7 +143,8 @@ void PaneProperties::_setupTree(QTreeView *tree, TreeProperties *model)
 
 QCoro::Task<void> PaneProperties::_retrieveStatistics()
 {
-    co_await SocialStatistics::retrieveFromAccounts(m_accounts, m_videos, this);
+    co_await SocialStatistics::retrieveFromAccounts(
+        m_accounts, m_videos, this, nullptr, nullptr, m_researchStore);
 }
 
 void PaneProperties::_addProperty()

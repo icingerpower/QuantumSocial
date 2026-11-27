@@ -4,6 +4,7 @@
 
 #include "SocialStatistics.h"
 #include "model/research/InspirationAdaptationMethod.h"
+#include "model/research/ResearchStore.h"
 
 #include <QDateTime>
 #include <QDebug>
@@ -768,6 +769,8 @@ QJsonObject SocialStatistics::ReferenceExperimentSummary::toJson() const
             {QStringLiteral("publishedCount"), r.publishedCount},
             {QStringLiteral("successCount"), r.successCount},
             {QStringLiteral("lowPerformerCount"), r.lowPerformerCount},
+            {QStringLiteral("distinctProductCount"), r.distinctProductCount},
+            {QStringLiteral("failedProductCount"), r.failedProductCount},
             {QStringLiteral("medianScore"), r.medianScore},
             {QStringLiteral("avgViews"), r.avgViews},
             {QStringLiteral("bestViews"), r.bestViews},
@@ -777,6 +780,7 @@ QJsonObject SocialStatistics::ReferenceExperimentSummary::toJson() const
             {QStringLiteral("variantMedianScore"), r.variantMedianScore},
             {QStringLiteral("bestStrategy"), r.bestStrategy},
             {QStringLiteral("isWinner"), r.isWinner},
+            {QStringLiteral("isAutoDiscardCandidate"), r.isAutoDiscardCandidate},
             {QStringLiteral("isRetired"), r.isRetired}
         });
     }
@@ -813,7 +817,7 @@ QString SocialStatistics::ReferenceExperimentSummary::humanSummary() const
         if (r.isRetired) ++retiredCount;
     }
     const QString retiredNote = retiredCount > 0
-        ? QStringLiteral(" · %1 low-performing source(s) retired (≥2 flops)").arg(retiredCount)
+        ? QStringLiteral(" · %1 source(s) auto-discarded (≥4 flops across ≥2 products)").arg(retiredCount)
         : QString{};
     return QStringLiteral("Reference & Variant A/B (%1 measured): %2 · %3 winning source reference(s)%4%5.")
         .arg(totalMeasuredPosts)
@@ -900,10 +904,17 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
         double engPctSum = 0.0;
         qint64 bestViews = 0;
     };
+    struct RefPostEntry
+    {
+        double score = 0.0;
+        QString productKey;
+    };
     struct RefAccum
     {
         QString referenceUrl;
         QList<double> allScores;
+        QList<RefPostEntry> postEntries;
+        QSet<QString> allProducts;
         QHash<QString, QList<double>> scoresByMethod;
         double viewsSum = 0.0;
         qint64 bestViews = 0;
@@ -965,14 +976,50 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
         {
             continue;
         }
-        QFile dnaFile{QDir{gPath}.filePath(QStringLiteral("creative_dna.json"))};
-        if (!dnaFile.open(QIODevice::ReadOnly))
+        const QDir gDir{gPath};
+        QJsonObject dna;
+        {
+            QFile dnaFile{gDir.filePath(QStringLiteral("creative_dna.json"))};
+            if (dnaFile.open(QIODevice::ReadOnly))
+            {
+                dna = QJsonDocument::fromJson(dnaFile.readAll()).object();
+            }
+        }
+        QJsonObject resCtx;
+        if (dna.isEmpty() || dna.value(QStringLiteral("referenceId")).toString().trimmed().isEmpty()
+            || dna.value(QStringLiteral("productId")).toString().trimmed().isEmpty())
+        {
+            QFile ctxFile{gDir.filePath(QStringLiteral("research_context.json"))};
+            if (ctxFile.open(QIODevice::ReadOnly))
+            {
+                resCtx = QJsonDocument::fromJson(ctxFile.readAll()).object();
+            }
+        }
+        if (dna.isEmpty() && resCtx.isEmpty())
         {
             continue;
         }
-        const QJsonObject dna = QJsonDocument::fromJson(dnaFile.readAll()).object();
-        const QString refId = dna.value(QStringLiteral("referenceId")).toString().trimmed();
-        const QString refUrl = dna.value(QStringLiteral("referenceUrl")).toString().trimmed();
+
+        QString refId = dna.value(QStringLiteral("referenceId")).toString().trimmed();
+        if (refId.isEmpty())
+        {
+            refId = resCtx.value(QStringLiteral("reference")).toObject().value(QStringLiteral("id")).toString().trimmed();
+        }
+        QString refUrl = dna.value(QStringLiteral("referenceUrl")).toString().trimmed();
+        if (refUrl.isEmpty())
+        {
+            refUrl = resCtx.value(QStringLiteral("reference")).toObject().value(QStringLiteral("url")).toString().trimmed();
+        }
+        QString productId = dna.value(QStringLiteral("productId")).toString().trimmed();
+        if (productId.isEmpty())
+        {
+            productId = resCtx.value(QStringLiteral("product")).toObject().value(QStringLiteral("id")).toString().trimmed();
+        }
+        if (productId.isEmpty() && !rec->projectId.isNull())
+        {
+            productId = QStringLiteral("proj:") + rec->projectId.toString(QUuid::WithoutBraces);
+        }
+
         QString strategy = dna.value(QStringLiteral("strategy")).toString().trimmed();
         if (strategy.isEmpty())
         {
@@ -1000,6 +1047,11 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
                 ra.referenceUrl = refUrl;
             }
             ra.allScores.append(bestNormScore);
+            ra.postEntries.append(RefPostEntry{bestNormScore, productId});
+            if (!productId.isEmpty())
+            {
+                ra.allProducts.insert(productId);
+            }
             ra.scoresByMethod[strategy].append(bestNormScore);
             ra.viewsSum += double(bestViews);
             ra.bestViews = qMax(ra.bestViews, bestViews);
@@ -1064,17 +1116,26 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
         rp.referenceId = it.key();
         rp.referenceUrl = ra.referenceUrl;
         rp.publishedCount = ra.allScores.size();
-        for (double sc : ra.allScores)
+        rp.distinctProductCount = ra.allProducts.size();
+        QSet<QString> failedProds;
+        for (const auto &pe : ra.postEntries)
         {
-            if (sc > 0.0 && sc >= summary.benchmarkScore)
+            if (pe.score > 0.0 && pe.score >= summary.benchmarkScore)
             {
                 ++rp.successCount;
             }
             else
             {
                 ++rp.lowPerformerCount;
+                if (!pe.productKey.isEmpty())
+                {
+                    failedProds.insert(pe.productKey);
+                }
             }
         }
+        rp.failedProductCount = failedProds.size();
+        rp.failedProductIds = failedProds.values();
+        rp.failedProductIds.sort();
         rp.medianScore = medianOfDoubles(ra.allScores);
         rp.avgViews = ra.viewsSum / double(rp.publishedCount);
         rp.bestViews = ra.bestViews;
@@ -1103,7 +1164,11 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
         }
         rp.variantCount = nonSwapScores.size();
         rp.variantMedianScore = nonSwapScores.isEmpty() ? -1.0 : medianOfDoubles(nonSwapScores);
-        rp.isRetired = (rp.lowPerformerCount >= 2 && rp.lowPerformerCount > rp.successCount);
+        rp.isAutoDiscardCandidate = (rp.lowPerformerCount >= 4
+                                     && rp.distinctProductCount >= 2
+                                     && rp.failedProductCount >= 2
+                                     && rp.lowPerformerCount > rp.successCount);
+        rp.isRetired = rp.isAutoDiscardCandidate;
         rp.isWinner = (!rp.isRetired && rp.successCount >= 1
                        && rp.medianScore > 0.0 && rp.medianScore >= summary.benchmarkScore);
         summary.references.append(rp);
@@ -1120,11 +1185,163 @@ SocialStatistics::ReferenceExperimentSummary SocialStatistics::summarizeReferenc
     return summary;
 }
 
+int SocialStatistics::applyAutoDiscardFromExperiment(
+    ResearchStore *researchStore,
+    const ReferenceExperimentSummary &summary)
+{
+    if (!researchStore || summary.references.isEmpty())
+    {
+        return 0;
+    }
+    QHash<QString, QString> reasonsByRefId;
+    for (const auto &rp : summary.references)
+    {
+        if (!rp.isAutoDiscardCandidate || rp.referenceId.isEmpty())
+        {
+            continue;
+        }
+        reasonsByRefId.insert(
+            rp.referenceId,
+            QObject::tr("Auto-discarded on statistics sync: %1 low-performing post(s) across %2 distinct product(s) "
+                        "(avg %3 views, %4 win(s) out of %5 post(s)).")
+                .arg(rp.lowPerformerCount)
+                .arg(rp.distinctProductCount)
+                .arg(qRound64(rp.avgViews))
+                .arg(rp.successCount)
+                .arg(rp.publishedCount));
+    }
+    if (reasonsByRefId.isEmpty())
+    {
+        return 0;
+    }
+    return researchStore->autoDiscardReferences(reasonsByRefId);
+}
+
+QString SocialStatistics::statsSyncStateFilePath()
+{
+    return WorkingDirectoryManager::instance()->workingDir().filePath(
+        QStringLiteral("social_stats_sync_state.json"));
+}
+
+QDateTime SocialStatistics::lastStatisticsRetrievalUtc(const TableVideos *fallbackVideos)
+{
+    const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+    {
+        QFile sf{wd.filePath(QStringLiteral("social_stats_sync_state.json"))};
+        if (sf.open(QIODevice::ReadOnly))
+        {
+            const QJsonObject obj = QJsonDocument::fromJson(sf.readAll()).object();
+            const QDateTime dt = QDateTime::fromString(
+                obj.value(QStringLiteral("lastRetrievedAt")).toString(), Qt::ISODate).toUTC();
+            if (dt.isValid())
+            {
+                return dt;
+            }
+        }
+    }
+    {
+        QFile tf{wd.filePath(QStringLiteral("account_top_posts.json"))};
+        if (tf.open(QIODevice::ReadOnly))
+        {
+            const QJsonObject obj = QJsonDocument::fromJson(tf.readAll()).object();
+            const QDateTime dt = QDateTime::fromString(
+                obj.value(QStringLiteral("updatedAt")).toString(), Qt::ISODate).toUTC();
+            if (dt.isValid())
+            {
+                return dt;
+            }
+        }
+    }
+    if (fallbackVideos)
+    {
+        QDateTime latestSnapUtc;
+        for (int r = 0; r < fallbackVideos->rowCount(); ++r)
+        {
+            const auto *rec = fallbackVideos->recordAt(r);
+            if (!rec)
+            {
+                continue;
+            }
+            for (const auto &pub : rec->publications)
+            {
+                for (const auto &snap : pub.snapshots)
+                {
+                    if (snap.fetchDate.isValid())
+                    {
+                        const QDateTime fUtc = snap.fetchDate.toUTC();
+                        if (!latestSnapUtc.isValid() || fUtc > latestSnapUtc)
+                        {
+                            latestSnapUtc = fUtc;
+                        }
+                    }
+                }
+            }
+        }
+        if (latestSnapUtc.isValid())
+        {
+            return latestSnapUtc;
+        }
+    }
+    return QDateTime{};
+}
+
+void SocialStatistics::recordStatisticsRetrievalCompleted(int autoDiscardedCount)
+{
+    const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+    if (!wd.exists())
+    {
+        return;
+    }
+    QSaveFile sf{statsSyncStateFilePath()};
+    if (sf.open(QIODevice::WriteOnly))
+    {
+        sf.write(QJsonDocument{QJsonObject{
+            {QStringLiteral("schemaVersion"), 1},
+            {QStringLiteral("lastRetrievedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+            {QStringLiteral("autoDiscardedReferences"), autoDiscardedCount}
+        }}.toJson(QJsonDocument::Indented));
+        sf.commit();
+    }
+}
+
+bool SocialStatistics::isStatisticsRetrievalDue(const TableAccounts *accounts,
+                                                qint64 maxAgeSeconds,
+                                                const TableVideos *fallbackVideos)
+{
+    if (!accounts || accounts->rowCount() == 0)
+    {
+        return false;
+    }
+    bool hasSupportedAccount = false;
+    for (int r = 0; r < accounts->rowCount(); ++r)
+    {
+        const QString typeStr = accounts->data(accounts->index(r, TableAccounts::IND_TYPE)).toString().trimmed();
+        const QString urlStr = accounts->data(accounts->index(r, TableAccounts::IND_URL)).toString().trimmed();
+        AbstractSocialAccount *acc = resolveSocialAccount(typeStr);
+        if (acc && acc->supportsAccountVideoStatistics() && !urlStr.isEmpty())
+        {
+            hasSupportedAccount = true;
+            break;
+        }
+    }
+    if (!hasSupportedAccount)
+    {
+        return false;
+    }
+    const QDateTime lastUtc = lastStatisticsRetrievalUtc(fallbackVideos);
+    if (!lastUtc.isValid())
+    {
+        return true;
+    }
+    return lastUtc.secsTo(QDateTime::currentDateTimeUtc()) >= qMax<qint64>(60, maxAgeSeconds);
+}
+
 QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts,
                                                          TableVideos *videos,
                                                          QWidget *parentWidget,
                                                          PreferredHashtags *hashtags,
-                                                         FavoriteHooks *favoriteHooks)
+                                                         FavoriteHooks *favoriteHooks,
+                                                         ResearchStore *researchStore)
 {
     appendRetrieveStatsLog(QStringLiteral("=== Retrieve statistics started ==="));
     struct AccountRowInfo
@@ -1210,6 +1427,8 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
     }
     int harvestedHashtags = 0;
     int harvestedHooks = 0;
+    int supportedQueriedCount = 0;
+    int supportedSucceededCount = 0;
 
     for (const AccountRowInfo &entry : accountRows)
     {
@@ -1232,11 +1451,13 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
             continue;
         }
 
+        ++supportedQueriedCount;
         appendRetrieveStatsLog(QStringLiteral("Fetching account video statistics for %1 (%2)...")
                                    .arg(account->getName(), entry.url));
         const auto accountResult = co_await account->fetchAccountVideoStatistics(entry.url, knownShortCodes);
         if (accountResult.notSupported)
         {
+            --supportedQueriedCount;
             const QString msg = QObject::tr("%1 (%2): %3")
                 .arg(account->getName(), entry.url,
                      accountResult.errorMessage.isEmpty()
@@ -1245,6 +1466,10 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
             appendRetrieveStatsLog(QStringLiteral("UNSUPPORTED: ") + msg);
             unsupportedMessages << msg;
             continue;
+        }
+        if (accountResult.errorMessage.isEmpty())
+        {
+            ++supportedSucceededCount;
         }
         appendRetrieveStatsLog(
             QStringLiteral("Result for %1: followers=%2, views=%3, likes=%4, posts=%5, error=\"%6\"")
@@ -1515,6 +1740,33 @@ QCoro::Task<void> SocialStatistics::retrieveFromAccounts(TableAccounts *accounts
     appendRetrieveStatsLog(videoTextExp.humanSummary());
     const ReferenceExperimentSummary refExp = summarizeReferenceExperiment(videos);
     appendRetrieveStatsLog(refExp.humanSummary());
+
+    int autoDiscardedCount = 0;
+    if (researchStore)
+    {
+        researchStore->reloadIfChangedOnDisk();
+        autoDiscardedCount = applyAutoDiscardFromExperiment(researchStore, refExp);
+    }
+    else
+    {
+        const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+        if (QFileInfo::exists(wd.filePath(QStringLiteral("research/research.json"))))
+        {
+            ResearchStore diskStore(wd.absolutePath());
+            autoDiscardedCount = applyAutoDiscardFromExperiment(&diskStore, refExp);
+        }
+    }
+    if (autoDiscardedCount > 0)
+    {
+        appendRetrieveStatsLog(
+            QStringLiteral("Auto-discarded %1 underperforming source reference(s) (>=4 low-performing posts across >=2 products).")
+                .arg(autoDiscardedCount));
+    }
+
+    if (supportedQueriedCount > 0 && supportedSucceededCount > 0)
+    {
+        recordStatisticsRetrievalCompleted(autoDiscardedCount);
+    }
 
     if (!discoveredTopPostsByUrl.isEmpty()
         || videoTextExp.withTextCount > 0

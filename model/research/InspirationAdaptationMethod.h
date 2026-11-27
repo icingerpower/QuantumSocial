@@ -1,6 +1,8 @@
 #ifndef INSPIRATIONADAPTATIONMETHOD_H
 #define INSPIRATIONADAPTATIONMETHOD_H
 
+#include <QDate>
+#include <QJsonObject>
 #include <QList>
 #include <QMap>
 #include <QString>
@@ -28,6 +30,7 @@ public:
         QString videoFormatLabel;   // e.g. "vertical (9:16)"
         QString outputImageFile;    // e.g. "generation_source.png"
         QString propertyFragments;  // Joined A/B property prompt fragments (when usesSceneProperties() is true)
+        QString seasonalGuidance;   // Current season + product-weather guardrail rule
         QString refinementFixNote;  // Optional round-2 AI vision quality-gate instruction
     };
 
@@ -71,6 +74,20 @@ public:
         const QString &referenceBestMethodId,
         const QString &globalWinningMethodId,
         bool isVideoFormat = true);
+
+    // Seasonal & product-weather coherence helpers
+    static QDate effectiveCurrentDate();
+    static QString currentSeasonLabel(const QDate &date = effectiveCurrentDate());
+    static QString seasonalGuardrailInstruction(const QString &productSummary,
+                                                const QDate &date = effectiveCurrentDate());
+    static bool hasTextSeasonalClash(const QString &sceneText,
+                                     const QString &productText,
+                                     const QDate &date = effectiveCurrentDate(),
+                                     QString *outReason = nullptr);
+    static bool hasReferenceSeasonalClash(const QJsonObject &reference,
+                                          const QJsonObject &product,
+                                          const QDate &date = effectiveCurrentDate(),
+                                          QString *outReason = nullptr);
 
     class Recorder
     {
