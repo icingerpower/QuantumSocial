@@ -134,14 +134,16 @@ AbstractVideoGenerator::deleteConversations(
 QCoro::Task<void> AbstractVideoGenerator::runDeleteConversationInWorker(
     const QString &conversationUrl, const QVariantMap &settings) const
 {
-    if (conversationUrl.trimmed().isEmpty() || !isWorkerRunning())
+    const QString trimmedUrl = conversationUrl.trimmed();
+    const QVariantMap settingsCopy = settings;
+    if (trimmedUrl.isEmpty() || !isWorkerRunning())
     {
         co_return;
     }
     QJsonObject request;
     request.insert(QStringLiteral("deleteConversation"), true);
-    request.insert(QStringLiteral("conversationUrl"), conversationUrl.trimmed());
-    request.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(settings));
+    request.insert(QStringLiteral("conversationUrl"), trimmedUrl);
+    request.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(settingsCopy));
     m_worker->write(QJsonDocument{request}.toJson(QJsonDocument::Compact) + "\n");
 
     QElapsedTimer timer;
@@ -177,6 +179,8 @@ AbstractVideoGenerator::runDeleteConversationsInWorker(
     const QStringList &conversationUrls,
     const QVariantMap &settings) const
 {
+    const QString scriptNameCopy = scriptFileName;
+    const QVariantMap settingsCopy = settings;
     DeleteConversationsResult result;
     QStringList cleanedUrls;
     for (const QString &raw : conversationUrls)
@@ -201,7 +205,7 @@ AbstractVideoGenerator::runDeleteConversationsInWorker(
     }
 
     const QString scriptPath = QDir(QString::fromUtf8(VIDEO_GEN_SCRIPT_DIR))
-        .filePath(scriptFileName);
+        .filePath(scriptNameCopy);
     if (!QFileInfo::exists(scriptPath))
     {
         result.failedUrls = cleanedUrls;
@@ -230,7 +234,7 @@ AbstractVideoGenerator::runDeleteConversationsInWorker(
     QJsonObject request;
     request.insert(QStringLiteral("deleteConversations"), true);
     request.insert(QStringLiteral("conversationUrls"), QJsonArray::fromStringList(cleanedUrls));
-    request.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(settings));
+    request.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(settingsCopy));
     m_worker->write(QJsonDocument{request}.toJson(QJsonDocument::Compact) + "\n");
 
     const qint64 perChatBudgetMs = static_cast<qint64>(cleanedUrls.size()) * 25000 + 30000;
@@ -298,7 +302,7 @@ AbstractVideoGenerator::runDeleteConversationsInWorker(
     }
     result.errorMessage = obj.value(QStringLiteral("error")).toString().trimmed();
 
-    if (!wasRunning && settings.value(QStringLiteral("closeBrowserOnFinish"), true).toBool())
+    if (!wasRunning && settingsCopy.value(QStringLiteral("closeBrowserOnFinish"), true).toBool())
     {
         _stopWorkerInternal();
     }

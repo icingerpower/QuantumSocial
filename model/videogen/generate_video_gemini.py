@@ -625,79 +625,124 @@ def _click_delete_in_open_menu_and_confirm(page, chat_id):
 
     page.wait_for_timeout(350)
 
-    # Confirm in the modal dialog ("Supprimer la discussion ?" / "Delete chat?")
-    confirmed = False
-    confirm_deadline = time.monotonic() + 3.5
-    while time.monotonic() < confirm_deadline and not confirmed:
+    # Confirm in the modal dialog ("Supprimer la discussion ?" / "Delete chat?").
+    # On real gemini.google.com, listen for Gemini's async batchexecute RPC so we
+    # do NOT close the tab or navigate away before Google's backend finishes
+    # deleting the chat (Gemini updates location.href to /app optimistically on
+    # click, while the HTTP DeleteConversation RPC is still in flight!).
+    cur_before_confirm = page.url if isinstance(getattr(page, "url", None), str) else ""
+    track_rpc = ("gemini.google.com" in cur_before_confirm
+                 and callable(getattr(page, "on", None))
+                 and callable(getattr(page, "remove_listener", None)))
+    rpc_state = {"done": False}
+
+    def _on_delete_response(response):
         try:
-            direct_confirm = page.locator(
-                'button[data-test-id="confirm-button"], '
-                'mat-dialog-container button[data-test-id="confirm-button"], '
-                '.mat-mdc-dialog-container button[data-test-id="confirm-button"]'
-            )
-            if direct_confirm.count() > 0 and direct_confirm.last.is_visible():
-                direct_confirm.last.click(timeout=1500)
-                confirmed = True
-                break
+            resp_url = getattr(response, "url", "") or ""
+            if "batchexecute" in resp_url or "DeleteConversation" in resp_url:
+                rpc_state["done"] = True
         except Exception:
             pass
 
-        dialog_btns = page.locator(
-            "mat-dialog-actions button, .mat-mdc-dialog-actions button, "
-            "message-dialog button, mat-dialog-container button, "
-            ".mat-mdc-dialog-container button, [role='dialog'] button"
-        )
+    if track_rpc:
         try:
-            btn_count = dialog_btns.count()
-            for idx in range(btn_count):
-                btn = dialog_btns.nth(idx)
-                if not btn.is_visible():
-                    continue
-                label = (
-                    (btn.get_attribute("aria-label") or "")
-                    + " "
-                    + (btn.inner_text() or "")
-                ).strip()
-                if DELETE_ACTION_RE.search(label) and not CANCEL_ACTION_RE.search(label):
-                    btn.click(timeout=1500)
+            page.on("response", _on_delete_response)
+        except Exception:
+            track_rpc = False
+
+    try:
+        confirmed = False
+        confirm_deadline = time.monotonic() + 3.5
+        while time.monotonic() < confirm_deadline and not confirmed:
+            try:
+                direct_confirm = page.locator(
+                    'button[data-test-id="confirm-button"], '
+                    'mat-dialog-container button[data-test-id="confirm-button"], '
+                    '.mat-mdc-dialog-container button[data-test-id="confirm-button"]'
+                )
+                if direct_confirm.count() > 0 and direct_confirm.last.is_visible():
+                    direct_confirm.last.click(timeout=1500)
                     confirmed = True
                     break
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+            dialog_btns = page.locator(
+                "mat-dialog-actions button, .mat-mdc-dialog-actions button, "
+                "message-dialog button, mat-dialog-container button, "
+                ".mat-mdc-dialog-container button, [role='dialog'] button"
+            )
+            try:
+                btn_count = dialog_btns.count()
+                for idx in range(btn_count):
+                    btn = dialog_btns.nth(idx)
+                    if not btn.is_visible():
+                        continue
+                    label = (
+                        (btn.get_attribute("aria-label") or "")
+                        + " "
+                        + (btn.inner_text() or "")
+                    ).strip()
+                    if DELETE_ACTION_RE.search(label) and not CANCEL_ACTION_RE.search(label):
+                        btn.click(timeout=1500)
+                        confirmed = True
+                        break
+            except Exception:
+                pass
+
+            if not confirmed:
+                page.wait_for_timeout(150)
 
         if not confirmed:
+            _log(f"delete_chat: clicked Delete menu item for {chat_id}, but confirmation button was not found")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+
+        # Verify deletion actually took effect (URL redirected away from chat_id or sidebar row removed)
+        deleted_confirmed = False
+        gone_deadline = time.monotonic() + 4.5
+        while time.monotonic() < gone_deadline:
+            try:
+                cur_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+                link_count = page.locator(f'a[href*="{chat_id}"], [href*="{chat_id}"]').count()
+                if chat_id not in cur_url:
+                    deleted_confirmed = True
+                    break
+                if had_sidebar_link_before and link_count == 0:
+                    deleted_confirmed = True
+                    break
+            except Exception:
+                break
             page.wait_for_timeout(150)
 
-    if not confirmed:
-        _log(f"delete_chat: clicked Delete menu item for {chat_id}, but confirmation button was not found")
-        try:
-            page.keyboard.press("Escape")
-        except Exception:
-            pass
+        if deleted_confirmed:
+            if track_rpc:
+                # Give Gemini's async batchexecute DeleteConversation RPC time to
+                # reach Google's backend and complete before any page.goto / page.close.
+                rpc_deadline = time.monotonic() + 3.0
+                while time.monotonic() < rpc_deadline and not rpc_state["done"]:
+                    try:
+                        page.wait_for_timeout(150)
+                    except Exception:
+                        break
+                try:
+                    page.wait_for_timeout(450 if rpc_state["done"] else 1000)
+                except Exception:
+                    pass
+            _log(f"delete_chat: deleted Gemini conversation {chat_id}"
+                 + (" (rpc ok)" if (track_rpc and rpc_state["done"]) else ""))
+            return True
+        _log(f"delete_chat: confirmed dialog for {chat_id}, but URL/sidebar still showed {chat_id}")
         return False
-
-    # Verify deletion actually took effect (URL redirected away from chat_id or sidebar row removed)
-    deleted_confirmed = False
-    gone_deadline = time.monotonic() + 4.5
-    while time.monotonic() < gone_deadline:
-        try:
-            cur_url = page.url if isinstance(getattr(page, "url", None), str) else ""
-            link_count = page.locator(f'a[href*="{chat_id}"], [href*="{chat_id}"]').count()
-            if chat_id not in cur_url:
-                deleted_confirmed = True
-                break
-            if had_sidebar_link_before and link_count == 0:
-                deleted_confirmed = True
-                break
-        except Exception:
-            break
-        page.wait_for_timeout(150)
-
-    if deleted_confirmed:
-        _log(f"delete_chat: deleted Gemini conversation {chat_id}")
-        return True
-    _log(f"delete_chat: confirmed dialog for {chat_id}, but URL/sidebar still showed {chat_id}")
-    return False
+    finally:
+        if track_rpc:
+            try:
+                page.remove_listener("response", _on_delete_response)
+            except Exception:
+                pass
 
 
 def _try_sidebar_delete_for_chat(page, chat_id):
@@ -878,10 +923,12 @@ def _delete_current_chat(page, target_url=None):
         return False
 
     try:
+        navigated_to_target = False
         if chat_id not in page_url and isinstance(target_url, str) and chat_id in target_url:
             _log(f"delete_chat: navigating to {target_url} to delete chat {chat_id}")
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             nav_state = _wait_ready_or_login(page, timeout_s=10)
+            navigated_to_target = True
             page_url = page.url if isinstance(getattr(page, "url", None), str) else ""
             if chat_id not in page_url:
                 if nav_state == "ready" and "gemini.google.com" in page_url and not _login_in_progress(page):
@@ -931,6 +978,27 @@ def _delete_current_chat(page, target_url=None):
         if _try_sidebar_delete_for_chat(page, chat_id):
             _remove_cached_chat(chat_id)
             return True
+
+        # Gemini's SPA keeps nonexistent/already-deleted /app/<chat_id> URLs in
+        # the address bar while rendering an empty home page ("Par quoi voulez-vous
+        # commencer ?") with zero messages and no sidebar entry. When we explicitly
+        # navigated to target_url and see an empty ready home page, treat it as gone.
+        if navigated_to_target and "gemini.google.com" in page_url and not _login_in_progress(page):
+            try:
+                page.wait_for_timeout(1200)
+                has_messages = (
+                    page.locator("user-query").count() > 0
+                    or page.locator("model-response").count() > 0
+                )
+                has_sidebar_link = page.locator(
+                    f'a[href*="{chat_id}"], [href*="{chat_id}"], [jslog*="{chat_id}"]'
+                ).count() > 0
+                if not has_messages and not has_sidebar_link and _gemini_ready(page):
+                    _log(f"delete_chat: chat {chat_id} rendered empty home page with no messages/sidebar entry (already gone)")
+                    _remove_cached_chat(chat_id)
+                    return True
+            except Exception:
+                pass
 
         _log(f"delete_chat: could not confirm deletion for chat {chat_id} (url={page_url})")
         _dump_state(page, "delete_chat_failed")
@@ -1985,7 +2053,8 @@ def _launch_context(playwright, use_system_profile):
             _log(f"launch failed: {note}: {exc}")
             errors.append(f"{note}: {exc}")
             if user_dir == SYSTEM_CHROME_PROFILE \
-                    and "existing browser session" in str(exc):
+                    and ("existing browser session" in str(exc)
+                         or "session de navigateur existante" in str(exc)):
                 # Your everyday Chrome owns that profile and will for as
                 # long as it runs — retrying it on every relaunch only
                 # wastes a launch AND hands a command line to your real
@@ -2283,7 +2352,15 @@ def _generate_once_impl(context, page, prompt, image_paths, output_dir, settings
                 _log(f"in-page retry {attempt}/{in_page_retries} after "
                      f"{'capacity cooldown' if last_capacity_note else 'rejection'} — fresh chat, {note}")
                 try:
-                    page.goto(_base_gemini_url(page), wait_until="domcontentloaded", timeout=60000)
+                    cur_url = page.url if isinstance(getattr(page, "url", None), str) else ""
+                    base_url = _base_gemini_url(page)
+                    already_fresh = (
+                        not _extract_chat_id(cur_url)
+                        and cur_url.startswith(base_url)
+                        and _gemini_ready(page)
+                    )
+                    if not already_fresh:
+                        page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
                     ready = _wait_ready_or_login(page) == "ready"
                 except Exception as exc:  # noqa: BLE001 - recovered below
                     if not _is_target_closed_error(exc):
@@ -2470,6 +2547,7 @@ def _worker_main():
     _log("worker: started, waiting for requests on stdin")
     context = None
     page = None
+    last_request_was_cleanup = False
     try:
         playwright = sync_playwright().start()
     except Exception as exc:  # noqa: BLE001 - nothing can run without it
@@ -2488,6 +2566,7 @@ def _worker_main():
                           "error": f"malformed request: {exc}"})
                 continue
             if request.get("deleteConversation"):
+                last_request_was_cleanup = True
                 target_conv_url = request.get("conversationUrl") or ""
                 req_settings = request.get("settings") or {}
                 deleted = False
@@ -2501,6 +2580,7 @@ def _worker_main():
                 _respond({"video": None, "error": None, "rejected": False, "deleted": deleted})
                 continue
             if request.get("deleteConversations"):
+                last_request_was_cleanup = True
                 raw_urls = request.get("conversationUrls") or []
                 urls = [str(u).strip() for u in raw_urls if isinstance(u, str) and str(u).strip()]
                 req_settings = request.get("settings") or {}
@@ -2568,6 +2648,7 @@ def _worker_main():
                 _respond({"video": None, "error": err_msg, "rejected": False,
                           "deleted": deleted_urls, "failed": failed_urls})
                 continue
+            last_request_was_cleanup = False
             try:
                 prompt, output_dir, images, settings = _read_request(request)
             except ValueError as exc:
@@ -2669,7 +2750,7 @@ def _worker_main():
     finally:
         _log("worker: stdin closed, shutting the browser down")
         try:
-            if page is not None and not page.is_closed():
+            if not last_request_was_cleanup and page is not None and not page.is_closed():
                 page_url = page.url if isinstance(getattr(page, "url", None), str) else ""
                 if _extract_chat_id(page_url):
                     _delete_current_chat(page, page_url)

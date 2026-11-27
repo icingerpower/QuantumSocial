@@ -34,10 +34,18 @@ class GeminiSubmissionTests(unittest.TestCase):
         self.page = self.browser.new_page()
         self.log_patch = patch.object(worker, "_log")
         self.log_patch.start()
+        self._cache_tmpdir = tempfile.TemporaryDirectory()
+        self._cache_env_patch = patch.dict(
+            os.environ,
+            {worker.CHAT_CACHE_ENV: os.path.join(self._cache_tmpdir.name, "gemini_chat_cache.json")},
+        )
+        self._cache_env_patch.start()
 
     def tearDown(self):
         self.page.close()
         self.log_patch.stop()
+        self._cache_env_patch.stop()
+        self._cache_tmpdir.cleanup()
 
     def submission_state(self, images=()):
         return {"promptSubmitted": True, "conversationUrl": self.page.url,
@@ -1232,6 +1240,26 @@ class GeminiSubmissionTests(unittest.TestCase):
                 self.assertIsNone(resp["error"])
                 remaining = worker._load_chat_cache()
                 self.assertEqual([e["url"] for e in remaining], [u2])
+
+    def test_delete_current_chat_treats_empty_home_page_for_nonexistent_url_as_already_gone(self):
+        url = "https://gemini.google.com/app/nonexistent_deleted_chat_999"
+        worker._record_cached_chat(url, status="active")
+        self.page.set_content("""
+            <main>
+                <h1>Par quoi voulez-vous commencer ?</h1>
+                <textarea aria-label="Demander à Gemini"></textarea>
+            </main>
+        """)
+        url_state = {"val": "https://gemini.google.com/app"}
+
+        def fake_goto(target, **_kwargs):
+            url_state["val"] = target
+
+        with patch.object(type(self.page), "url", new_callable=lambda: property(lambda _: url_state["val"])), \
+                patch.object(self.page, "goto", side_effect=fake_goto), \
+                patch.object(worker, "_wait_ready_or_login", return_value="ready"):
+            self.assertTrue(worker._delete_current_chat(self.page, url))
+        self.assertEqual(worker._load_chat_cache(), [])
 
 
 if __name__ == "__main__":
