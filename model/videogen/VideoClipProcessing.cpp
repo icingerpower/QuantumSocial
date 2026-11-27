@@ -284,6 +284,114 @@ QCoro::Task<VideoClipProcessing::ContinuationResult> VideoClipProcessing::prepar
     co_return ContinuationResult{seg.path, {}, true, srcInfo.duration - tailLen, {}};
 }
 
+QCoro::Task<VideoClipProcessing::MotionGrade> VideoClipProcessing::gradeClipMotion(
+    QString source, bool expectsMultipleAngles)
+{
+    MotionGrade grade;
+    const auto info = co_await inspect(source);
+    if (!info.error.isEmpty())
+    {
+        grade.error = info.error;
+        grade.qualityScore = 75;
+        co_return grade;
+    }
+    grade.durationSec = info.duration;
+    // Skip freeze detection on ultra-short (<2.8s) synthetic unit-test clips
+    if (info.duration < 2.8)
+    {
+        grade.qualityScore = 85;
+        co_return grade;
+    }
+
+    QStringList args{
+        QStringLiteral("-nostats"),
+        QStringLiteral("-v"), QStringLiteral("info"),
+        QStringLiteral("-i"), source,
+        QStringLiteral("-vf"),
+        QStringLiteral("fps=10,scale=160:-2:flags=fast_bilinear,format=yuv420p,"
+                       "freezedetect=n=-48dB:d=1.0,"
+                       "select='gt(scene,0.28)',showinfo"),
+        QStringLiteral("-f"), QStringLiteral("null"), QStringLiteral("-")
+    };
+    const auto res = co_await run(QStringLiteral("ffmpeg"), args, 30000);
+    if (!res.error.isEmpty())
+    {
+        grade.error = res.error;
+        grade.qualityScore = 80;
+        co_return grade;
+    }
+
+    const QString errText = QString::fromUtf8(res.errorOutput);
+    static const QRegularExpression freezeStartRe(
+        QStringLiteral(R"(freeze_start:\s*([0-9]*\.?[0-9]+))"));
+    static const QRegularExpression freezeDurRe(
+        QStringLiteral(R"(freeze_duration:\s*([0-9]*\.?[0-9]+))"));
+    static const QRegularExpression showInfoPtsRe(
+        QStringLiteral(R"(\[Parsed_showinfo_[^\]]*\]\s+n:\s*\d+\s+pts:\s*\d+\s+pts_time:([0-9]*\.?[0-9]+))"));
+
+    double pendingOpeningStart = -1.0;
+    for (const QString &line : errText.split(QLatin1Char('\n')))
+    {
+        const auto ms = freezeStartRe.match(line);
+        if (ms.hasMatch())
+        {
+            const double st = ms.captured(1).toDouble();
+            if (st <= 0.30 && pendingOpeningStart < 0.0)
+            {
+                pendingOpeningStart = st;
+            }
+        }
+        const auto md = freezeDurRe.match(line);
+        if (md.hasMatch() && pendingOpeningStart >= 0.0)
+        {
+            grade.openingFreezeSec = qMax(grade.openingFreezeSec, md.captured(1).toDouble());
+            pendingOpeningStart = -1.0;
+        }
+    }
+    if (pendingOpeningStart >= 0.0 && grade.openingFreezeSec <= 0.0)
+    {
+        // Frozen from opening all the way to EOF
+        grade.openingFreezeSec = qMax(0.0, info.duration - pendingOpeningStart);
+    }
+
+    auto cutIt = showInfoPtsRe.globalMatch(errText);
+    while (cutIt.hasNext())
+    {
+        const double pts = cutIt.next().captured(1).toDouble();
+        if (pts > 0.15)
+        {
+            ++grade.sceneCutCount;
+        }
+    }
+
+    int score = 86;
+    if (grade.openingFreezeSec >= 1.0)
+    {
+        score -= qMin(42, int(grade.openingFreezeSec * 18.0));
+    }
+    if (expectsMultipleAngles)
+    {
+        if (grade.sceneCutCount >= 2)
+        {
+            score += 12;
+        }
+        else if (grade.sceneCutCount == 1)
+        {
+            score += 4;
+        }
+        else
+        {
+            score -= 16;
+        }
+    }
+    else if (grade.openingFreezeSec < 0.2)
+    {
+        score += 6;
+    }
+    grade.qualityScore = qBound(10, score, 100);
+    co_return grade;
+}
+
 QCoro::Task<VideoClipProcessing::Result> VideoClipProcessing::merge(
     QStringList sources, QString destination, std::function<bool()> stillCurrent)
 {

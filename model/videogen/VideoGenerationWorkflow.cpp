@@ -641,9 +641,27 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
         }
         const bool imageFixPossible = request.imageCli
             && !currentImage.isEmpty() && QFileInfo::exists(currentImage);
+        const bool expectsMultiAngleCuts =
+            currentPrompt.contains(QLatin1String("camera view"), Qt::CaseInsensitive)
+            || currentPrompt.contains(QLatin1String("alternating"), Qt::CaseInsensitive);
+        VideoClipProcessing::MotionGrade motionGrade;
+        motionGrade = co_await VideoClipProcessing::gradeClipMotion(videoPath, expectsMultiAngleCuts);
+        QString motionTelemetryNote;
+        if (motionGrade.error.isEmpty() && motionGrade.durationSec >= 2.8)
+        {
+            motionTelemetryNote = tr("\nObjective ffmpeg motion telemetry: duration=%1s, openingFreeze=%2s, cameraAngleCuts=%3.")
+                .arg(QString::number(motionGrade.durationSec, 'f', 1))
+                .arg(QString::number(motionGrade.openingFreezeSec, 'f', 2))
+                .arg(motionGrade.sceneCutCount);
+            if (motionGrade.openingFreezeSec >= 1.2)
+            {
+                motionTelemetryNote += tr(" WARNING: Video starts frozen on a static image for %1s before motion begins!")
+                    .arg(QString::number(motionGrade.openingFreezeSec, 'f', 1));
+            }
+        }
         QString checkPrompt = tr(
             "The files %1 in the current working directory are key frames "
-            "extracted from a generated video.\n"
+            "extracted from a generated video.%4\n"
             "Video brief: %2\n"
             "Prompt used:\n%3\n\n"
             "Look at the frames and judge: is the clip on topic for the brief, "
@@ -680,7 +698,7 @@ QCoro::Task<void> VideoGenerationWorkflow::_run(Request request)
             "Omit both \"imageFix\" and \"improvedPrompt\" when cause is "
             "\"randomness\".")
             .arg(frameRefs.join(QStringLiteral(", ")),
-                 request.contextSummary, currentPrompt);
+                 request.contextSummary, currentPrompt, motionTelemetryNote);
         if (!imageFixPossible)
         {
             checkPrompt += tr("\nNo image regeneration is available this run — "

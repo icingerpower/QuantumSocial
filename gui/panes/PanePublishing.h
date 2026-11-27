@@ -6,8 +6,10 @@
 #include <QColor>
 #include <QDateTime>
 #include <QDir>
+#include <QJsonObject>
 #include <QList>
 #include <QPixmap>
+#include <QSet>
 #include <QSize>
 #include <QString>
 #include <QStringList>
@@ -84,6 +86,7 @@ public:
         QString strategy;
         QString referenceUrl;
         QString dnaAccountId;
+        int outcomeQualityScore = -1;
     };
 
     struct ScheduledItem
@@ -110,6 +113,9 @@ public:
     ~PanePublishing() override;
 
     bool isJobRunning() const { return m_jobActive; }
+    bool isPublicationArmed() const { return m_continuousArmed; }
+    int queuedItemCount() const;
+    QSet<QString> queuedOrActiveShortCodes() const;
     bool canPublishNextNow() const;
     const QList<ScheduledItem> &activeQueue() const { return m_queue; }
     QString statusText() const;
@@ -118,7 +124,13 @@ public:
 
     bool startPublishJob(const PublishJobConfig &config);
     bool startPlannedPublishJob(const PublishJobConfig &config,
-                                const QList<ScheduledItem> &confirmedQueue);
+                                const QList<ScheduledItem> &confirmedQueue,
+                                bool armContinuous = false);
+    int appendToPublishQueue(const PublishJobConfig &config,
+                             const QList<ScheduledItem> &newItems,
+                             bool armContinuous = true);
+    bool restorePersistedQueue();
+    QString persistedQueueFilePath() const;
 
     QList<EligibleCreative> collectEligibleCreatives(int maxDaysOld,
                                                      bool skipSingleImages = true,
@@ -191,6 +203,12 @@ private:
     void _scheduleNextTimer();
     void _launchNextQueuedItem();
     QCoro::Task<void> _executeItemCoroutine(int itemIndex);
+    void _savePersistedQueue() const;
+    QJsonObject _configToJson(const PublishJobConfig &config) const;
+    PublishJobConfig _configFromJson(const QJsonObject &obj) const;
+    static void _scheduleAppendedItems(QList<ScheduledItem> &existingQueue,
+                                       QList<ScheduledItem> &newItems,
+                                       const PublishJobConfig &config);
 
     TableAccounts *m_accounts = nullptr;
     TableProjects *m_projects = nullptr;
@@ -213,6 +231,8 @@ private:
     QList<ScheduledItem> m_queue;
     int m_currentIndex = -1;
     bool m_jobActive = false;
+    bool m_continuousArmed = false;
+    bool m_needsPreUploadLiveSync = false;
     bool m_uploadingNow = false;
     std::shared_ptr<bool> m_cancelFlag;
     QTimer *m_waitTimer = nullptr;

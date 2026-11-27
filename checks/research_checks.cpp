@@ -130,10 +130,11 @@ public:
     mutable QList<QStringList> imagesPerCall;
     mutable QStringList deletedConversations;
     mutable int quotaOnCallNumber = 0;
+    mutable QString cachedTinyMp4Path;
     QString getId() const override { return QStringLiteral("gemini-research-test"); }
     QString getName() const override { return QStringLiteral("Gemini Research Test"); }
     QCoro::Task<Result> generate(const QString &prompt, const QStringList &images,
-                                 const QString &outputDir, const QVariantMap &) const override
+                                 const QString &outputDir, const QVariantMap &settings) const override
     {
         prompts << prompt;
         imagesPerCall << images;
@@ -145,8 +146,26 @@ public:
             res.errorMessage = QStringLiteral("Gemini daily video quota reached (test limit).");
             co_return res;
         }
+        if (cachedTinyMp4Path.isEmpty() || !QFileInfo::exists(cachedTinyMp4Path))
+        {
+            cachedTinyMp4Path = QDir::temp().filePath(
+                QStringLiteral("qs_research_fixture_%1.mp4").arg(QCoreApplication::applicationPid()));
+            QProcess proc;
+            proc.start(QStandardPaths::findExecutable(QStringLiteral("ffmpeg")),
+                       {QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-y"),
+                        QStringLiteral("-f"), QStringLiteral("lavfi"),
+                        QStringLiteral("-i"), QStringLiteral("color=navy:s=160x284:d=0.4:r=24"),
+                        QStringLiteral("-c:v"), QStringLiteral("libx264"),
+                        cachedTinyMp4Path});
+            requireResearch(proc.waitForFinished(20000) && proc.exitCode() == 0,
+                            "generate tiny valid MP4 for ResearchVideoBackendFixture");
+        }
+        res.conversationUrl = settings.value(QStringLiteral("conversationUrl")).toString().isEmpty()
+            ? QStringLiteral("https://gemini.google.com/app/research_fixture_chat_%1").arg(prompts.size())
+            : settings.value(QStringLiteral("conversationUrl")).toString();
         res.videoPath = QDir(outputDir).filePath(QStringLiteral("animated_product.mp4"));
-        writeResearch(res.videoPath, "fake animated video output");
+        QFile::remove(res.videoPath);
+        requireResearch(QFile::copy(cachedTinyMp4Path, res.videoPath), "copy fixture MP4");
         co_return res;
     }
     QCoro::Task<DeleteConversationsResult> deleteConversations(
@@ -356,6 +375,91 @@ void checkResearch(const QDir &callerWorkingDir)
     importBtn->click();
     requireResearch(warningText.contains("stores") && warningText.contains("invalid"), "invalid directory warns about missing stores folder");
     dirEdit->setText(source.path());
+
+    // Verify "Import / refresh" with no new products does NOT pop up a dialog,
+    // and when a new product is added to the source directory, "Import / refresh" shows
+    // dialogNewlyImportedProducts with product image preview and 1-click "Check New Products"!
+    {
+        bool spuriousDialogOpened = false;
+        QTimer::singleShot(0, [&]() {
+            if (auto *dlg = qobject_cast<QDialog *>(QApplication::activeModalWidget()))
+            {
+                spuriousDialogOpened = true;
+                dlg->accept();
+            }
+        });
+        importBtn->click();
+        QApplication::processEvents();
+        requireResearch(!spuriousDialogOpened,
+                        "Import / refresh does not open a dialog when 0 new products were found");
+
+        // Now add a new color ("Emerald") with A+ element & high-res photo to source catalog and click Import / refresh:
+        auto emeraldShoe = shoe;
+        emeraldShoe.insert("asin", "B000000009");
+        emeraldShoe.insert("sku", "SHOE-Emerald-39");
+        emeraldShoe.insert("color", "Emerald");
+        QJsonArray expandedCatalog = catalog;
+        expandedCatalog.append(emeraldShoe);
+        writeResearch(catalogFile, QJsonDocument(expandedCatalog).toJson());
+        QImage emeraldImg(800, 1200, QImage::Format_RGB32);
+        emeraldImg.fill(QColor("#10b981"));
+        requireResearch(emeraldImg.save(source.filePath("sizing/P-SHOE-studio-shoes/emerald-image-01.jpg")),
+                        "save high-res photo for newly added Emerald product");
+        writeResearch(source.filePath("sizing/P-SHOE-studio-shoes/settings.ini"),
+            "[aplus]\nexcluded_colors=Red\n\n[sizing]\nskus\\B000000001=SHOE-Black-39\nskus\\B000000002=SHOE-Black-40\nskus\\B000000003=SHOE-Black-39\nskus\\B000000006=SHOE-Red-39\nskus\\B000000009=SHOE-Emerald-39\n");
+        writeResearch(source.filePath("sizing/P-SHOE-studio-shoes/aplus/index.json"),
+            R"({"elements":[{"id":"image_color_black","type":"image","versions":[{"desktop":"image_color_black/desktop.png"}]},{"id":"image_color_emerald","type":"image","versions":[{"desktop":"image_color_emerald/desktop.png"}]}]})");
+
+        bool sawNewProductsDialog = false;
+        bool hadRenderedPixmap = false;
+        QString summaryTxt;
+        QStringList checkedFromDialog;
+        QObject::connect(&pane, &PaneResearch::newlyImportedProductsChecked, &pane,
+                         [&](const QStringList &ids) { checkedFromDialog = ids; });
+        QTimer::singleShot(0, [&]() {
+            if (auto *dlg = qobject_cast<QDialog *>(QApplication::activeModalWidget()))
+            {
+                if (dlg->objectName() == QLatin1String("dialogNewlyImportedProducts"))
+                {
+                    sawNewProductsDialog = true;
+                    if (auto *sumLbl = dlg->findChild<QLabel *>("labelNewProductsSummary"))
+                    {
+                        summaryTxt = sumLbl->text();
+                    }
+                    const auto imgLabels = dlg->findChildren<QLabel *>();
+                    for (QLabel *lbl : imgLabels)
+                    {
+                        if (lbl->objectName().startsWith("newProductImage_") && !lbl->pixmap().isNull())
+                        {
+                            hadRenderedPixmap = true;
+                        }
+                    }
+                    if (auto *btnCheck = dlg->findChild<QPushButton *>("buttonCheckNewProducts"))
+                    {
+                        btnCheck->click();
+                        return;
+                    }
+                }
+                dlg->accept();
+            }
+        });
+        importBtn->click();
+        requireResearch(sawNewProductsDialog
+                            && hadRenderedPixmap
+                            && summaryTxt.contains("Found 1 new")
+                            && checkedFromDialog.size() == 1
+                            && productTable->model()->rowCount() == 2,
+                        "Import / refresh pops up dialogNewlyImportedProducts with rendered product image and Check New Products button");
+
+        // Restore original 2-product catalog so downstream assertions in checkResearch see exact original state:
+        writeResearch(catalogFile, catalogBytes);
+        writeResearch(source.filePath("sizing/P-SHOE-studio-shoes/settings.ini"),
+            "[aplus]\nexcluded_colors=Red\n\n[sizing]\nskus\\B000000001=SHOE-Black-39\nskus\\B000000002=SHOE-Black-40\nskus\\B000000003=SHOE-Black-39\nskus\\B000000006=SHOE-Red-39\n");
+        writeResearch(source.filePath("sizing/P-SHOE-studio-shoes/aplus/index.json"),
+            R"({"elements":[{"id":"image_color_black","type":"image","versions":[{"desktop":"image_color_black/desktop.png"}]}]})");
+        QFile::remove(source.filePath("sizing/P-SHOE-studio-shoes/emerald-image-01.jpg"));
+        requireResearch(store.replaceProducts(imported.products, source.path()), "restore original 2-product catalog after import dialog check");
+    }
 
     auto *tabs = pane.findChild<QTabWidget *>();
     requireResearch(tabs && tabs->count() == 2, "Products and References subtabs");
@@ -1578,9 +1682,11 @@ void checkResearch(const QDir &callerWorkingDir)
             "prompt = sys.stdin.read()\n"
             "if 'auto_plan.json' in prompt:\n"
             "    assert '\"hooks\"' in prompt, 'auto_plan must request full hooks + hashtags pool'\n"
+            "    assert 'SEASONAL & WEATHER COHERENCE' in prompt, 'auto_plan must enforce seasonal coherence'\n"
+            "    visual_clash = ('UnlabeledVisualSnowRef' in prompt)\n"
             "    out = {\n"
             "        'slots': [\n"
-            "            {'slot': 0, 'prompt': 'Editorial street look showcasing Studio Black Heels', 'hook': 'Stop scrolling for these heels', 'description': 'Studio shoes styled right #highheels #shoes', 'hookCategory': 'contrarian'},\n"
+            "            {'slot': 0, 'seasonalClash': visual_clash, 'seasonalClashReason': 'Snow in frame clashes with open-toe sandal' if visual_clash else '', 'prompt': 'Warm luxury marble hotel lobby showcasing Studio Black Heels', 'hook': 'Stop scrolling for these heels', 'description': 'Studio shoes styled right #highheels #shoes', 'hookCategory': 'contrarian'},\n"
             "            {'slot': 1, 'prompt': 'Four-slide outfit breakdown featuring Studio Black Heels', 'hook': '4 ways to style black heels', 'description': 'Carousel shoes styling #highheels #shoes', 'hookCategory': 'direct_value'},\n"
             "            {'slot': 2, 'prompt': 'Generate a video: Confident walk down marble stairs in Studio Black Heels', 'hook': 'Wait for the heel walk', 'description': 'Video shoes walk #highheels #shoes', 'hookCategory': 'transformation'}\n"
             "        ],\n"
@@ -2476,26 +2582,39 @@ void checkResearch(const QDir &callerWorkingDir)
                 }
             }, genWork.path());
 
-            // Seed 3 approved inspirations for wfAccId:
-            //   1) winRefId:   1 published post that performed well (2,400 views) -> privileged from 1st win!
-            //   2) flopRefId:  2 published posts that flopped (75 & 85 views)     -> retired after 2 low performers!
-            //   3) freshRefId: 0 published posts                                  -> fresh exploration pool
+            // Seed inspirations for wfAccId to verify:
+            //   1) winRefId:        1 published post that performed well (2,400 views) -> privileged from 1st win!
+            //   2) singleProdFlop:  4 low-performing posts on ONLY 1 product -> NOT discarded yet (needs >=2 products)!
+            //   3) flopRefId:       4 low-performing posts across 2 distinct products -> auto-discarded as "auto_discarded"!
+            //   4) humanRejRefId:   rejected by human -> stays "rejected" (distinct from "auto_discarded")!
+            //   5) freshRefId:      0 published posts -> fresh exploration pool
             const QString winRefId = wfStore.addReference(
                 wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/101"),
                 QStringLiteral("Winning Runway Source"), spyImgPath);
             const QString flopRefId = wfStore.addReference(
                 wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/102"),
-                QStringLiteral("Two-Flop Weak Source"), spyImgPath);
+                QStringLiteral("Four-Flop Two-Product Source"), spyImgPath);
             const QString freshRefId = wfStore.addReference(
                 wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/103"),
                 QStringLiteral("Fresh Untested Source"), spyImgPath);
+            const QString singleProdFlopRefId = wfStore.addReference(
+                wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/104"),
+                QStringLiteral("Four-Flop Single-Product Source"), spyImgPath);
+            const QString humanRejRefId = wfStore.addReference(
+                wfAccId, QStringLiteral("https://www.tiktok.com/@inspo/video/105"),
+                QStringLiteral("Human Rejected Source"), spyImgPath);
             requireResearch(!winRefId.isEmpty() && !flopRefId.isEmpty() && !freshRefId.isEmpty()
-                                && wfStore.review({winRefId, flopRefId, freshRefId},
+                                && !singleProdFlopRefId.isEmpty() && !humanRejRefId.isEmpty()
+                                && wfStore.review({winRefId, flopRefId, freshRefId, singleProdFlopRefId},
                                                   QStringLiteral("approved"),
-                                                  QStringLiteral("Approved for workflow test")),
-                            "seed 3 approved references (1st-win, 2-flop, fresh) in wfStore");
+                                                  QStringLiteral("Approved for workflow test"))
+                                && wfStore.review({humanRejRefId},
+                                                  QStringLiteral("rejected"),
+                                                  QStringLiteral("Rejected manually by human")),
+                            "seed approved and human-rejected references in wfStore");
 
             const auto seedHistoricalRefPost = [&](const QString &refId,
+                                                   const QString &prodId,
                                                    const QString &postUrl,
                                                    qint64 views,
                                                    qint64 likes,
@@ -2509,6 +2628,7 @@ void checkResearch(const QDir &callerWorkingDir)
                 writeResearch(gDir.filePath("creative_dna.json"), QJsonDocument(QJsonObject{
                     {QStringLiteral("referenceId"), refId},
                     {QStringLiteral("referenceUrl"), QStringLiteral("https://www.tiktok.com/@inspo/video/") + refId},
+                    {QStringLiteral("productId"), prodId},
                     {QStringLiteral("strategy"), QStringLiteral("reference_swap")},
                     {QStringLiteral("format"), QStringLiteral("video")}
                 }).toJson());
@@ -2530,13 +2650,29 @@ void checkResearch(const QDir &callerWorkingDir)
                 }
             };
 
-            seedHistoricalRefPost(winRefId, QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5001"),
+            seedHistoricalRefPost(winRefId, QStringLiteral("wf-prod-1"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5001"),
                                   2400, 190, 28, true);
-            seedHistoricalRefPost(flopRefId, QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5002"),
-                                  75, 2, 0, true);
+            // 4 flops on ONLY 1 product (wf-prod-1) -> must NOT be auto-discarded!
+            seedHistoricalRefPost(singleProdFlopRefId, QStringLiteral("wf-prod-1"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5011"), 70, 2, 0, true);
+            seedHistoricalRefPost(singleProdFlopRefId, QStringLiteral("wf-prod-1"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5012"), 65, 1, 0, true);
+            seedHistoricalRefPost(singleProdFlopRefId, QStringLiteral("wf-prod-1"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5013"), 80, 2, 0, true);
+            seedHistoricalRefPost(singleProdFlopRefId, QStringLiteral("wf-prod-1"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5014"), 75, 2, 0, true);
+            // 4 flops across 2 different products (wf-prod-1 & wf-prod-2) -> 3 measured + 1 pending!
+            seedHistoricalRefPost(flopRefId, QStringLiteral("wf-prod-1"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5002"), 75, 2, 0, true);
+            seedHistoricalRefPost(flopRefId, QStringLiteral("wf-prod-1"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5003"), 60, 1, 0, true);
+            seedHistoricalRefPost(flopRefId, QStringLiteral("wf-prod-2"),
+                                  QStringLiteral("https://www.tiktok.com/@pradize.high.heel/video/5004"), 80, 2, 0, true);
             QUuid pendingFlopVidId;
             const QString pendingFlopUrl = QStringLiteral("https://www.tiktok.com/@pradize.high.heel#QS-PENDING");
-            seedHistoricalRefPost(flopRefId, pendingFlopUrl, 85, 3, 0, false, &pendingFlopVidId);
+            seedHistoricalRefPost(flopRefId, QStringLiteral("wf-prod-2"),
+                                  pendingFlopUrl, 85, 3, 0, false, &pendingFlopVidId);
 
             PaneResearch wfResearch(&pubAccounts, &wfStore, {&swapCli});
             PaneWorkflow wfPane(&pubAccounts, &wfStore, &wfResearch, &liveGenPane, &panePub,
@@ -2544,6 +2680,25 @@ void checkResearch(const QDir &callerWorkingDir)
             wfPane.resize(1200, 780);
             wfPane.show();
             QApplication::processEvents();
+
+            // Before the 4th flop snapshot arrives, flopRefId only has 3 flops (<4) so it is NOT auto-discarded yet!
+            {
+                const auto preExp = SocialStatistics::summarizeReferenceExperiment(&pubVideos);
+                for (const auto &rp : preExp.references)
+                {
+                    if (rp.referenceId == flopRefId)
+                    {
+                        requireResearch(rp.lowPerformerCount == 3 && !rp.isAutoDiscardCandidate && !rp.isRetired,
+                                        "3 flops across 2 products is not auto-discarded yet (needs >=4)");
+                    }
+                    if (rp.referenceId == singleProdFlopRefId)
+                    {
+                        requireResearch(rp.lowPerformerCount == 4 && rp.distinctProductCount == 1
+                                            && !rp.isAutoDiscardCandidate && !rp.isRetired,
+                                        "4 flops on only 1 product is NOT auto-discarded (needs >=2 distinct products)");
+                    }
+                }
+            }
 
             // Verify Workflow detects unmeasured newly-published posts (#QS-PENDING without snapshots),
             // and clears needsStatsSyncBeforeGeneration() once latest snapshots are recorded!
@@ -2555,22 +2710,40 @@ void checkResearch(const QDir &callerWorkingDir)
                             "PaneWorkflow exposes Sync Stats controls and detects unmeasured published posts needing sync");
 
             {
-                AbstractSocialAccount::VideoStatistics flop2Stats;
-                flop2Stats.views = 85;
-                flop2Stats.likes = 3;
-                flop2Stats.comments = 0;
-                flop2Stats.shares = 0;
+                AbstractSocialAccount::VideoStatistics flop4Stats;
+                flop4Stats.views = 85;
+                flop4Stats.likes = 3;
+                flop4Stats.comments = 0;
+                flop4Stats.shares = 0;
                 pubVideos.addSnapshot(pendingFlopVidId, pendingFlopUrl,
-                                      AbstractSocialAccount::StatSource::PublicView, flop2Stats);
+                                      AbstractSocialAccount::StatSource::PublicView, flop4Stats);
             }
+            const auto wfRefExp = SocialStatistics::summarizeReferenceExperiment(&pubVideos);
+            const int autoDiscCnt = SocialStatistics::applyAutoDiscardFromExperiment(&wfStore, wfRefExp);
+            requireResearch(autoDiscCnt == 1
+                                && wfStore.reference(flopRefId).value("status").toString() == QLatin1String("auto_discarded")
+                                && wfStore.reference(flopRefId).value("history").toArray().last().toObject().value("actor").toString() == QLatin1String("auto_stats")
+                                && wfStore.reference(humanRejRefId).value("status").toString() == QLatin1String("rejected")
+                                && wfStore.reference(humanRejRefId).value("history").toArray().last().toObject().value("actor").toString() == QLatin1String("human")
+                                && wfStore.reference(singleProdFlopRefId).value("status").toString() == QLatin1String("approved"),
+                            "applyAutoDiscardFromExperiment marks >=4-flop/>=2-product source as auto_discarded (actor=auto_stats), keeps human rejected distinct, and spares 1-product flops");
+
+            auto *btnFilterRej = wfResearch.findChild<QPushButton *>("researchFilter_rejected");
+            auto *btnFilterAutoDisc = wfResearch.findChild<QPushButton *>("researchFilter_auto_discarded");
+            requireResearch(btnFilterRej && btnFilterAutoDisc
+                                && btnFilterRej->text().contains("Rejected (1)")
+                                && btnFilterAutoDisc->text().contains("Auto-discarded (1)"),
+                            "PaneResearch displays separate filter tabs and counts for human Rejected vs Auto-discarded");
+
+            // Move singleProdFlopRefId back to pending for the upcoming 2-slot exploit generation check
+            wfStore.review({singleProdFlopRefId}, QStringLiteral("pending"), QStringLiteral("Reset for 2-slot check"));
             wfPane.refreshStep1Products();
             QApplication::processEvents();
             requireResearch(!wfPane.needsStatsSyncBeforeGeneration(),
                             "needsStatsSyncBeforeGeneration becomes false once all published posts have fresh (<30m) stats");
 
-            const auto wfRefExp = SocialStatistics::summarizeReferenceExperiment(&pubVideos);
             bool verifiedFirstWinPrivileged = false;
-            bool verifiedTwoFlopsRetired = false;
+            bool verifiedFourFlopsTwoProdsRetired = false;
             for (const auto &rp : wfRefExp.references)
             {
                 if (rp.referenceId == winRefId)
@@ -2580,14 +2753,14 @@ void checkResearch(const QDir &callerWorkingDir)
                 }
                 else if (rp.referenceId == flopRefId)
                 {
-                    verifiedTwoFlopsRetired = (rp.publishedCount == 2 && rp.lowPerformerCount == 2
-                                               && rp.isRetired && !rp.isWinner);
+                    verifiedFourFlopsTwoProdsRetired = (rp.publishedCount == 4 && rp.lowPerformerCount == 4
+                                                        && rp.distinctProductCount == 2 && rp.isRetired && !rp.isWinner);
                 }
             }
-            requireResearch(verifiedFirstWinPrivileged && verifiedTwoFlopsRetired
+            requireResearch(verifiedFirstWinPrivileged && verifiedFourFlopsTwoProdsRetired
                                 && wfInspoInfo->text().contains("proven winner(s) privileged")
-                                && wfInspoInfo->text().contains("retired"),
-                            "SocialStatistics privileges source from 1st win, retires source starting at 2 low performers, and displays counts in Step 1B");
+                                && wfInspoInfo->text().contains("auto-discarded"),
+                            "SocialStatistics privileges source from 1st win, auto-discards source at >=4 flops across >=2 products, and displays counts in Step 1B");
 
             requireResearch(wfPane.currentStep() == 0, "PaneWorkflow opens on Step 1 (Pick Products)");
             auto *wfProdList = wfPane.findChild<QListWidget *>("listWorkflowProducts");
@@ -2706,7 +2879,7 @@ void checkResearch(const QDir &callerWorkingDir)
                                 && !QFileInfo::exists(genWork.filePath("paused_auto_batch.json"))
                                 && !wfLimitBanner->isVisible()
                                 && wfGenLog->toPlainText().contains("Saved")
-                                && wfGenLog->toPlainText().contains("1 proven winner(s) privileged, 1 retired"),
+                                && wfGenLog->toPlainText().contains("1 proven winner(s) privileged"),
                             "Resuming paused batch finishes remaining creative (2/2), clears checkpoint, privileges 1st-win source, and auto-advances to Step 2");
 
             // Verify newly generated wf-prod-1 and wf-prod-2 creatives both privileged winRefId (0% flopRefId)
@@ -3168,6 +3341,988 @@ void checkResearch(const QDir &callerWorkingDir)
                                     "two_step_reveal final_video.mp4 has full ~2.0s combined duration in both merged and standalone modes");
                 }
                 requireResearch(twoStepSavedCount == 2, "both two_step_reveal creatives saved and verified");
+
+                // End-to-end Continuous Workflow + Incremental "Little by Little" Queueing + Crash/Restart Recovery
+                // + Mid-Slot 2-Step Checkpoint Resume + Two-Switch Shutdown (Stop Generation + Stop Publication):
+                {
+                    QTemporaryDir cwWorkTmp;
+                    const QDir cwWork(cwWorkTmp.path());
+                    WorkingDirectoryManager::instance()->setWorkingDir(cwWork);
+                    qputenv("QS_PUBLISH_LOG_DIR", cwWork.filePath("publish_logs").toUtf8());
+                    // Mark initial stats sync fresh so Phase 1's real TikTok account does not scrape the internet;
+                    // Phase 4 below tests live offline retrieveFromAccounts + 12h startup & continuous sync!
+                    SocialStatistics::recordStatisticsRetrievalCompleted(0);
+
+                    TableAccounts cwAccounts(cwWork.path());
+                    cwAccounts.addAccount();
+                    cwAccounts.setData(cwAccounts.index(0, TableAccounts::IND_TYPE), QStringLiteral("TikTok"));
+                    cwAccounts.setData(cwAccounts.index(0, TableAccounts::IND_URL), QStringLiteral("https://www.tiktok.com/@pradize.high.heel"));
+                    const QString cwAccId = cwAccounts.accountId(0).toString(QUuid::WithoutBraces);
+
+                    ResearchStore cwStore(cwWork.path());
+                    requireResearch(cwStore.setProfile(cwAccId, QJsonObject{
+                        {QStringLiteral("brands"), QJsonArray{QStringLiteral("Pradize")}},
+                        {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}}
+                    }), "configure continuous workflow profile");
+                    requireResearch(cwStore.replaceProducts(QJsonArray{
+                        QJsonObject{
+                            {QStringLiteral("id"), QStringLiteral("cw-prod-1")},
+                            {QStringLiteral("asin"), QStringLiteral("B0CWPROD01")},
+                            {QStringLiteral("title"), QStringLiteral("Pradize Champagne Crystal Sandal")},
+                            {QStringLiteral("color"), QStringLiteral("Champagne")},
+                            {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                            {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                            {QStringLiteral("sizingFolder"), QStringLiteral("APlus")},
+                            {QStringLiteral("localImage"), spyImgPath}
+                        },
+                        QJsonObject{
+                            {QStringLiteral("id"), QStringLiteral("cw-prod-2")},
+                            {QStringLiteral("asin"), QStringLiteral("B0CWPROD02")},
+                            {QStringLiteral("title"), QStringLiteral("Pradize Noir Velvet Stiletto")},
+                            {QStringLiteral("color"), QStringLiteral("Noir")},
+                            {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                            {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                            {QStringLiteral("sizingFolder"), QStringLiteral("APlus")},
+                            {QStringLiteral("localImage"), spyImgPath}
+                        }
+                    }, cwWork.path()), "seed continuous workflow products");
+
+                    TreeProperties cwProps(cwWork.filePath("props.json"));
+                    TreeProperties cwArch(cwWork.filePath("arch.json"));
+                    TableVideos cwVideos(cwWork.path());
+                    TableGenerationSettings cwSettings(cwWork.path());
+                    PreferredHashtags cwHashtags(cwWork.path());
+                    PromptLessons cwLessons(cwWork.path());
+                    FavoriteHooks cwHooks(cwWork.path());
+                    FavoriteVideoPrompts cwFavPrompts(cwWork.path());
+                    SavedPrompts cwSaved(cwWork.path());
+
+                    // Phase 1: Start recurring generation (every 4 hours) + curate & append creatives little by little!
+                    QString firstQueuedCode;
+                    QString secondQueuedCode;
+                    {
+                        PaneResearch cwResearch(&cwAccounts, &cwStore, {&swapCli});
+                        PaneGeneration cwGen(&cwProps, &cwArch, &cwVideos, &cwSettings, &cwHashtags,
+                                             &cwLessons, &cwHooks, &cwFavPrompts, &cwSaved);
+                        cwGen.setAvailableClis({&swapCli});
+                        PanePublishing cwPub(&cwAccounts, cwGen.projectsModel(), &cwVideos, {&swapCli}, nullptr, &cwHashtags, &cwHooks);
+                        PaneWorkflow cwWf(&cwAccounts, &cwStore, &cwResearch, &cwGen, &cwPub, &cwVideos, {&swapCli}, &cwHooks, nullptr, &cwHashtags);
+                        cwWf.setUploadUrlOverride(QStringLiteral("file://") + studioHtmlPath);
+                        cwWf.resize(1320, 860);
+                        cwWf.show();
+                        QApplication::processEvents();
+
+                        auto *chkRepeat = cwWf.findChild<QCheckBox *>("checkWorkflowRepeatEveryHours");
+                        auto *spinRepeat = cwWf.findChild<QSpinBox *>("spinWorkflowRepeatHours");
+                        auto *chkVid = cwWf.findChild<QCheckBox *>("checkWorkflowFormatVideo");
+                        auto *chkCar = cwWf.findChild<QCheckBox *>("checkWorkflowFormatCarousel");
+                        auto *chkImg = cwWf.findChild<QCheckBox *>("checkWorkflowFormatImage");
+                        auto *spinPerProd = cwWf.findChild<QSpinBox *>("spinWorkflowGenPerProduct");
+                        auto *btnCheckAll = cwWf.findChild<QPushButton *>("buttonWorkflowCheckAllProducts");
+                        auto *btnGen = cwWf.findChild<QPushButton *>("buttonWorkflowGenerate");
+                        auto *btnStopGenTop = cwWf.findChild<QPushButton *>("buttonWorkflowStopGeneration");
+                        auto *btnStopPubTop = cwWf.findChild<QPushButton *>("buttonWorkflowStopPublication");
+                        auto *btnAddQueue = cwWf.findChild<QPushButton *>("buttonWorkflowAddToQueue");
+                        auto *radioFixed = cwWf.findChild<QRadioButton *>("radioWorkflowSpacingFixed");
+                        auto *spinFixed = cwWf.findChild<QSpinBox *>("spinWorkflowFixedMinutes");
+                        auto *chkDryRun = cwWf.findChild<QCheckBox *>("checkWorkflowDryRun");
+                        requireResearch(chkRepeat && spinRepeat && btnStopGenTop && btnStopPubTop && btnAddQueue
+                                            && !btnStopGenTop->isEnabled() && !btnStopPubTop->isEnabled(),
+                                        "Continuous workflow exposes recurring schedule controls, Add to Queue button, and top Stop switches");
+
+                        radioFixed->setChecked(true);
+                        spinFixed->setValue(60);
+                        chkDryRun->setChecked(true);
+
+                        // Configure 2 products × 2 slideshows each = 4 creatives, repeating every 4 hours
+                        chkVid->setChecked(false);
+                        chkCar->setChecked(true);
+                        chkImg->setChecked(false);
+                        spinPerProd->setValue(2);
+                        chkRepeat->setChecked(true);
+                        spinRepeat->setValue(4);
+                        btnCheckAll->click();
+                        QApplication::processEvents();
+                        requireResearch(btnGen->text().contains("Generate 4 Creative(s)")
+                                            && btnGen->text().contains("Repeat Every 4h"),
+                                        "Generate button reflects recurring N-hour daemon schedule");
+
+                        btnGen->click();
+                        QElapsedTimer cwWait;
+                        cwWait.start();
+                        while (cwGen.isAutoBatchRunning() && cwWait.elapsed() < 30000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(20);
+                        }
+                        QApplication::processEvents();
+
+                        const QJsonObject daemonJson1 = QJsonDocument::fromJson(
+                            readResearch(cwWf.generationDaemonStatePath())).object();
+                        requireResearch(cwWf.isGenerationDaemonActive()
+                                            && btnStopGenTop->isEnabled()
+                                            && daemonJson1.value("active").toBool()
+                                            && daemonJson1.value("intervalHours").toInt() == 4
+                                            && daemonJson1.value("cyclesCompleted").toInt() == 1
+                                            && cwWf.currentStep() == 1,
+                                        "Cycle #1 completes, persists workflow_generation_daemon.json (active=true, 4h), enables Stop Generation, and opens Step 2");
+
+                        auto *candTable = cwWf.findChild<QTableWidget *>("tableReviewCandidates");
+                        requireResearch(candTable && candTable->rowCount() == 4,
+                                        "Step 2 lists all 4 newly generated creatives");
+
+                        // Curate "little by little": check ONLY row 0 first and click "Add Selected to Publish Queue"
+                        for (int r = 0; r < candTable->rowCount(); ++r)
+                        {
+                            candTable->item(r, 0)->setCheckState(r == 0 ? Qt::Checked : Qt::Unchecked);
+                        }
+                        QApplication::processEvents();
+                        firstQueuedCode = candTable->item(0, 2)->text().section(' ', 0, 0);
+                        requireResearch(btnAddQueue->isEnabled() && btnAddQueue->text().contains("Add 1 Selected"),
+                                        "Step 2 Add to Queue button reflects 1 checked item");
+
+                        btnAddQueue->click();
+                        QApplication::processEvents();
+                        requireResearch(cwPub.isPublicationArmed()
+                                            && btnStopPubTop->isEnabled()
+                                            && candTable->rowCount() == 3,
+                                        "Adding 1st creative arms continuous Publication, enables Stop Publication, and removes queued item from Step 2");
+
+                        // Wait for 1st item dry-run upload to complete (queue drains to 0 pending, but Publication stays armed!)
+                        cwWait.restart();
+                        while (cwPub.isJobRunning() && cwWait.elapsed() < 30000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(25);
+                        }
+                        requireResearch(!cwPub.isJobRunning()
+                                            && cwPub.isPublicationArmed()
+                                            && btnStopPubTop->isEnabled(),
+                                        "After 1st item finishes, Publication stays armed for incremental additions until Stop Publication is clicked");
+
+                        // Now check a 2nd creative in Step 2 AND verify live creativeGenerated preserves checked selection,
+                        // then click "Add Selected to Publish Queue" again -> chains +60m after 1st post!
+                        candTable->item(0, 0)->setCheckState(Qt::Checked);
+                        secondQueuedCode = candTable->item(0, 2)->text().section(' ', 0, 0);
+                        QApplication::processEvents();
+                        emit cwGen.creativeGenerated(QStringLiteral("DUMMY_SIGNAL_CHECK"));
+                        QApplication::processEvents();
+                        requireResearch(candTable->item(0, 0)->checkState() == Qt::Checked,
+                                        "Live creativeGenerated refresh in Step 2 preserves user's in-progress checked selection");
+
+                        btnAddQueue->click();
+                        QApplication::processEvents();
+                        requireResearch(cwPub.isJobRunning()
+                                            && cwPub.queuedItemCount() == 1
+                                            && candTable->rowCount() == 2
+                                            && cwPub.activeQueue().size() == 2
+                                            && cwPub.activeQueue().at(1).status == QLatin1String("Queued")
+                                            && QDateTime::currentDateTime().secsTo(cwPub.activeQueue().at(1).scheduledAt) > 2400,
+                                        "Appending 2nd creative little-by-little chains its schedule +60m after 1st post and keeps it Queued on disk");
+                        requireResearch(QFileInfo::exists(cwPub.persistedQueueFilePath()),
+                                        "publish_queue.json persisted atomically on disk");
+
+                        cwWf.close();
+                    }
+
+                    // Phase 2: Simulate mid-run APP CRASH before restart:
+                    //   (a) Mutate publish_queue.json so item #2's scheduledAt is 2 hours overdue (as if app was down 2h),
+                    //       plus add item #3 in interrupted "Uploading" state to verify crash recovery resets it to Queued!
+                    //   (b) Seed a mid-slot 2-step crash checkpoint (paused_auto_batch.json with inFlight=true +
+                    //       auto_slot_01/slot_checkpoint.json with step0Done=true & step1Done=true) so restart resumes
+                    //       directly at Step 2 without wasting Step 1 Veo credits!
+                    tsBackend.calls.clear();
+                    tsBackend.continuationCount = 0;
+                    tsBackend.deletedConversations.clear();
+                    {
+                        // Overdue publish_queue.json mutation (simulate app was down for 3 hours)
+                        const QString pqPath = cwWork.filePath("publish_queue.json");
+                        QJsonObject pqObj = QJsonDocument::fromJson(readResearch(pqPath)).object();
+                        QJsonArray qArr = pqObj.value("items").toArray();
+                        requireResearch(qArr.size() == 2, "persisted publish_queue.json has 2 items before crash");
+                        QJsonObject item1 = qArr[0].toObject();
+                        item1.insert("scheduledAt", QDateTime::currentDateTimeUtc().addSecs(-10800).toString(Qt::ISODate));
+                        qArr[0] = item1;
+                        QJsonObject item2 = qArr[1].toObject();
+                        item2.insert("status", QStringLiteral("Uploading")); // simulate crash mid-upload!
+                        item2.insert("scheduledAt", QDateTime::currentDateTimeUtc().addSecs(-7200).toString(Qt::ISODate));
+                        qArr[1] = item2;
+                        pqObj.insert("items", qArr);
+                        writeResearch(pqPath, QJsonDocument(pqObj).toJson(QJsonDocument::Indented));
+
+                        // Seed 2-step mid-slot crash checkpoint on cw-prod-1's project
+                        TableProjects crashProjCheck(cwWork.path());
+                        requireResearch(crashProjCheck.rowCount() >= 1, "projects persisted before crash");
+                        const QDir slot1Dir(crashProjCheck.stagingDir(0).filePath("auto_slot_01"));
+                        QDir().mkpath(slot1Dir.filePath("two_step_1"));
+                        QFile::copy(spyImgPath, slot1Dir.filePath("generation_source.png"));
+                        const QString preCrashStep1Vid = slot1Dir.filePath("two_step_1/precrash_step1.mp4");
+                        TwoStepGeminiBackendFixture::runFfmpeg({
+                            QStringLiteral("-v"), QStringLiteral("error"), QStringLiteral("-y"),
+                            QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"), QStringLiteral("color=red:s=160x284:d=1.6:r=30"),
+                            QStringLiteral("-c:v"), QStringLiteral("libx264"), preCrashStep1Vid});
+                        const QJsonObject slotCkpt{
+                            {QStringLiteral("schemaVersion"), 1},
+                            {QStringLiteral("plannedStrategy"), QStringLiteral("two_step_reveal")},
+                            {QStringLiteral("plannedPrompt"), QStringLiteral("Generate a vertical 9:16 video: slow motion close-up bottom to top.")},
+                            {QStringLiteral("plannedStep2Prompt"), QStringLiteral("Generate a vertical 9:16 video. In the next video, alternate close-up and full-body views.")},
+                            {QStringLiteral("plannedHook"), QStringLiteral("Wait for the full heel reveal")},
+                            {QStringLiteral("plannedDescription"), QStringLiteral("Champagne crystal heels #heels")},
+                            {QStringLiteral("step0Done"), true},
+                            {QStringLiteral("step1Done"), true},
+                            {QStringLiteral("step1Video"), preCrashStep1Vid},
+                            {QStringLiteral("conversationUrl"), QStringLiteral("https://gemini.google.com/app/recovered_step1_chat")}
+                        };
+                        writeResearch(slot1Dir.filePath("slot_checkpoint.json"),
+                                      QJsonDocument(slotCkpt).toJson(QJsonDocument::Indented));
+
+                        const QJsonObject crashBatchSpec{
+                            {QStringLiteral("accountId"), cwAccId},
+                            {QStringLiteral("accountLabel"), QStringLiteral("TikTok · @pradize.high.heel")},
+                            {QStringLiteral("profile"), QJsonObject{
+                                {QStringLiteral("brands"), QJsonArray{QStringLiteral("Pradize")}},
+                                {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}}
+                            }},
+                            {QStringLiteral("products"), QJsonArray{
+                                QJsonObject{
+                                    {QStringLiteral("id"), QStringLiteral("cw-prod-1")},
+                                    {QStringLiteral("asin"), QStringLiteral("B0CWPROD01")},
+                                    {QStringLiteral("title"), QStringLiteral("Pradize Champagne Crystal Sandal")},
+                                    {QStringLiteral("color"), QStringLiteral("Champagne")},
+                                    {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                                    {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                                    {QStringLiteral("localImage"), spyImgPath}
+                                }
+                            }},
+                            {QStringLiteral("approvedReferences"), QJsonArray{}},
+                            {QStringLiteral("generationsPerProduct"), 1},
+                            {QStringLiteral("includeImage"), false},
+                            {QStringLiteral("includeCarousel"), false},
+                            {QStringLiteral("includeVideo"), true},
+                            {QStringLiteral("videoGeneratorId"), tsBackend.getId()},
+                            {QStringLiteral("promptCli"), swapCli.getName()},
+                            {QStringLiteral("imageCli"), swapCli.getName()},
+                            {QStringLiteral("suppressModalProgressDialog"), true}
+                        };
+                        const QJsonObject crashPausedJson{
+                            {QStringLiteral("schemaVersion"), 1},
+                            {QStringLiteral("inFlight"), true},
+                            {QStringLiteral("batchSpec"), crashBatchSpec},
+                            {QStringLiteral("nextProductIndex"), 0},
+                            {QStringLiteral("nextSlotIndex"), 0},
+                            {QStringLiteral("completedCreatives"), 0},
+                            {QStringLiteral("totalCreatives"), 1},
+                            {QStringLiteral("limitReason"), QStringLiteral("Interrupted by application exit/crash — ready to resume.")},
+                            {QStringLiteral("pausedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
+                        };
+                        writeResearch(cwWork.filePath("paused_auto_batch.json"),
+                                      QJsonDocument(crashPausedJson).toJson(QJsonDocument::Indented));
+                    }
+
+                    // Phase 3: Re-launch fresh panes on the same working directory and verify automatic crash recovery
+                    // + Two-Switch Shutdown (Stop Generation + Stop Publication)!
+                    {
+                        TableVideos cwVideosRestart(cwWork.path());
+                        PaneResearch cwResearch2(&cwAccounts, &cwStore, {&swapCli});
+                        PaneGeneration cwGen2(&cwProps, &cwArch, &cwVideosRestart, &cwSettings, &cwHashtags,
+                                              &cwLessons, &cwHooks, &cwFavPrompts, &cwSaved);
+                        cwGen2.setAvailableClis({&swapCli});
+                        requireResearch(cwGen2.hasPausedAutoBatch() && cwGen2.wasPausedAutoBatchCrashInterrupted(),
+                                        "Fresh PaneGeneration detects in-flight crash-interrupted batch on startup");
+
+                        PanePublishing cwPub2(&cwAccounts, cwGen2.projectsModel(), &cwVideosRestart, {&swapCli}, nullptr, &cwHashtags, &cwHooks);
+                        requireResearch(cwPub2.isPublicationArmed()
+                                            && cwPub2.isJobRunning()
+                                            && cwPub2.activeQueue().size() == 2
+                                            && cwPub2.activeQueue().at(1).status == QLatin1String("Queued"),
+                                        "Fresh PanePublishing restores publish_queue.json on startup and resets interrupted Uploading item to Queued");
+
+                        PaneWorkflow cwWf2(&cwAccounts, &cwStore, &cwResearch2, &cwGen2, &cwPub2, &cwVideosRestart, {&swapCli}, &cwHooks, nullptr, &cwHashtags);
+                        cwWf2.setUploadUrlOverride(QStringLiteral("file://") + studioHtmlPath);
+
+                        // Wait for automatic crash-recovery generation + recovered overdue publish item to complete!
+                        QElapsedTimer recWait;
+                        recWait.start();
+                        while ((cwGen2.isAutoBatchRunning() || cwGen2.hasPausedAutoBatch() || cwPub2.isJobRunning())
+                               && recWait.elapsed() < 40000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(25);
+                        }
+                        QApplication::processEvents();
+
+                        requireResearch(tsBackend.calls.size() == 1
+                                            && tsBackend.continuationCount == 1
+                                            && tsBackend.calls.first().settings.value("chatMode").toString() == QLatin1String("conversation")
+                                            && tsBackend.calls.first().settings.value("conversationUrl").toString()
+                                                   == QLatin1String("https://gemini.google.com/app/recovered_step1_chat"),
+                                        "Crash recovery resumed interrupted two_step_reveal directly at Step 2 in saved chat URL with ZERO duplicate Step 1 calls");
+                        requireResearch(cwVideosRestart.rowCount() == 5
+                                            && cwPub2.activeQueue().at(1).status == QLatin1String("Dry-run OK")
+                                            && cwWf2.isGenerationDaemonActive()
+                                            && cwPub2.isPublicationArmed(),
+                                        "Both recovered generation and overdue publish item succeeded while keeping Generation & Publication loops active");
+
+                        // Verify deterministic motion grader score was persisted into creative_dna.json for the 3.6s video!
+                        const auto *recoveredVidRec = cwVideosRestart.recordAt(cwVideosRestart.rowCount() - 1);
+                        requireResearch(recoveredVidRec != nullptr, "recovered video record present");
+                        const QDir recGenDir = cwGen2.projectsModel()->generationDir(0, recoveredVidRec->shortCode, false);
+                        const QJsonObject recDna = QJsonDocument::fromJson(
+                            readResearch(recGenDir.filePath("creative_dna.json"))).object();
+                        requireResearch(recDna.contains("outcomeQualityScore")
+                                            && recDna.contains("openingFreezeSec")
+                                            && recDna.contains("sceneCutCount"),
+                                        "Saved >2.8s video records deterministic outcomeQualityScore, openingFreezeSec, and sceneCutCount in creative_dna.json");
+
+                        // Verify Two-Switch Shutdown:
+                        // 1) Click Stop Generation -> stops Generation daemon only; Publication stays armed!
+                        auto *btnStopGen2 = cwWf2.findChild<QPushButton *>("buttonWorkflowStopGeneration");
+                        auto *btnStopPub2 = cwWf2.findChild<QPushButton *>("buttonWorkflowStopPublication");
+                        requireResearch(btnStopGen2 && btnStopGen2->isEnabled()
+                                            && btnStopPub2 && btnStopPub2->isEnabled(),
+                                        "Both Stop Generation and Stop Publication switches are enabled while loops are armed");
+
+                        btnStopGen2->click();
+                        QApplication::processEvents();
+                        const QJsonObject daemonStopped = QJsonDocument::fromJson(
+                            readResearch(cwWf2.generationDaemonStatePath())).object();
+                        requireResearch(!cwWf2.isGenerationDaemonActive()
+                                            && !btnStopGen2->isEnabled()
+                                            && !daemonStopped.value("active").toBool()
+                                            && cwPub2.isPublicationArmed()
+                                            && btnStopPub2->isEnabled(),
+                                        "Clicking Stop Generation disarms recurring generation on disk while leaving Publication armed");
+
+                        // 2) Click Stop Publication -> disarms Publication on disk too!
+                        btnStopPub2->click();
+                        QApplication::processEvents();
+                        const QJsonObject pubStopped = QJsonDocument::fromJson(
+                            readResearch(cwPub2.persistedQueueFilePath())).object();
+                        requireResearch(!cwPub2.isPublicationArmed()
+                                            && !cwPub2.isJobRunning()
+                                            && !btnStopPub2->isEnabled()
+                                            && !pubStopped.value("armed").toBool()
+                                            && !pubStopped.value("jobActive").toBool(),
+                                        "Clicking Stop Publication disarms publish_queue.json on disk");
+
+                        // 3) Verify a subsequent restart stays cleanly stopped on both loops!
+                        PanePublishing cwPub3(&cwAccounts, cwGen2.projectsModel(), &cwVideosRestart, {&swapCli}, nullptr, &cwHashtags, &cwHooks);
+                        PaneWorkflow cwWf3(&cwAccounts, &cwStore, &cwResearch2, &cwGen2, &cwPub3, &cwVideosRestart, {&swapCli}, &cwHooks, nullptr, &cwHashtags);
+                        {
+                            QElapsedTimer idleWait;
+                            idleWait.start();
+                            while (idleWait.elapsed() < 100)
+                            {
+                                QApplication::processEvents();
+                                QThread::msleep(15);
+                            }
+                        }
+                        requireResearch(!cwWf3.isGenerationDaemonActive()
+                                            && !cwPub3.isPublicationArmed()
+                                            && !cwPub3.isJobRunning(),
+                                        "After clicking Stop Generation + Stop Publication, restarting the app keeps both workflows stopped");
+                    }
+
+                    // Phase 4: End-to-end verification of:
+                    //   (a) Statistics retrieval automatically discarding a source with >=4 flops across >=2 products
+                    //       as "auto_discarded" (distinct from human "rejected"), while keeping <4-flop or 1-product sources active,
+                    //   (b) App startup statistics retrieval running automatically when last sync was >=12h ago (and skipping when <12h),
+                    //   (c) Continuous workflow automatically running statistics retrieval when >=12h has elapsed!
+                    {
+                        class OfflineStatsAccountFixture final : public AbstractSocialAccount
+                        {
+                        public:
+                            mutable int accountVideoFetchCalls = 0;
+                            mutable QList<AccountPostStatistics> mockedPosts;
+
+                            QString getId() const override { return QStringLiteral("mock-stats-social"); }
+                            QString getName() const override { return QStringLiteral("MockStatsSocial"); }
+                            bool supportsAccountVideoStatistics() const override { return true; }
+                            QCoro::Task<Statistics> fetchStatistics(const QString &) const override
+                            {
+                                Statistics s;
+                                s.followers = 1500;
+                                co_return s;
+                            }
+                            QCoro::Task<AccountVideosResult> fetchAccountVideoStatistics(
+                                const QString &, const QStringList &) const override
+                            {
+                                ++accountVideoFetchCalls;
+                                AccountVideosResult r;
+                                r.followers = 1500;
+                                r.views = 12000;
+                                r.likes = 900;
+                                r.posts = mockedPosts;
+                                co_return r;
+                            }
+                        };
+                        static OfflineStatsAccountFixture mockStatsPlatform;
+                        static bool registeredMockStats = false;
+                        if (!registeredMockStats)
+                        {
+                            AbstractSocialAccount::Recorder rec(&mockStatsPlatform);
+                            Q_UNUSED(rec);
+                            registeredMockStats = true;
+                        }
+                        mockStatsPlatform.accountVideoFetchCalls = 0;
+                        mockStatsPlatform.mockedPosts.clear();
+
+                        QTemporaryDir stWorkTmp;
+                        const QDir stWork(stWorkTmp.path());
+                        WorkingDirectoryManager::instance()->setWorkingDir(stWork);
+
+                        TableAccounts stAccounts(stWork.path());
+                        stAccounts.addAccount();
+                        stAccounts.setData(stAccounts.index(0, TableAccounts::IND_TYPE), mockStatsPlatform.getName());
+                        stAccounts.setData(stAccounts.index(0, TableAccounts::IND_URL), QStringLiteral("https://mock.social/@pradize"));
+                        const QString stAccId = stAccounts.accountId(0).toString(QUuid::WithoutBraces);
+
+                        ResearchStore stStore(stWork.path());
+                        stStore.setProfile(stAccId, QJsonObject{
+                            {QStringLiteral("brands"), QJsonArray{QStringLiteral("Pradize")}},
+                            {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}}
+                        });
+                        stStore.replaceProducts(QJsonArray{
+                            QJsonObject{{QStringLiteral("id"), QStringLiteral("st-prod-a")},
+                                        {QStringLiteral("title"), QStringLiteral("Pradize Gold Sandal")},
+                                        {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                                        {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                                        {QStringLiteral("localImage"), spyImgPath}},
+                            QJsonObject{{QStringLiteral("id"), QStringLiteral("st-prod-b")},
+                                        {QStringLiteral("title"), QStringLiteral("Pradize Pearl Mule")},
+                                        {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                                        {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                                        {QStringLiteral("localImage"), spyImgPath}}
+                        }, stWork.path());
+
+                        const QString winRef = stStore.addReference(stAccId, QStringLiteral("https://www.pinterest.com/pin/9001/"), QStringLiteral("Winner Pin"), spyImgPath);
+                        const QString badTwoProdRef = stStore.addReference(stAccId, QStringLiteral("https://www.pinterest.com/pin/9002/"), QStringLiteral("Failed 4x on 2 Products"), spyImgPath);
+                        const QString badOneProdRef = stStore.addReference(stAccId, QStringLiteral("https://www.pinterest.com/pin/9003/"), QStringLiteral("Failed 4x on 1 Product Only"), spyImgPath);
+                        const QString humanRejectedRef = stStore.addReference(stAccId, QStringLiteral("https://www.pinterest.com/pin/9004/"), QStringLiteral("Human Rejected Pin"), spyImgPath);
+                        stStore.review({winRef, badTwoProdRef, badOneProdRef}, QStringLiteral("approved"), QStringLiteral("Initial approve"));
+                        stStore.review({humanRejectedRef}, QStringLiteral("rejected"), QStringLiteral("Human rejected"));
+
+                        TreeProperties stProps(stWork.filePath("props.json"));
+                        TreeProperties stArch(stWork.filePath("arch.json"));
+                        TableVideos stVideos(stWork.path());
+                        TableGenerationSettings stSettings(stWork.path());
+                        PreferredHashtags stTags(stWork.path());
+                        PromptLessons stLessons(stWork.path());
+                        FavoriteHooks stHooks(stWork.path());
+                        FavoriteVideoPrompts stFavP(stWork.path());
+                        SavedPrompts stSaved(stWork.path());
+
+                        PaneResearch stResearch(&stAccounts, &stStore, {&swapCli});
+                        PaneGeneration stGen(&stProps, &stArch, &stVideos, &stSettings, &stTags, &stLessons, &stHooks, &stFavP, &stSaved);
+                        stGen.setAvailableClis({&swapCli});
+                        TableProjects *stProjects = stGen.projectsModel();
+                        const int pRowA = stProjects->addProject(spyImgPath, {}, QStringLiteral("heels"), {});
+                        const int pRowB = stProjects->addProject(spyImgPath, {}, QStringLiteral("mules"), {});
+
+                        const auto addPublishedPostForSync = [&](int projRow, const QString &prodId, const QString &refId,
+                                                                 const QString &postUrl, qint64 views) {
+                            const QUuid vid = stVideos.addVideo({}, {}, QStringLiteral("auto_batch"), stProjects->projectId(projRow));
+                            const auto *vRec = stVideos.recordFromId(vid);
+                            const QDir gDir = stProjects->generationDir(projRow, vRec->shortCode, true);
+                            writeResearch(gDir.filePath("creative_dna.json"), QJsonDocument(QJsonObject{
+                                {QStringLiteral("referenceId"), refId},
+                                {QStringLiteral("productId"), prodId},
+                                {QStringLiteral("strategy"), QStringLiteral("reference_swap")},
+                                {QStringLiteral("format"), QStringLiteral("video")}
+                            }).toJson());
+                            AbstractSocialAccount::AccountPostStatistics ap;
+                            ap.postUrl = postUrl;
+                            ap.shortCode = vRec->shortCode;
+                            ap.caption = QStringLiteral("Evening heels look #heels ") + vRec->shortCode;
+                            ap.publishDate = QDateTime::currentDateTimeUtc();
+                            ap.stats.views = views;
+                            ap.stats.likes = views / 15;
+                            ap.stats.comments = 2;
+                            ap.stats.shares = views / 50;
+                            mockStatsPlatform.mockedPosts.append(ap);
+                        };
+
+                        // 1 winner (3,000 views), 4 flops across 2 products for badTwoProdRef, 4 flops on 1 product for badOneProdRef
+                        addPublishedPostForSync(pRowA, QStringLiteral("st-prod-a"), winRef, QStringLiteral("https://mock.social/@pradize/video/1"), 3000);
+                        addPublishedPostForSync(pRowA, QStringLiteral("st-prod-a"), badTwoProdRef, QStringLiteral("https://mock.social/@pradize/video/2"), 45);
+                        addPublishedPostForSync(pRowA, QStringLiteral("st-prod-a"), badTwoProdRef, QStringLiteral("https://mock.social/@pradize/video/3"), 55);
+                        addPublishedPostForSync(pRowB, QStringLiteral("st-prod-b"), badTwoProdRef, QStringLiteral("https://mock.social/@pradize/video/4"), 40);
+                        addPublishedPostForSync(pRowB, QStringLiteral("st-prod-b"), badTwoProdRef, QStringLiteral("https://mock.social/@pradize/video/5"), 50);
+
+                        addPublishedPostForSync(pRowA, QStringLiteral("st-prod-a"), badOneProdRef, QStringLiteral("https://mock.social/@pradize/video/6"), 48);
+                        addPublishedPostForSync(pRowA, QStringLiteral("st-prod-a"), badOneProdRef, QStringLiteral("https://mock.social/@pradize/video/7"), 52);
+                        addPublishedPostForSync(pRowA, QStringLiteral("st-prod-a"), badOneProdRef, QStringLiteral("https://mock.social/@pradize/video/8"), 42);
+                        addPublishedPostForSync(pRowA, QStringLiteral("st-prod-a"), badOneProdRef, QStringLiteral("https://mock.social/@pradize/video/9"), 49);
+
+                        PanePublishing stPub(&stAccounts, stProjects, &stVideos, {&swapCli}, nullptr, &stTags, &stHooks);
+                        PaneWorkflow stWf(&stAccounts, &stStore, &stResearch, &stGen, &stPub, &stVideos, {&swapCli}, &stHooks, nullptr, &stTags);
+
+                        // 1) Startup check when NEVER retrieved yet -> must run statistics retrieval automatically
+                        //    and auto-discard ONLY badTwoProdRef ("auto_discarded", actor="auto_stats")!
+                        requireResearch(SocialStatistics::isStatisticsRetrievalDue(&stAccounts),
+                                        "Statistics retrieval is due on fresh workspace before first sync");
+                        stWf.scheduleStartupStatisticsCheck(15);
+                        QElapsedTimer stWait;
+                        stWait.start();
+                        while (mockStatsPlatform.accountVideoFetchCalls < 1 && stWait.elapsed() < 10000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(15);
+                        }
+                        // Wait for coroutine completion & social_stats_sync_state.json write
+                        stWait.restart();
+                        while (!QFileInfo::exists(SocialStatistics::statsSyncStateFilePath()) && stWait.elapsed() < 10000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(15);
+                        }
+                        QApplication::processEvents();
+
+                        requireResearch(mockStatsPlatform.accountVideoFetchCalls == 1
+                                            && !SocialStatistics::isStatisticsRetrievalDue(&stAccounts)
+                                            && stStore.reference(badTwoProdRef).value("status").toString() == QLatin1String("auto_discarded")
+                                            && stStore.reference(badTwoProdRef).value("history").toArray().last().toObject().value("actor").toString() == QLatin1String("auto_stats")
+                                            && stStore.reference(badOneProdRef).value("status").toString() == QLatin1String("approved")
+                                            && stStore.reference(humanRejectedRef).value("status").toString() == QLatin1String("rejected")
+                                            && stStore.reference(winRef).value("status").toString() == QLatin1String("approved"),
+                                        "Startup check retrieves stats, persists social_stats_sync_state.json, auto-discards 4-flop/2-product source as auto_discarded, spares 1-product source, and preserves human rejected");
+
+                        // 2) Startup check when synced <12h ago -> must NOT re-run!
+                        stWf.scheduleStartupStatisticsCheck(15);
+                        {
+                            QElapsedTimer skipWait;
+                            skipWait.start();
+                            while (skipWait.elapsed() < 80)
+                            {
+                                QApplication::processEvents();
+                                QThread::msleep(15);
+                            }
+                        }
+                        requireResearch(mockStatsPlatform.accountVideoFetchCalls == 1,
+                                        "Startup statistics check skips retrieval when synced <12 hours ago");
+
+                        // 3) Age social_stats_sync_state.json to 13 hours ago -> verify continuous workflow check runs it!
+                        writeResearch(SocialStatistics::statsSyncStateFilePath(), QJsonDocument(QJsonObject{
+                            {QStringLiteral("schemaVersion"), 1},
+                            {QStringLiteral("lastRetrievedAt"), QDateTime::currentDateTimeUtc().addSecs(-13 * 3600).toString(Qt::ISODate)},
+                            {QStringLiteral("autoDiscardedReferences"), 1}
+                        }).toJson(QJsonDocument::Indented));
+                        requireResearch(SocialStatistics::isStatisticsRetrievalDue(&stAccounts)
+                                            && stWf.runPeriodicOrStartupStatsCheckIfDue(),
+                                        "Continuous workflow detects >=12h stale statistics and triggers automatic background retrieval");
+                        stWait.restart();
+                        while (mockStatsPlatform.accountVideoFetchCalls < 2 && stWait.elapsed() < 10000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(15);
+                        }
+                        // Wait for sync coroutine to finish writing fresh timestamp
+                        stWait.restart();
+                        while (SocialStatistics::isStatisticsRetrievalDue(&stAccounts) && stWait.elapsed() < 10000)
+                        {
+                            QApplication::processEvents();
+                            QThread::msleep(15);
+                        }
+                        requireResearch(mockStatsPlatform.accountVideoFetchCalls == 2
+                                            && !SocialStatistics::isStatisticsRetrievalDue(&stAccounts),
+                                        "Continuous workflow completes >=12h statistics retrieval and refreshes sync state");
+
+                        // 4) Seasonal & footwear-weather coherence checks (Summer vs Winter + Auto-Batch pre-filter & visual clash fallback):
+                        {
+                            const QDate julyDate(2026, 7, 15);
+                            const QDate decDate(2026, 12, 15);
+                            QString why;
+
+                            // Summer: boots in snowy street -> clash; gold sandals on sunlit terrace -> ok
+                            requireResearch(InspirationAdaptationMethod::hasTextSeasonalClash(
+                                                QStringLiteral("Walking through snowy street in winter parka"),
+                                                QStringLiteral("Black Leather Ankle Boots"), julyDate, &why),
+                                            "Summer date rejects snowy winter street scene");
+                            requireResearch(!InspirationAdaptationMethod::hasTextSeasonalClash(
+                                                QStringLiteral("Golden hour sunlit café terrace"),
+                                                QStringLiteral("Gold Strappy Open-Toe Sandals"), julyDate, &why),
+                                            "Summer date allows strappy sandals on sunlit terrace");
+
+                            // Winter: open-toe sandals in snow -> clash; beach poolside in Dec -> clash; sandals in indoor marble lobby -> ok!
+                            requireResearch(InspirationAdaptationMethod::hasTextSeasonalClash(
+                                                QStringLiteral("Snowfall street walk"),
+                                                QStringLiteral("Gold Strappy Open-Toe Sandals"), decDate, &why),
+                                            "Winter date rejects open-toe summer sandals in snow");
+                            requireResearch(InspirationAdaptationMethod::hasTextSeasonalClash(
+                                                QStringLiteral("Tropical palm beach poolside bikini"),
+                                                QStringLiteral("Velvet Stiletto Pumps"), decDate, &why),
+                                            "Winter date rejects tropical beach poolside scene");
+                            requireResearch(!InspirationAdaptationMethod::hasTextSeasonalClash(
+                                                QStringLiteral("Warm candlelit marble hotel lobby"),
+                                                QStringLiteral("Gold Strappy Open-Toe Sandals"), decDate, &why),
+                                            "Winter date allows open-toe evening sandals in warm indoor hotel lobby");
+                            const QString winterSandalRule = InspirationAdaptationMethod::seasonalGuardrailInstruction(
+                                QStringLiteral("Gold Strappy Open-Toe Sandals"), decDate);
+                            requireResearch(winterSandalRule.contains("INDOOR") && winterSandalRule.contains("NEVER outdoors in snow"),
+                                            "Winter sandal guardrail explicitly mandates indoor luxury styling and forbids snow");
+
+                            // End-to-end Auto-Batch in December with open-toe sandals + 1 text-snowy ref + 1 visual-snowy ref
+                            // + 1 clashing snowy property value + 1 indoor lobby property value:
+                            qputenv("QS_CURRENT_DATE_OVERRIDE", "2026-12-15");
+                            TreeProperties seasProps(stWork.filePath("seas_props.json"));
+                            const QModelIndex settingProp = seasProps.addProperty(QStringLiteral("Setting"));
+                            const QModelIndex snowValIdx = seasProps.addValue(
+                                settingProp, QStringLiteral("Snowy Street"), QStringLiteral("walking outdoors on a snowy street in a puffer coat"));
+                            const QModelIndex lobbyValIdx = seasProps.addValue(
+                                settingProp, QStringLiteral("Marble Lobby"), QStringLiteral("inside a warm candlelit marble hotel lobby"));
+                            const QUuid snowValUuid = snowValIdx.data(TreeProperties::RoleId).toUuid();
+                            const QUuid lobbyValUuid = lobbyValIdx.data(TreeProperties::RoleId).toUuid();
+
+                            TreeProperties seasArch(stWork.filePath("seas_arch.json"));
+                            TableVideos seasVideos(stWork.path());
+                            PaneGeneration seasGen(&seasProps, &seasArch, &seasVideos, &stSettings, &stTags, &stLessons, &stHooks, &stFavP, &stSaved);
+                            seasGen.setAvailableClis({&swapCli});
+
+                            const QJsonObject seasSpec{
+                                {QStringLiteral("accountId"), stAccId},
+                                {QStringLiteral("accountLabel"), QStringLiteral("MockStatsSocial · @pradize")},
+                                {QStringLiteral("profile"), QJsonObject{
+                                    {QStringLiteral("brands"), QJsonArray{QStringLiteral("Pradize")}},
+                                    {QStringLiteral("categories"), QJsonArray{QStringLiteral("Sandals")}}
+                                }},
+                                {QStringLiteral("products"), QJsonArray{
+                                    QJsonObject{
+                                        {QStringLiteral("id"), QStringLiteral("seas-sandal-1")},
+                                        {QStringLiteral("title"), QStringLiteral("Pradize Gold Strappy Open-Toe Sandals")},
+                                        {QStringLiteral("color"), QStringLiteral("Gold")},
+                                        {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                                        {QStringLiteral("categories"), QJsonArray{QStringLiteral("Sandals")}},
+                                        {QStringLiteral("localImage"), spyImgPath}
+                                    }
+                                }},
+                                {QStringLiteral("approvedReferences"), QJsonArray{
+                                    QJsonObject{
+                                        {QStringLiteral("reference"), QJsonObject{
+                                            {QStringLiteral("id"), QStringLiteral("ref-snow-text")},
+                                            {QStringLiteral("accountId"), stAccId},
+                                            {QStringLiteral("status"), QStringLiteral("approved")},
+                                            {QStringLiteral("title"), QStringLiteral("Winter Snowfall Street Walk")},
+                                            {QStringLiteral("url"), QStringLiteral("https://www.pinterest.com/pin/9101/")}
+                                        }},
+                                        {QStringLiteral("mediaPath"), spyImgPath}
+                                    },
+                                    QJsonObject{
+                                        {QStringLiteral("reference"), QJsonObject{
+                                            {QStringLiteral("id"), QStringLiteral("ref-snow-visual")},
+                                            {QStringLiteral("accountId"), stAccId},
+                                            {QStringLiteral("status"), QStringLiteral("approved")},
+                                            {QStringLiteral("title"), QStringLiteral("UnlabeledVisualSnowRef")},
+                                            {QStringLiteral("url"), QStringLiteral("https://www.pinterest.com/pin/9102/")}
+                                        }},
+                                        {QStringLiteral("mediaPath"), spyImgPath}
+                                    }
+                                }},
+                                {QStringLiteral("generationsPerProduct"), 1},
+                                {QStringLiteral("includeImage"), true},
+                                {QStringLiteral("includeCarousel"), false},
+                                {QStringLiteral("includeVideo"), false},
+                                {QStringLiteral("suppressModalProgressDialog"), true}
+                            };
+
+                            QStringList seasProgressLines;
+                            QObject::connect(&seasGen, &PaneGeneration::autoBatchProgress,
+                                             [&seasProgressLines](int, int, const QString &msg) {
+                                seasProgressLines << msg;
+                            });
+                            const int beforeSeasRows = seasVideos.rowCount();
+                            requireResearch(seasGen.startAutoBatch(seasSpec), "start seasonal guardrail Auto-Batch");
+                            stWait.restart();
+                            while (seasGen.isAutoBatchRunning() && stWait.elapsed() < 20000)
+                            {
+                                QApplication::processEvents();
+                                QThread::msleep(15);
+                            }
+                            qunsetenv("QS_CURRENT_DATE_OVERRIDE");
+
+                            const QString joinedSeasLogs = seasProgressLines.join(QLatin1Char('\n'));
+                            requireResearch(seasVideos.rowCount() == beforeSeasRows + 1
+                                                && joinedSeasLogs.contains("Skipping seasonally incompatible")
+                                                && joinedSeasLogs.contains("Visual seasonal/weather clash in reference"),
+                                            "Auto-Batch skips text-clashing snow reference AND switches away from visually-clashing snow reference");
+
+                            const auto *seasRec = seasVideos.recordAt(seasVideos.rowCount() - 1);
+                            const int seasProjRow = seasGen.projectsModel()->rowOfId(seasRec->projectId);
+                            const QDir seasGenDir = seasGen.projectsModel()->generationDir(seasProjRow, seasRec->shortCode, false);
+                            const QJsonObject seasDna = QJsonDocument::fromJson(
+                                readResearch(seasGenDir.filePath("creative_dna.json"))).object();
+                            QStringList keptPropStrs;
+                            for (const QJsonValue &pv : seasDna.value("propertyValueIds").toArray())
+                            {
+                                keptPropStrs << pv.toString();
+                            }
+                            requireResearch(seasDna.value("referenceId").toString().isEmpty()
+                                                && seasDna.value("strategy").toString() == QLatin1String("editorial_ab")
+                                                && !keptPropStrs.contains(snowValUuid.toString(QUuid::WithoutBraces))
+                                                && (keptPropStrs.isEmpty() || keptPropStrs.contains(lobbyValUuid.toString(QUuid::WithoutBraces))),
+                                            "Visual clash fallback clears clashing referenceId, switches to editorial_ab, and excludes snowy property value for sandals");
+                        }
+                    }
+
+                    // Multi-Product Window-Capped Recurring Generation ("50 planned, max N per 6h window")
+                    // + Round-Robin Product Diversity + Mid-Window Crash Recovery + Full-Pass Wrap-Around:
+                    {
+                        QTemporaryDir wcTmp;
+                        const QDir wcWork(wcTmp.path());
+                        WorkingDirectoryManager::instance()->setWorkingDir(wcWork);
+                        SocialStatistics::recordStatisticsRetrievalCompleted(0);
+
+                        TableAccounts wcAccounts(wcWork.path());
+                        wcAccounts.addAccount();
+                        wcAccounts.setData(wcAccounts.index(0, TableAccounts::IND_TYPE), QStringLiteral("TikTok"));
+                        wcAccounts.setData(wcAccounts.index(0, TableAccounts::IND_URL), QStringLiteral("https://www.tiktok.com/@pradize.high.heel"));
+                        const QString wcAccId = wcAccounts.accountId(0).toString(QUuid::WithoutBraces);
+
+                        ResearchStore wcStore(wcWork.path());
+                        requireResearch(wcStore.setProfile(wcAccId, QJsonObject{
+                            {QStringLiteral("brands"), QJsonArray{QStringLiteral("Pradize")}},
+                            {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}}
+                        }), "configure window-cap profile");
+
+                        QJsonArray wcProducts;
+                        for (int i = 1; i <= 5; ++i)
+                        {
+                            wcProducts.append(QJsonObject{
+                                {QStringLiteral("id"), QStringLiteral("wc-prod-%1").arg(i)},
+                                {QStringLiteral("asin"), QStringLiteral("B0WCPROD0%1").arg(i)},
+                                {QStringLiteral("title"), QStringLiteral("Pradize Evening Heel Style %1").arg(i)},
+                                {QStringLiteral("color"), QStringLiteral("Color%1").arg(i)},
+                                {QStringLiteral("brand"), QStringLiteral("Pradize")},
+                                {QStringLiteral("categories"), QJsonArray{QStringLiteral("Heels")}},
+                                {QStringLiteral("sizingFolder"), QStringLiteral("APlus")},
+                                {QStringLiteral("localImage"), spyImgPath}
+                            });
+                        }
+                        requireResearch(wcStore.replaceProducts(wcProducts, wcWork.path()),
+                                        "seed 5 products for window-capped recurring workflow");
+
+                        TreeProperties wcProps(wcWork.filePath("props.json"));
+                        TreeProperties wcArch(wcWork.filePath("arch.json"));
+                        TableGenerationSettings wcSettings(wcWork.path());
+                        PreferredHashtags wcHashtags(wcWork.path());
+                        PromptLessons wcLessons(wcWork.path());
+                        FavoriteHooks wcHooks(wcWork.path());
+                        FavoriteVideoPrompts wcFavPrompts(wcWork.path());
+                        SavedPrompts wcSaved(wcWork.path());
+
+                        // Window #1: 5 products × 2 per format × 1 format (Image) = 10 creatives total,
+                        // Repeat every 6h, Max 3 per window -> generates 3 DIFFERENT products (wc-prod-1..3)!
+                        {
+                            TableVideos wcVideos(wcWork.path());
+                            PaneResearch wcRes(&wcAccounts, &wcStore, {&swapCli});
+                            PaneGeneration wcGen(&wcProps, &wcArch, &wcVideos, &wcSettings, &wcHashtags,
+                                                 &wcLessons, &wcHooks, &wcFavPrompts, &wcSaved);
+                            wcGen.setAvailableClis({&swapCli});
+                            PanePublishing wcPub(&wcAccounts, wcGen.projectsModel(), &wcVideos, {&swapCli}, nullptr, &wcHashtags, &wcHooks);
+                            PaneWorkflow wcWf(&wcAccounts, &wcStore, &wcRes, &wcGen, &wcPub, &wcVideos, {&swapCli}, &wcHooks, nullptr, &wcHashtags);
+                            wcWf.show();
+                            QApplication::processEvents();
+
+                            auto *chkVid = wcWf.findChild<QCheckBox *>("checkWorkflowFormatVideo");
+                            auto *chkCar = wcWf.findChild<QCheckBox *>("checkWorkflowFormatCarousel");
+                            auto *chkImg = wcWf.findChild<QCheckBox *>("checkWorkflowFormatImage");
+                            auto *spinPerProd = wcWf.findChild<QSpinBox *>("spinWorkflowGenPerProduct");
+                            auto *chkRepeat = wcWf.findChild<QCheckBox *>("checkWorkflowRepeatEveryHours");
+                            auto *spinRepeat = wcWf.findChild<QSpinBox *>("spinWorkflowRepeatHours");
+                            auto *spinMaxWin = wcWf.findChild<QSpinBox *>("spinWorkflowMaxPerWindow");
+                            auto *btnCheckAll = wcWf.findChild<QPushButton *>("buttonWorkflowCheckAllProducts");
+                            auto *lblSelected = wcWf.findChild<QLabel *>("labelWorkflowSelectedProducts");
+                            auto *btnGen = wcWf.findChild<QPushButton *>("buttonWorkflowGenerate");
+                            auto *btnStep1 = wcWf.findChild<QPushButton *>("buttonWorkflowStep1");
+                            requireResearch(spinMaxWin != nullptr, "Step 1B exposes spinWorkflowMaxPerWindow control");
+
+                            chkVid->setChecked(false);
+                            chkCar->setChecked(false);
+                            chkImg->setChecked(true);
+                            spinPerProd->setValue(2);
+                            chkRepeat->setChecked(true);
+                            spinRepeat->setValue(6);
+                            spinMaxWin->setValue(3);
+                            btnCheckAll->click();
+                            QApplication::processEvents();
+
+                            requireResearch(lblSelected->text().contains("= 10 creative(s) total")
+                                                && lblSelected->text().contains("capped at 3 per 6h window (4 windows/pass)")
+                                                && btnGen->text().contains("Generate 3 Now (of 10)")
+                                                && btnGen->text().contains("Every 6h"),
+                                            "Step 1 summary & Generate button show 10 total creatives capped at 3 per 6h window");
+
+                            btnGen->click();
+                            QElapsedTimer wcWait;
+                            wcWait.start();
+                            while (wcGen.isAutoBatchRunning() && wcWait.elapsed() < 30000)
+                            {
+                                QApplication::processEvents();
+                                QThread::msleep(20);
+                            }
+                            QApplication::processEvents();
+
+                            requireResearch(wcVideos.rowCount() == 3,
+                                            "Window #1 stops cleanly at maxPerWindow=3 creatives (not all 10)");
+                            QSet<QString> win1ProductIds;
+                            for (int r = 0; r < wcVideos.rowCount(); ++r)
+                            {
+                                const auto *rec = wcVideos.recordAt(r);
+                                const int pRow = wcGen.projectsModel()->rowOfId(rec->projectId);
+                                const QDir gDir = wcGen.projectsModel()->generationDir(pRow, rec->shortCode, false);
+                                const QJsonObject dna = QJsonDocument::fromJson(readResearch(gDir.filePath("creative_dna.json"))).object();
+                                win1ProductIds.insert(dna.value("productId").toString());
+                            }
+                            requireResearch(win1ProductIds == QSet<QString>({
+                                                QStringLiteral("wc-prod-1"),
+                                                QStringLiteral("wc-prod-2"),
+                                                QStringLiteral("wc-prod-3")}),
+                                            "Window #1 round-robins across 3 distinct products instead of exhausting product #1 first");
+
+                            const QJsonObject dState1 = QJsonDocument::fromJson(
+                                readResearch(wcWf.generationDaemonStatePath())).object();
+                            requireResearch(dState1.value("active").toBool()
+                                                && dState1.value("maxPerWindow").toInt() == 3
+                                                && dState1.value("passTotal").toInt() == 10
+                                                && dState1.value("nextProductIndex").toInt() == 3
+                                                && dState1.value("nextSlotIndex").toInt() == 0
+                                                && dState1.value("passesCompleted").toInt() == 0
+                                                && btnStep1 && btnStep1->text().contains("3/10"),
+                                            "Window #1 persists exact cursor (3/10, nextProductIndex=3) and Step 1 badge shows 3/10");
+                            wcWf.close();
+                        }
+
+                        // Window #2: Fast-forward nextCycleUtc to past and restart -> generates next 3 creatives
+                        // (wc-prod-4, wc-prod-5 from Round 1, plus wc-prod-1 from Round 2 -> 6/10 total)!
+                        {
+                            const QString dPath = wcWork.filePath("workflow_generation_daemon.json");
+                            QJsonObject dObj = QJsonDocument::fromJson(readResearch(dPath)).object();
+                            dObj.insert("nextCycleUtc", QDateTime::currentDateTimeUtc().addSecs(-60).toString(Qt::ISODate));
+                            writeResearch(dPath, QJsonDocument(dObj).toJson(QJsonDocument::Indented));
+
+                            TableVideos wcVideos2(wcWork.path());
+                            PaneResearch wcRes2(&wcAccounts, &wcStore, {&swapCli});
+                            PaneGeneration wcGen2(&wcProps, &wcArch, &wcVideos2, &wcSettings, &wcHashtags,
+                                                  &wcLessons, &wcHooks, &wcFavPrompts, &wcSaved);
+                            wcGen2.setAvailableClis({&swapCli});
+                            PanePublishing wcPub2(&wcAccounts, wcGen2.projectsModel(), &wcVideos2, {&swapCli}, nullptr, &wcHashtags, &wcHooks);
+                            PaneWorkflow wcWf2(&wcAccounts, &wcStore, &wcRes2, &wcGen2, &wcPub2, &wcVideos2, {&swapCli}, &wcHooks, nullptr, &wcHashtags);
+
+                            QElapsedTimer wcWait2;
+                            wcWait2.start();
+                            while ((wcVideos2.rowCount() < 6 || wcGen2.isAutoBatchRunning()) && wcWait2.elapsed() < 30000)
+                            {
+                                QApplication::processEvents();
+                                QThread::msleep(25);
+                            }
+                            QApplication::processEvents();
+
+                            const QJsonObject dState2 = QJsonDocument::fromJson(readResearch(dPath)).object();
+                            QSet<QString> allProductIdsAfterWin2;
+                            for (int r = 0; r < wcVideos2.rowCount(); ++r)
+                            {
+                                const auto *rec = wcVideos2.recordAt(r);
+                                const int pRow = wcGen2.projectsModel()->rowOfId(rec->projectId);
+                                const QDir gDir = wcGen2.projectsModel()->generationDir(pRow, rec->shortCode, false);
+                                const QJsonObject dna = QJsonDocument::fromJson(readResearch(gDir.filePath("creative_dna.json"))).object();
+                                allProductIdsAfterWin2.insert(dna.value("productId").toString());
+                            }
+                            requireResearch(wcVideos2.rowCount() == 6
+                                                && allProductIdsAfterWin2.size() == 5
+                                                && dState2.value("cyclesCompleted").toInt() == 2
+                                                && dState2.value("nextProductIndex").toInt() == 6
+                                                && dState2.value("passesCompleted").toInt() == 0,
+                                            "Window #2 generates slots 4..6 (covering all 5 products + starting Round 2) and advances cursor to 6/10");
+                            wcWf2.close();
+                        }
+
+                        // Window #3 Mid-Window Crash Recovery + Window #4 Pass Wrap-Around:
+                        // Simulate Window #3 crashing after 1 of 3 creatives (at index 7, remaining=2),
+                        // verify crash recovery generates ONLY the remaining 2 creatives (reaching 8 new -> wait: 6 + 1 simulated?
+                        // Let's seed paused_auto_batch.json at index 7 with completedCreatives=1, maxCreativesThisRun=2 -> generates 2 creatives (indices 7 & 8), advancing cursor to 9/10)!
+                        {
+                            const QString dPath = wcWork.filePath("workflow_generation_daemon.json");
+                            const QJsonObject dObj = QJsonDocument::fromJson(readResearch(dPath)).object();
+                            QJsonObject interruptedSpec = dObj.value("batchSpec").toObject();
+                            interruptedSpec.insert("maxCreativesThisRun", 2);
+                            const QJsonObject crashWin3{
+                                {QStringLiteral("schemaVersion"), 1},
+                                {QStringLiteral("inFlight"), true},
+                                {QStringLiteral("batchSpec"), interruptedSpec},
+                                {QStringLiteral("nextProductIndex"), 7},
+                                {QStringLiteral("nextSlotIndex"), 0},
+                                {QStringLiteral("completedCreatives"), 1},
+                                {QStringLiteral("totalCreatives"), 3},
+                                {QStringLiteral("limitReason"), QStringLiteral("Interrupted by application exit/crash — ready to resume.")},
+                                {QStringLiteral("pausedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
+                            };
+                            writeResearch(wcWork.filePath("paused_auto_batch.json"),
+                                          QJsonDocument(crashWin3).toJson(QJsonDocument::Indented));
+
+                            TableVideos wcVideos3(wcWork.path());
+                            PaneResearch wcRes3(&wcAccounts, &wcStore, {&swapCli});
+                            PaneGeneration wcGen3(&wcProps, &wcArch, &wcVideos3, &wcSettings, &wcHashtags,
+                                                  &wcLessons, &wcHooks, &wcFavPrompts, &wcSaved);
+                            wcGen3.setAvailableClis({&swapCli});
+                            requireResearch(wcGen3.pausedAutoBatchRemaining() == 2,
+                                            "Mid-window crash checkpoint reports exact remaining window slots (2, not full campaign)");
+
+                            PanePublishing wcPub3(&wcAccounts, wcGen3.projectsModel(), &wcVideos3, {&swapCli}, nullptr, &wcHashtags, &wcHooks);
+                            PaneWorkflow wcWf3(&wcAccounts, &wcStore, &wcRes3, &wcGen3, &wcPub3, &wcVideos3, {&swapCli}, &wcHooks, nullptr, &wcHashtags);
+
+                            QElapsedTimer wcWait3;
+                            wcWait3.start();
+                            while ((wcGen3.hasPausedAutoBatch() || wcGen3.isAutoBatchRunning()) && wcWait3.elapsed() < 30000)
+                            {
+                                QApplication::processEvents();
+                                QThread::msleep(25);
+                            }
+                            QApplication::processEvents();
+
+                            const QJsonObject dState3 = QJsonDocument::fromJson(readResearch(dPath)).object();
+                            requireResearch(wcVideos3.rowCount() == 8
+                                                && dState3.value("nextProductIndex").toInt() == 9
+                                                && dState3.value("passesCompleted").toInt() == 0,
+                                            "Mid-window crash recovery finishes ONLY the remaining 2 creatives of Window #3 and advances cursor to 9/10");
+                            wcWf3.close();
+                        }
+
+                        // Window #4: Only 1 creative remains in Pass #1 (index 9 of 10) -> generates 1 creative,
+                        // increments passesCompleted=1, and wraps cursor back to (0, 0) for Pass #2!
+                        {
+                            const QString dPath = wcWork.filePath("workflow_generation_daemon.json");
+                            QJsonObject dObj = QJsonDocument::fromJson(readResearch(dPath)).object();
+                            dObj.insert("nextCycleUtc", QDateTime::currentDateTimeUtc().addSecs(-60).toString(Qt::ISODate));
+                            writeResearch(dPath, QJsonDocument(dObj).toJson(QJsonDocument::Indented));
+
+                            TableVideos wcVideos4(wcWork.path());
+                            PaneResearch wcRes4(&wcAccounts, &wcStore, {&swapCli});
+                            PaneGeneration wcGen4(&wcProps, &wcArch, &wcVideos4, &wcSettings, &wcHashtags,
+                                                  &wcLessons, &wcHooks, &wcFavPrompts, &wcSaved);
+                            wcGen4.setAvailableClis({&swapCli});
+                            PanePublishing wcPub4(&wcAccounts, wcGen4.projectsModel(), &wcVideos4, {&swapCli}, nullptr, &wcHashtags, &wcHooks);
+                            PaneWorkflow wcWf4(&wcAccounts, &wcStore, &wcRes4, &wcGen4, &wcPub4, &wcVideos4, {&swapCli}, &wcHooks, nullptr, &wcHashtags);
+
+                            QElapsedTimer wcWait4;
+                            wcWait4.start();
+                            while ((wcVideos4.rowCount() < 9 || wcGen4.isAutoBatchRunning()) && wcWait4.elapsed() < 30000)
+                            {
+                                QApplication::processEvents();
+                                QThread::msleep(25);
+                            }
+                            QApplication::processEvents();
+
+                            const QJsonObject dState4 = QJsonDocument::fromJson(readResearch(dPath)).object();
+                            requireResearch(wcVideos4.rowCount() == 9
+                                                && dState4.value("passesCompleted").toInt() == 1
+                                                && dState4.value("nextProductIndex").toInt() == 0
+                                                && dState4.value("nextSlotIndex").toInt() == 0
+                                                && dState4.value("productOffset").toInt() == 1,
+                                            "Window #4 finishes final 1 creative of Pass #1, increments passesCompleted=1, and wraps cursor to (0,0) for Pass #2");
+                            wcWf4.stopGenerationWorkflow();
+                            wcWf4.close();
+                        }
+                    }
+                }
 
                 WorkingDirectoryManager::instance()->setWorkingDir(genWork);
             }

@@ -6,6 +6,7 @@
 
 #include "../WidgetCreativeReview.h"
 #include "AbstractCli.h"
+#include "../../../common/workingdirectory/WorkingDirectoryManager.h"
 #include "PaneGeneration.h"
 #include "PaneResearch.h"
 #include "model/FavoriteHooks.h"
@@ -58,6 +59,7 @@
 #include <QStackedWidget>
 #include <QTableWidget>
 #include <QTime>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -147,6 +149,24 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     m_headerSummaryLabel->setWordWrap(true);
     topContextRow->addWidget(m_headerSummaryLabel, 1);
 
+    m_btnStopGenerationTop = new QPushButton(tr("■ Stop Generation"), headerCard);
+    m_btnStopGenerationTop->setObjectName(QStringLiteral("buttonWorkflowStopGeneration"));
+    m_btnStopGenerationTop->setToolTip(
+        tr("Stop the active or recurring generation loop permanently (clears crash-resume and scheduled cycles)."));
+    m_btnStopGenerationTop->setStyleSheet(QStringLiteral(
+        "QPushButton { background: rgba(220, 38, 38, 0.24); border: 1px solid rgba(248, 113, 113, 0.55); "
+        "color: #fca5a5; font-weight: 700; padding: 4px 10px; border-radius: 5px; }"
+        "QPushButton:disabled { background: transparent; border: 1px solid rgba(128, 140, 165, 0.20); color: #6b7280; }"));
+
+    m_btnStopPublicationTop = new QPushButton(tr("■ Stop Publication"), headerCard);
+    m_btnStopPublicationTop->setObjectName(QStringLiteral("buttonWorkflowStopPublication"));
+    m_btnStopPublicationTop->setToolTip(
+        tr("Stop the active or armed publication queue permanently (cancels scheduled posts and disarms crash-resume)."));
+    m_btnStopPublicationTop->setStyleSheet(QStringLiteral(
+        "QPushButton { background: rgba(220, 38, 38, 0.24); border: 1px solid rgba(248, 113, 113, 0.55); "
+        "color: #fca5a5; font-weight: 700; padding: 4px 10px; border-radius: 5px; }"
+        "QPushButton:disabled { background: transparent; border: 1px solid rgba(128, 140, 165, 0.20); color: #6b7280; }"));
+
     m_btnSyncStats = new QPushButton(tr("↻ Sync Stats"), headerCard);
     m_btnSyncStats->setObjectName(QStringLiteral("buttonWorkflowSyncStats"));
     m_btnSyncStats->setToolTip(
@@ -160,6 +180,8 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     btnOpenResearch->setToolTip(tr("Switch to the Research tab to import products, edit account rules, or approve inspirations."));
     auto *btnOpenAccounts = new QPushButton(tr("Accounts…"), headerCard);
     btnOpenAccounts->setObjectName(QStringLiteral("buttonWorkflowOpenAccounts"));
+    topContextRow->addWidget(m_btnStopGenerationTop);
+    topContextRow->addWidget(m_btnStopPublicationTop);
     topContextRow->addWidget(m_btnSyncStats);
     topContextRow->addWidget(m_btnClearGeminiChats);
     topContextRow->addWidget(btnOpenResearch);
@@ -202,6 +224,12 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     m_stepStack->addWidget(_buildStep3Page());
     root->addWidget(m_stepStack, 1);
 
+    m_genDaemonTimer = new QTimer(this);
+    m_genDaemonTimer->setSingleShot(true);
+    connect(m_genDaemonTimer, &QTimer::timeout, this, &PaneWorkflow::_onGenerationDaemonTimerTick);
+
+    connect(m_btnStopGenerationTop, &QPushButton::clicked, this, &PaneWorkflow::stopGenerationWorkflow);
+    connect(m_btnStopPublicationTop, &QPushButton::clicked, this, &PaneWorkflow::stopPublicationWorkflow);
     connect(m_btnSyncStats, &QPushButton::clicked, this, &PaneWorkflow::syncAccountStatisticsNow);
     connect(m_btnClearGeminiChats, &QPushButton::clicked, this, &PaneWorkflow::openClearGeminiChatsDialog);
     connect(btnOpenResearch, &QPushButton::clicked, this, &PaneWorkflow::openResearchTabRequested);
@@ -231,6 +259,21 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
     if (m_store)
     {
         connect(m_store, &ResearchStore::changed, this, [this]() {
+            refreshStep1Products();
+            _updateHeaderAndStepBadges();
+        });
+    }
+    if (m_paneResearch)
+    {
+        connect(m_paneResearch, &PaneResearch::newlyImportedProductsChecked,
+                this, [this](const QStringList &productIds) {
+            for (const QString &pid : productIds)
+            {
+                if (!pid.trimmed().isEmpty())
+                {
+                    m_checkedProductIds.insert(pid.trimmed());
+                }
+            }
             refreshStep1Products();
             _updateHeaderAndStepBadges();
         });
@@ -280,20 +323,97 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
             m_genLogConsole->appendPlainText(
                 QTime::currentTime().toString(QStringLiteral("HH:mm:ss  ")) + msg);
         });
+        connect(m_paneGeneration, &PaneGeneration::creativeGenerated, this, [this](const QString &) {
+            if (m_step2Initialized)
+            {
+                refreshStep2Candidates(true);
+            }
+            _updateHeaderAndStepBadges();
+        });
         connect(m_paneGeneration, &PaneGeneration::autoBatchFinished, this,
                 [this](int completed, int total, bool cancelled, const QString &errorMsg) {
             m_btnCancelGen->setEnabled(false);
             m_btnCancelGen->setVisible(false);
             m_genProgressBar->setRange(0, qMax(1, total));
             m_genProgressBar->setValue(completed);
-            if (!errorMsg.isEmpty())
+
+            const bool hitLimitPause = !errorMsg.isEmpty() || (m_paneGeneration && m_paneGeneration->hasPausedAutoBatch());
+            if (m_genDaemonActive && !cancelled)
+            {
+                if (!hitLimitPause)
+                {
+                    ++m_genDaemonCyclesCompleted;
+                    const bool cappedMidPass = m_paneGeneration && m_paneGeneration->lastAutoBatchReachedWindowCap();
+                    if (cappedMidPass)
+                    {
+                        m_genDaemonNextProdIdx = m_paneGeneration->lastAutoBatchNextProductIndex();
+                        m_genDaemonNextSlotIdx = m_paneGeneration->lastAutoBatchNextSlotIndex();
+                    }
+                    else
+                    {
+                        ++m_genDaemonPassesCompleted;
+                        ++m_genDaemonProductOffset;
+                        m_genDaemonNextProdIdx = 0;
+                        m_genDaemonNextSlotIdx = 0;
+                    }
+                    m_genDaemonNextCycleUtc = QDateTime::currentDateTimeUtc().addSecs(
+                        qint64(qMax(1, m_genDaemonIntervalHours)) * 3600);
+                    const QString nextLocalStr = m_genDaemonNextCycleUtc.toLocalTime().toString(QStringLiteral("HH:mm"));
+                    if (m_genDaemonPassTotal > m_genDaemonMaxPerWindow && m_genDaemonMaxPerWindow > 0)
+                    {
+                        int fmtCnt = 0;
+                        if (m_genDaemonBatchSpec.value(QStringLiteral("includeImage")).toBool()) ++fmtCnt;
+                        if (m_genDaemonBatchSpec.value(QStringLiteral("includeCarousel")).toBool()) ++fmtCnt;
+                        if (m_genDaemonBatchSpec.value(QStringLiteral("includeVideo")).toBool()) ++fmtCnt;
+                        const int slotsPerEntry = qMax(1, m_genDaemonBatchSpec.value(QStringLiteral("generationsPerProduct")).toInt(1))
+                            * qMax(1, fmtCnt);
+                        const int doneInPass = cappedMidPass
+                            ? qBound(0, m_genDaemonNextProdIdx * slotsPerEntry + m_genDaemonNextSlotIdx, m_genDaemonPassTotal)
+                            : m_genDaemonPassTotal;
+                        const int passDisp = cappedMidPass ? (m_genDaemonPassesCompleted + 1) : m_genDaemonPassesCompleted;
+                        m_genStatusLabel->setText(
+                            tr("✓ Window #%1 finished (%2/%3 saved · %4/%5 in pass #%6) — next ≤%7 scheduled at %8 (or click Stop Generation).")
+                                .arg(m_genDaemonCyclesCompleted)
+                                .arg(completed)
+                                .arg(total)
+                                .arg(doneInPass)
+                                .arg(m_genDaemonPassTotal)
+                                .arg(qMax(1, passDisp))
+                                .arg(m_genDaemonMaxPerWindow)
+                                .arg(nextLocalStr));
+                    }
+                    else
+                    {
+                        m_genStatusLabel->setText(
+                            tr("✓ Cycle #%1 finished (%2/%3 saved) — next batch scheduled at %4 (or click Stop Generation).")
+                                .arg(m_genDaemonCyclesCompleted)
+                                .arg(completed)
+                                .arg(total)
+                                .arg(nextLocalStr));
+                    }
+                }
+                else
+                {
+                    // Limit/quota hit while recurring daemon is active: retry automatically at next interval (max 1h)
+                    const qint64 retrySecs = qMin<qint64>(qint64(qMax(1, m_genDaemonIntervalHours)) * 3600, 3600);
+                    m_genDaemonNextCycleUtc = QDateTime::currentDateTimeUtc().addSecs(retrySecs);
+                    m_genStatusLabel->setText(
+                        tr("⚠ Limit reached (%1/%2 saved) — auto-resuming at %3: %4")
+                            .arg(completed)
+                            .arg(total)
+                            .arg(m_genDaemonNextCycleUtc.toLocalTime().toString(QStringLiteral("HH:mm")), errorMsg));
+                }
+                _saveGenerationDaemonState();
+                _armGenerationDaemonTimer();
+            }
+            else if (!errorMsg.isEmpty())
             {
                 m_genStatusLabel->setText(tr("⚠ Limit reached (%1/%2 saved): %3")
                     .arg(completed).arg(total).arg(errorMsg));
             }
             else if (cancelled)
             {
-                m_genStatusLabel->setText(tr("Cancelled (%1/%2 creative(s) saved).").arg(completed).arg(total));
+                m_genStatusLabel->setText(tr("Stopped (%1/%2 creative(s) saved).").arg(completed).arg(total));
             }
             else
             {
@@ -303,12 +423,15 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
             _updateStep1SummaryAndButtons();
             _updateHeaderAndStepBadges();
 
-            const bool hitLimitPause = !errorMsg.isEmpty() || (m_paneGeneration && m_paneGeneration->hasPausedAutoBatch());
-            const bool shouldAdvance = m_triggeredBatchFromWorkflow && completed > 0 && !cancelled && !hitLimitPause;
+            const bool shouldAdvance = m_triggeredBatchFromWorkflow && completed > 0 && !cancelled && !hitLimitPause
+                && currentStep() == 0;
             m_triggeredBatchFromWorkflow = false;
+            if (completed > 0)
+            {
+                refreshStep2Candidates(m_step2Initialized);
+            }
             if (shouldAdvance)
             {
-                refreshStep2Candidates(false);
                 setCurrentStep(1);
             }
         });
@@ -322,12 +445,16 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
             }
         });
         connect(m_panePublishing, &PanePublishing::queueUpdated, this, [this]() {
+            if (m_step2Initialized && currentStep() == 1)
+            {
+                refreshStep2Candidates(true);
+            }
             _refreshStep3QueueTable();
             _updateStep3Buttons();
             _updateHeaderAndStepBadges();
         });
         connect(m_panePublishing, &PanePublishing::statusTextChanged, this, [this](const QString &txt) {
-            if (m_publishStatusLabel && m_panePublishing->isJobRunning())
+            if (m_publishStatusLabel && (m_panePublishing->isJobRunning() || m_panePublishing->isPublicationArmed()))
             {
                 m_publishStatusLabel->setText(txt);
             }
@@ -337,6 +464,7 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
             {
                 m_publishStatusLabel->setText(m_panePublishing->statusText());
             }
+            _armContinuousStatsTimer();
             _refreshStep3QueueTable();
             _updateStep3Buttons();
             _updateHeaderAndStepBadges();
@@ -345,6 +473,7 @@ PaneWorkflow::PaneWorkflow(TableAccounts *accounts,
 
     refreshAll();
     setCurrentStep(0);
+    QTimer::singleShot(50, this, &PaneWorkflow::restoreGenerationDaemon);
 }
 
 PaneWorkflow::~PaneWorkflow()
@@ -388,8 +517,25 @@ QWidget *PaneWorkflow::_buildStep1Page()
     m_btnCheckAllProducts->setObjectName(QStringLiteral("buttonWorkflowCheckAllProducts"));
     m_btnClearProducts = new QPushButton(tr("Clear"), leftBox);
     m_btnClearProducts->setObjectName(QStringLiteral("buttonWorkflowClearProducts"));
+    auto *btnRefreshCatalog = new QPushButton(tr("↻ Refresh"), leftBox);
+    btnRefreshCatalog->setObjectName(QStringLiteral("buttonWorkflowRefreshProducts"));
+    btnRefreshCatalog->setToolTip(
+        tr("Re-scan your AmazonTemplate3 directory for newly added A+ products "
+           "(displays a preview dialog with images if any new products are found)."));
+    connect(btnRefreshCatalog, &QPushButton::clicked, this, [this]() {
+        if (m_paneResearch && m_paneResearch->hasConfiguredProductDirectory())
+        {
+            _syncResearchAccountSelection();
+            m_paneResearch->importProducts();
+        }
+        else
+        {
+            emit openResearchTabRequested();
+        }
+    });
     filterRow->addWidget(m_btnCheckAllProducts);
     filterRow->addWidget(m_btnClearProducts);
+    filterRow->addWidget(btnRefreshCatalog);
     leftLayout->addLayout(filterRow);
 
     auto *listAndPreviewRow = new QHBoxLayout;
@@ -450,6 +596,42 @@ QWidget *PaneWorkflow::_buildStep1Page()
            "(e.g. 2 with Video + Carousel checked = 2 videos + 2 carousels per product)."));
     m_spinGenPerProduct->setValue(uiSettings.value(QStringLiteral("autoBatch/generationsPerProduct"), 2).toInt());
     form->addRow(tr("Generations per product (each format):"), m_spinGenPerProduct);
+
+    auto *repeatRow = new QHBoxLayout;
+    repeatRow->setContentsMargins(0, 0, 0, 0);
+    m_chkRepeatGeneration = new QCheckBox(tr("Repeat automatically every"), rightBox);
+    m_chkRepeatGeneration->setObjectName(QStringLiteral("checkWorkflowRepeatEveryHours"));
+    m_chkRepeatGeneration->setToolTip(
+        tr("Continuously generate a new window of creatives every N hours until you click \"Stop Generation\" "
+           "(automatically recovers and resumes after an app crash or restart)."));
+    m_chkRepeatGeneration->setChecked(uiSettings.value(QStringLiteral("autoBatch/repeatEveryHoursEnabled"), false).toBool());
+    m_spinRepeatHours = new QSpinBox(rightBox);
+    m_spinRepeatHours->setObjectName(QStringLiteral("spinWorkflowRepeatHours"));
+    m_spinRepeatHours->setRange(1, 168);
+    m_spinRepeatHours->setSuffix(tr(" hour(s)"));
+    m_spinRepeatHours->setValue(uiSettings.value(QStringLiteral("autoBatch/repeatIntervalHours"), 6).toInt());
+    m_spinRepeatHours->setEnabled(m_chkRepeatGeneration->isChecked());
+    auto *lblMaxCap = new QLabel(tr("· max"), rightBox);
+    m_spinMaxPerWindow = new QSpinBox(rightBox);
+    m_spinMaxPerWindow->setObjectName(QStringLiteral("spinWorkflowMaxPerWindow"));
+    m_spinMaxPerWindow->setRange(1, 500);
+    m_spinMaxPerWindow->setSuffix(tr(" / window"));
+    m_spinMaxPerWindow->setToolTip(
+        tr("Maximum creatives generated in each repetition window.\n"
+           "Example: select 25 products × 2 = 50 creatives total and set max 6 / window every 6 hours — "
+           "QuantumSocial will walk across all selected products 6 at a time every 6 hours, then wrap around."));
+    m_spinMaxPerWindow->setValue(qMax(1, uiSettings.value(QStringLiteral("autoBatch/maxCreativesPerWindow"), 6).toInt()));
+    m_spinMaxPerWindow->setEnabled(m_chkRepeatGeneration->isChecked());
+    lblMaxCap->setEnabled(m_chkRepeatGeneration->isChecked());
+    connect(m_chkRepeatGeneration, &QCheckBox::toggled, m_spinRepeatHours, &QWidget::setEnabled);
+    connect(m_chkRepeatGeneration, &QCheckBox::toggled, m_spinMaxPerWindow, &QWidget::setEnabled);
+    connect(m_chkRepeatGeneration, &QCheckBox::toggled, lblMaxCap, &QWidget::setEnabled);
+    repeatRow->addWidget(m_chkRepeatGeneration);
+    repeatRow->addWidget(m_spinRepeatHours);
+    repeatRow->addWidget(lblMaxCap);
+    repeatRow->addWidget(m_spinMaxPerWindow);
+    repeatRow->addStretch();
+    form->addRow(tr("Recurring schedule:"), repeatRow);
 
     m_comboPromptCli = new QComboBox(rightBox);
     m_comboPromptCli->setObjectName(QStringLiteral("comboWorkflowPromptCli"));
@@ -695,7 +877,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
         }
         else
         {
-            _updateStep1SummaryAndButtons();
+            _updateHeaderAndStepBadges();
         }
     });
     connect(m_btnClearProducts, &QPushButton::clicked, this, [this]() {
@@ -712,7 +894,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
         }
         else
         {
-            _updateStep1SummaryAndButtons();
+            _updateHeaderAndStepBadges();
         }
     });
     connect(m_productList, &QListWidget::itemChanged, this, [this](QListWidgetItem *it) {
@@ -729,7 +911,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
         {
             m_checkedProductIds.remove(pid);
         }
-        _updateStep1SummaryAndButtons();
+        _updateHeaderAndStepBadges();
     });
     connect(m_productList, &QListWidget::currentRowChanged, this, [this](int) {
         _updateStep1ProductPreview();
@@ -769,6 +951,36 @@ QWidget *PaneWorkflow::_buildStep1Page()
     connect(m_chkFormatVideo, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
     connect(m_chkFormatCarousel, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
     connect(m_chkFormatImage, &QCheckBox::toggled, this, [this](bool) { _updateStep1SummaryAndButtons(); });
+    connect(m_chkRepeatGeneration, &QCheckBox::toggled, this, [this](bool) {
+        _saveStep1Settings();
+        _updateStep1SummaryAndButtons();
+    });
+    connect(m_spinRepeatHours, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
+        _saveStep1Settings();
+        if (m_genDaemonActive)
+        {
+            m_genDaemonIntervalHours = m_spinRepeatHours->value();
+            _saveGenerationDaemonState();
+            _updateHeaderAndStepBadges();
+        }
+        else
+        {
+            _updateStep1SummaryAndButtons();
+        }
+    });
+    connect(m_spinMaxPerWindow, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
+        _saveStep1Settings();
+        if (m_genDaemonActive)
+        {
+            m_genDaemonMaxPerWindow = qMax(1, m_spinMaxPerWindow->value());
+            _saveGenerationDaemonState();
+            _updateHeaderAndStepBadges();
+        }
+        else
+        {
+            _updateStep1SummaryAndButtons();
+        }
+    });
     connect(m_chkAutoSyncStats, &QCheckBox::toggled, this, [this](bool checked) {
         if (m_store)
         {
@@ -777,17 +989,7 @@ QWidget *PaneWorkflow::_buildStep1Page()
         }
     });
 
-    connect(m_btnCancelGen, &QPushButton::clicked, this, [this]() {
-        m_statsSyncCancelled = true;
-        if (m_statsSyncCancelToken)
-        {
-            *m_statsSyncCancelToken = true;
-        }
-        if (m_paneGeneration)
-        {
-            m_paneGeneration->cancelAutoBatch();
-        }
-    });
+    connect(m_btnCancelGen, &QPushButton::clicked, this, &PaneWorkflow::stopGenerationWorkflow);
     connect(m_btnPauseAndPublish, &QPushButton::clicked, this, [this]() {
         // Keep paused batch checkpoint intact so user can return to Step 1 or Generation tab to resume later!
         refreshStep2Candidates(false);
@@ -911,6 +1113,16 @@ QWidget *PaneWorkflow::_buildStep2Page()
     m_btnBackToStep1->setObjectName(QStringLiteral("buttonWorkflowBackToStep1"));
     m_btnBackToStep1->setMinimumHeight(36);
 
+    m_btnAddSelectedToQueue = new QPushButton(tr("➕ Add Selected to Publish Queue"), page);
+    m_btnAddSelectedToQueue->setObjectName(QStringLiteral("buttonWorkflowAddToQueue"));
+    m_btnAddSelectedToQueue->setMinimumHeight(36);
+    m_btnAddSelectedToQueue->setToolTip(
+        tr("Immediately append the checked creative(s) into the live crash-safe Publish Queue "
+           "(starts publishing automatically and lets you keep adding more little by little as new generations finish)."));
+    m_btnAddSelectedToQueue->setStyleSheet(QStringLiteral(
+        "QPushButton { background: #2563eb; color: white; font-weight: 700; padding: 6px 16px; border-radius: 6px; }"
+        "QPushButton:disabled { background: #374151; color: #9ca3af; }"));
+
     m_btnContinueToStep3 = new QPushButton(tr("Continue to Step 3: Auto-Publish →"), page);
     m_btnContinueToStep3->setObjectName(QStringLiteral("buttonWorkflowToStep3"));
     m_btnContinueToStep3->setMinimumHeight(36);
@@ -920,6 +1132,7 @@ QWidget *PaneWorkflow::_buildStep2Page()
 
     bottomBar->addWidget(m_btnBackToStep1);
     bottomBar->addStretch();
+    bottomBar->addWidget(m_btnAddSelectedToQueue);
     bottomBar->addWidget(m_btnContinueToStep3);
     pageLayout->addLayout(bottomBar);
 
@@ -942,6 +1155,13 @@ QWidget *PaneWorkflow::_buildStep2Page()
     connect(m_reviewWidget, &WidgetCreativeReview::selectionChanged, this,
             [this](int checked, int) {
         m_showingCompletedPublishQueue = false;
+        if (m_btnAddSelectedToQueue)
+        {
+            m_btnAddSelectedToQueue->setEnabled(checked > 0);
+            m_btnAddSelectedToQueue->setText(checked > 0
+                ? tr("➕ Add %1 Selected to Publish Queue").arg(checked)
+                : tr("➕ Add Selected to Publish Queue"));
+        }
         m_btnContinueToStep3->setEnabled(checked > 0);
         m_btnContinueToStep3->setText(checked > 0
             ? tr("Continue to Step 3: Auto-Publish (%1 selected) →").arg(checked)
@@ -953,6 +1173,7 @@ QWidget *PaneWorkflow::_buildStep2Page()
             _updateStep3Buttons();
         }
     });
+    connect(m_btnAddSelectedToQueue, &QPushButton::clicked, this, &PaneWorkflow::addSelectedStep2ToPublishQueue);
     connect(m_reviewWidget, &WidgetCreativeReview::deleteCandidateRequested, this,
             [this](const QString &shortCode) {
         deleteCreativeByShortCode(shortCode, true);
@@ -1219,9 +1440,7 @@ QWidget *PaneWorkflow::_buildStep3Page()
     connect(m_btnPublishNextNow, &QPushButton::clicked, this, [this]() {
         if (m_panePublishing) m_panePublishing->publishNextNow();
     });
-    connect(m_btnStopPublish, &QPushButton::clicked, this, [this]() {
-        if (m_panePublishing) m_panePublishing->stopJob();
-    });
+    connect(m_btnStopPublish, &QPushButton::clicked, this, &PaneWorkflow::stopPublicationWorkflow);
     connect(btnDebugDir, &QPushButton::clicked, this, [this]() {
         if (m_panePublishing) m_panePublishing->openDebugLogsFolder();
     });
@@ -1364,14 +1583,24 @@ void PaneWorkflow::refreshStep1Products()
     }
 
     int approvedRefCount = 0;
+    int autoDiscardedRefCount = 0;
     QSet<QString> approvedRefIds;
     for (const QJsonValue &v : m_store->references())
     {
         const QJsonObject r = v.toObject();
-        if (jsonText(r, "accountId") == curAccount && jsonText(r, "status") == QLatin1String("approved"))
+        if (jsonText(r, "accountId") != curAccount)
+        {
+            continue;
+        }
+        const QString st = jsonText(r, "status");
+        if (st == QLatin1String("approved"))
         {
             ++approvedRefCount;
             approvedRefIds.insert(jsonText(r, "id"));
+        }
+        else if (st == QLatin1String("auto_discarded"))
+        {
+            ++autoDiscardedRefCount;
         }
     }
 
@@ -1397,6 +1626,8 @@ void PaneWorkflow::refreshStep1Products()
         }
     }
 
+    const int totalAutoDiscardedOrPendingRetire = autoDiscardedRefCount + retiredApprovedCount;
+
     if (curAccount.isEmpty())
     {
         m_inspirationsInfoLabel->setText(
@@ -1412,26 +1643,26 @@ void PaneWorkflow::refreshStep1Products()
         m_inspirationsInfoLabel->setText(
             tr("0 products match this account's brand/category rules — click \"Open Research…\" → \"Account rules…\" to allow your products."));
     }
-    else if (approvedRefCount > 0)
+    else if (approvedRefCount > 0 || totalAutoDiscardedOrPendingRetire > 0)
     {
         const int activeApprovedCount = qMax(0, approvedRefCount - retiredApprovedCount);
-        if (winnerApprovedCount > 0 || retiredApprovedCount > 0)
+        if (winnerApprovedCount > 0 || totalAutoDiscardedOrPendingRetire > 0)
         {
-            const QString retiredPart = retiredApprovedCount > 0
-                ? tr(", %1 retired after ≥2 low performers").arg(retiredApprovedCount)
+            const QString discardedPart = totalAutoDiscardedOrPendingRetire > 0
+                ? tr(", %1 auto-discarded after ≥4 flops across ≥2 products").arg(totalAutoDiscardedOrPendingRetire)
                 : QString{};
             m_inspirationsInfoLabel->setText(
                 tr("✓ %1 active inspiration(s) ready (★ %2 proven winner(s) privileged at 80%%3) — "
-                   "privileging sources from their 1st win && stopping reuse after 2 low performers.")
+                   "privileging sources from their 1st win & auto-discarding sources on stats sync after ≥4 flops across ≥2 products.")
                     .arg(activeApprovedCount)
                     .arg(winnerApprovedCount)
-                    .arg(retiredPart));
+                    .arg(discardedPart));
         }
         else
         {
             m_inspirationsInfoLabel->setText(
                 tr("✓ %1 approved inspiration(s) ready for this account — QuantumSocial privileges any source "
-                   "from its 1st winning post (80% winners, 20% exploration) and stops reusing sources after 2 low performers.")
+                   "from its 1st winning post (80% winners, 20% exploration) and auto-discards sources after ≥4 low-performing posts across ≥2 products.")
                     .arg(approvedRefCount));
         }
     }
@@ -1578,11 +1809,27 @@ void PaneWorkflow::_updateStep1SummaryAndButtons()
         m_btnSyncStats->setEnabled(!batchRunning && m_accounts && m_accounts->rowCount() > 0);
     }
 
+    const bool repeatEnabled = m_chkRepeatGeneration && m_chkRepeatGeneration->isChecked();
+    const int repeatHours = m_spinRepeatHours ? m_spinRepeatHours->value() : 6;
+    const int maxPerWindow = m_spinMaxPerWindow ? qMax(1, m_spinMaxPerWindow->value()) : 6;
+    const bool windowCapped = repeatEnabled && totalToGen > maxPerWindow;
+
     if (m_selectedProductsLabel)
     {
-        m_selectedProductsLabel->setText(
-            tr("Selected: %1 product(s) × %2 per format × %3 format(s) = %4 creative(s) to generate")
-                .arg(checkedCount).arg(perFormat).arg(formatCount).arg(totalToGen));
+        if (windowCapped)
+        {
+            const int windowsPerPass = (totalToGen + maxPerWindow - 1) / maxPerWindow;
+            m_selectedProductsLabel->setText(
+                tr("Selected: %1 product(s) × %2 per format × %3 format(s) = %4 creative(s) total · capped at %5 per %6h window (%7 windows/pass)")
+                    .arg(checkedCount).arg(perFormat).arg(formatCount).arg(totalToGen)
+                    .arg(maxPerWindow).arg(repeatHours).arg(windowsPerPass));
+        }
+        else
+        {
+            m_selectedProductsLabel->setText(
+                tr("Selected: %1 product(s) × %2 per format × %3 format(s) = %4 creative(s) to generate")
+                    .arg(checkedCount).arg(perFormat).arg(formatCount).arg(totalToGen));
+        }
         m_selectedProductsLabel->setStyleSheet(checkedCount > 0
             ? QStringLiteral("color: #8fd19e; font-weight: 600;")
             : QStringLiteral("color: #e89774; font-weight: 600;"));
@@ -1599,7 +1846,12 @@ void PaneWorkflow::_updateStep1SummaryAndButtons()
         else
         {
             m_btnGenerateAndNext->setText(checkedCount > 0
-                ? tr("✨ Generate %1 Creative(s) && Continue to Step 2 →").arg(totalToGen)
+                ? (windowCapped
+                       ? tr("✨ Generate %1 Now (of %2) && Repeat ≤%1 Every %3h →")
+                             .arg(maxPerWindow).arg(totalToGen).arg(repeatHours)
+                       : (repeatEnabled
+                              ? tr("✨ Generate %1 Creative(s) && Repeat Every %2h →").arg(totalToGen).arg(repeatHours)
+                              : tr("✨ Generate %1 Creative(s) && Continue to Step 2 →").arg(totalToGen)))
                 : tr("Select at least 1 product to generate"));
         }
     }
@@ -1622,6 +1874,18 @@ void PaneWorkflow::_saveStep1Settings() const
     }
     QSettings settings(m_store->directory().filePath(QStringLiteral("ui.ini")), QSettings::IniFormat);
     settings.setValue(QStringLiteral("autoBatch/generationsPerProduct"), m_spinGenPerProduct->value());
+    if (m_chkRepeatGeneration)
+    {
+        settings.setValue(QStringLiteral("autoBatch/repeatEveryHoursEnabled"), m_chkRepeatGeneration->isChecked());
+    }
+    if (m_spinRepeatHours)
+    {
+        settings.setValue(QStringLiteral("autoBatch/repeatIntervalHours"), m_spinRepeatHours->value());
+    }
+    if (m_spinMaxPerWindow)
+    {
+        settings.setValue(QStringLiteral("autoBatch/maxCreativesPerWindow"), m_spinMaxPerWindow->value());
+    }
     if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
     {
         settings.setValue(QStringLiteral("autoBatch/promptCli"), pCli->getName());
@@ -1665,6 +1929,11 @@ bool PaneWorkflow::needsStatsSyncBeforeGeneration() const
     if (!hasAnySupportedAccount)
     {
         return false;
+    }
+    if (SocialStatistics::isStatisticsRetrievalDue(
+            m_accounts, SocialStatistics::kAutoStatsSyncIntervalSeconds, m_videos))
+    {
+        return true;
     }
 
     int publishedCount = 0;
@@ -1747,7 +2016,7 @@ QCoro::Task<void> PaneWorkflow::_syncStatsCoroutine(bool startGenerationAfter)
     _updateStep1SummaryAndButtons();
 
     co_await SocialStatistics::retrieveFromAccounts(
-        m_accounts, m_videos, nullptr, m_hashtags, m_favoriteHooks);
+        m_accounts, m_videos, nullptr, m_hashtags, m_favoriteHooks, m_store);
 
     if (!self || (cancelToken && *cancelToken))
     {
@@ -1763,10 +2032,25 @@ QCoro::Task<void> PaneWorkflow::_syncStatsCoroutine(bool startGenerationAfter)
     m_genProgressBar->setValue(1);
     m_btnCancelGen->setVisible(false);
 
+    int autoDiscardedTotal = 0;
+    if (m_store)
+    {
+        for (const QJsonValue &v : m_store->references())
+        {
+            if (jsonText(v.toObject(), "status") == QLatin1String("auto_discarded"))
+            {
+                ++autoDiscardedTotal;
+            }
+        }
+    }
+
     const auto refExp = SocialStatistics::summarizeReferenceExperiment(m_videos);
+    const QString discardLogPart = autoDiscardedTotal > 0
+        ? tr(" · %1 source(s) marked auto-discarded").arg(autoDiscardedTotal)
+        : QString{};
     m_genLogConsole->appendPlainText(
         QTime::currentTime().toString(QStringLiteral("HH:mm:ss  "))
-        + tr("✓ Statistics synced — %1").arg(refExp.humanSummary()));
+        + tr("✓ Statistics synced — %1%2").arg(refExp.humanSummary(), discardLogPart));
     m_genStatusLabel->setText(tr("Statistics synced."));
 
     refreshStep1Products();
@@ -1797,6 +2081,24 @@ void PaneWorkflow::startStep1Generation()
         return;
     }
 
+    m_genDaemonActive = m_chkRepeatGeneration && m_chkRepeatGeneration->isChecked();
+    m_genDaemonIntervalHours = m_spinRepeatHours ? m_spinRepeatHours->value() : 6;
+    m_genDaemonMaxPerWindow = m_spinMaxPerWindow ? qMax(1, m_spinMaxPerWindow->value()) : 6;
+    m_genDaemonCyclesCompleted = 0;
+    m_genDaemonProductOffset = 0;
+    m_genDaemonNextProdIdx = 0;
+    m_genDaemonNextSlotIdx = 0;
+    m_genDaemonPassTotal = 0;
+    m_genDaemonPassesCompleted = 0;
+    m_genDaemonNextCycleUtc = QDateTime{};
+    if (m_genDaemonTimer)
+    {
+        m_genDaemonTimer->stop();
+    }
+    _armContinuousStatsTimer();
+    _saveGenerationDaemonState();
+    _updateHeaderAndStepBadges();
+
     m_genLogConsole->clear();
     if (m_chkAutoSyncStats && m_chkAutoSyncStats->isChecked() && needsStatsSyncBeforeGeneration())
     {
@@ -1807,27 +2109,45 @@ void PaneWorkflow::startStep1Generation()
     _launchStep1AutoBatchNow();
 }
 
-void PaneWorkflow::_launchStep1AutoBatchNow()
+QJsonObject PaneWorkflow::_buildUnrolledDaemonSpec(const QStringList &chosenIds) const
 {
-    if (!m_paneResearch || !m_paneGeneration || m_paneGeneration->isAutoBatchRunning())
+    if (!m_paneResearch || chosenIds.isEmpty())
     {
-        return;
+        return QJsonObject{};
     }
-    const QStringList chosenIds = _checkedStep1ProductIds();
-    if (chosenIds.isEmpty())
+    QStringList orderedIds = chosenIds;
+    if (m_genDaemonProductOffset > 0 && orderedIds.size() > 1)
     {
-        return;
+        const int shift = m_genDaemonProductOffset % orderedIds.size();
+        orderedIds = orderedIds.mid(shift) + orderedIds.mid(0, shift);
     }
-
     QJsonObject spec = m_paneResearch->buildAutoBatchSpec(
-        chosenIds,
-        m_spinGenPerProduct->value(),
+        orderedIds,
+        /*generationsPerProduct=*/1,
         m_chkFormatImage->isChecked(),
         m_chkFormatCarousel->isChecked(),
         m_chkFormatVideo->isChecked(),
         m_chkCarouselOverlay->isChecked(),
         m_comboAspectFormat->currentText(),
         m_comboVideoGen->currentData().toString());
+    if (spec.isEmpty())
+    {
+        return spec;
+    }
+    const QJsonArray baseProducts = spec.value(QStringLiteral("products")).toArray();
+    const int rounds = qMax(1, m_spinGenPerProduct ? m_spinGenPerProduct->value() : 1);
+    QJsonArray unrolledProducts;
+    for (int r = 0; r < rounds; ++r)
+    {
+        for (const QJsonValue &pv : baseProducts)
+        {
+            QJsonObject pObj = pv.toObject();
+            pObj.insert(QStringLiteral("roundOrdinal"), r);
+            unrolledProducts.append(pObj);
+        }
+    }
+    spec.insert(QStringLiteral("products"), unrolledProducts);
+    spec.insert(QStringLiteral("generationsPerProduct"), 1);
     if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
     {
         spec.insert(QStringLiteral("promptCli"), pCli->getName());
@@ -1837,12 +2157,467 @@ void PaneWorkflow::_launchStep1AutoBatchNow()
         spec.insert(QStringLiteral("imageCli"), iCli->getName());
     }
     spec.insert(QStringLiteral("suppressModalProgressDialog"), true);
+    return spec;
+}
 
-    m_triggeredBatchFromWorkflow = true;
+void PaneWorkflow::_launchStep1AutoBatchNow()
+{
+    if (!m_paneResearch || !m_paneGeneration || m_paneGeneration->isAutoBatchRunning())
+    {
+        return;
+    }
+    const QStringList chosenIds = _checkedStep1ProductIds();
+    QJsonObject spec;
+    if (m_genDaemonActive)
+    {
+        if (!chosenIds.isEmpty())
+        {
+            spec = _buildUnrolledDaemonSpec(chosenIds);
+        }
+        else if (!m_genDaemonBatchSpec.isEmpty())
+        {
+            spec = m_genDaemonBatchSpec;
+        }
+    }
+    else if (!chosenIds.isEmpty())
+    {
+        spec = m_paneResearch->buildAutoBatchSpec(
+            chosenIds,
+            m_spinGenPerProduct->value(),
+            m_chkFormatImage->isChecked(),
+            m_chkFormatCarousel->isChecked(),
+            m_chkFormatVideo->isChecked(),
+            m_chkCarouselOverlay->isChecked(),
+            m_comboAspectFormat->currentText(),
+            m_comboVideoGen->currentData().toString());
+        if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
+        {
+            spec.insert(QStringLiteral("promptCli"), pCli->getName());
+        }
+        if (auto *iCli = m_comboImageCli ? m_comboImageCli->currentData().value<AbstractCli *>() : nullptr)
+        {
+            spec.insert(QStringLiteral("imageCli"), iCli->getName());
+        }
+        spec.insert(QStringLiteral("suppressModalProgressDialog"), true);
+    }
+    if (spec.isEmpty())
+    {
+        return;
+    }
+
+    if (m_genDaemonActive)
+    {
+        if (m_store)
+        {
+            // Rebuild approvedReferences from live ResearchStore so any newly auto-discarded
+            // inspirations are never carried forward from an older daemon snapshot!
+            const QString curAccount = _selectedAccountId();
+            QList<QJsonObject> freshApproved;
+            for (const QJsonValue &v : m_store->references())
+            {
+                const QJsonObject r = v.toObject();
+                if (jsonText(r, "accountId") == curAccount && jsonText(r, "status") == QLatin1String("approved"))
+                {
+                    freshApproved.append(QJsonObject{
+                        {QStringLiteral("reference"), r},
+                        {QStringLiteral("mediaPath"), m_store->mediaPath(r)}
+                    });
+                }
+            }
+            QJsonArray approvedArr;
+            for (const auto &obj : freshApproved)
+            {
+                approvedArr.append(obj);
+            }
+            spec.insert(QStringLiteral("approvedReferences"), approvedArr);
+        }
+
+        int fmtCount = 0;
+        if (spec.value(QStringLiteral("includeImage")).toBool()) ++fmtCount;
+        if (spec.value(QStringLiteral("includeCarousel")).toBool()) ++fmtCount;
+        if (spec.value(QStringLiteral("includeVideo")).toBool()) ++fmtCount;
+        const int prodCount = spec.value(QStringLiteral("products")).toArray().size();
+        const int slotsPerEntry = qMax(1, spec.value(QStringLiteral("generationsPerProduct")).toInt(1))
+            * qMax(1, fmtCount);
+        m_genDaemonPassTotal = prodCount * slotsPerEntry;
+        if (m_genDaemonNextProdIdx < 0 || m_genDaemonNextProdIdx >= prodCount)
+        {
+            m_genDaemonNextProdIdx = 0;
+            m_genDaemonNextSlotIdx = 0;
+        }
+        if (m_genDaemonNextSlotIdx < 0 || m_genDaemonNextSlotIdx >= slotsPerEntry)
+        {
+            m_genDaemonNextSlotIdx = 0;
+        }
+        spec.insert(QStringLiteral("startProductIndex"), m_genDaemonNextProdIdx);
+        spec.insert(QStringLiteral("startSlotIndex"), m_genDaemonNextSlotIdx);
+        spec.insert(QStringLiteral("priorCampaignCompleted"), 0);
+        spec.insert(QStringLiteral("maxCreativesThisRun"), qMax(1, m_genDaemonMaxPerWindow));
+
+        m_genDaemonBatchSpec = spec;
+        _saveGenerationDaemonState();
+    }
+    _armContinuousStatsTimer();
+
+    m_triggeredBatchFromWorkflow = !m_step2Initialized && m_genDaemonCyclesCompleted == 0;
     if (!m_paneGeneration->startAutoBatch(spec))
     {
         m_triggeredBatchFromWorkflow = false;
     }
+    _updateHeaderAndStepBadges();
+}
+
+QString PaneWorkflow::generationDaemonStatePath() const
+{
+    const QDir wd = WorkingDirectoryManager::instance()->workingDir();
+    return wd.filePath(QStringLiteral("workflow_generation_daemon.json"));
+}
+
+void PaneWorkflow::_saveGenerationDaemonState() const
+{
+    const QString path = generationDaemonStatePath();
+    if (path.isEmpty())
+    {
+        return;
+    }
+    QSaveFile sf(path);
+    if (!sf.open(QIODevice::WriteOnly))
+    {
+        return;
+    }
+    QJsonObject root{
+        {QStringLiteral("schemaVersion"), 2},
+        {QStringLiteral("active"), m_genDaemonActive},
+        {QStringLiteral("intervalHours"), qMax(1, m_genDaemonIntervalHours)},
+        {QStringLiteral("maxPerWindow"), qMax(1, m_genDaemonMaxPerWindow)},
+        {QStringLiteral("cyclesCompleted"), m_genDaemonCyclesCompleted},
+        {QStringLiteral("passesCompleted"), m_genDaemonPassesCompleted},
+        {QStringLiteral("passTotal"), m_genDaemonPassTotal},
+        {QStringLiteral("productOffset"), m_genDaemonProductOffset},
+        {QStringLiteral("nextProductIndex"), m_genDaemonNextProdIdx},
+        {QStringLiteral("nextSlotIndex"), m_genDaemonNextSlotIdx},
+        {QStringLiteral("nextCycleUtc"), m_genDaemonNextCycleUtc.isValid()
+            ? m_genDaemonNextCycleUtc.toUTC().toString(Qt::ISODate)
+            : QString{}},
+        {QStringLiteral("checkedProductIds"), QJsonArray::fromStringList(_checkedStep1ProductIds())},
+        {QStringLiteral("batchSpec"), m_genDaemonBatchSpec},
+        {QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
+    };
+    sf.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    sf.commit();
+}
+
+void PaneWorkflow::_armGenerationDaemonTimer()
+{
+    if (!m_genDaemonActive)
+    {
+        if (m_genDaemonTimer)
+        {
+            m_genDaemonTimer->stop();
+        }
+        return;
+    }
+    if (!m_genDaemonTimer)
+    {
+        m_genDaemonTimer = new QTimer(this);
+        m_genDaemonTimer->setSingleShot(true);
+        connect(m_genDaemonTimer, &QTimer::timeout, this, &PaneWorkflow::_onGenerationDaemonTimerTick);
+    }
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    const qint64 msUntil = m_genDaemonNextCycleUtc.isValid()
+        ? nowUtc.msecsTo(m_genDaemonNextCycleUtc)
+        : 0;
+    const int waitMs = int(qBound(qint64(50), msUntil, qint64(30'000)));
+    m_genDaemonTimer->start(waitMs);
+}
+
+void PaneWorkflow::_armContinuousStatsTimer()
+{
+    const bool continuousActive = m_genDaemonActive
+        || (m_panePublishing && (m_panePublishing->isPublicationArmed() || m_panePublishing->isJobRunning()));
+    if (!continuousActive)
+    {
+        if (m_continuousStatsTimer)
+        {
+            m_continuousStatsTimer->stop();
+        }
+        return;
+    }
+    if (!m_continuousStatsTimer)
+    {
+        m_continuousStatsTimer = new QTimer(this);
+        m_continuousStatsTimer->setInterval(60'000);
+        connect(m_continuousStatsTimer, &QTimer::timeout, this, &PaneWorkflow::_onContinuousStatsTimerTick);
+    }
+    if (!m_continuousStatsTimer->isActive())
+    {
+        m_continuousStatsTimer->start();
+    }
+}
+
+void PaneWorkflow::_onContinuousStatsTimerTick()
+{
+    const bool continuousActive = m_genDaemonActive
+        || (m_panePublishing && (m_panePublishing->isPublicationArmed() || m_panePublishing->isJobRunning()));
+    if (!continuousActive)
+    {
+        if (m_continuousStatsTimer)
+        {
+            m_continuousStatsTimer->stop();
+        }
+        return;
+    }
+    runPeriodicOrStartupStatsCheckIfDue(SocialStatistics::kAutoStatsSyncIntervalSeconds);
+}
+
+void PaneWorkflow::scheduleStartupStatisticsCheck(int delayMs)
+{
+    QTimer::singleShot(qMax(1, delayMs), this, [this]() {
+        runPeriodicOrStartupStatsCheckIfDue(SocialStatistics::kAutoStatsSyncIntervalSeconds);
+    });
+}
+
+bool PaneWorkflow::runPeriodicOrStartupStatsCheckIfDue(qint64 maxAgeSeconds)
+{
+    if (m_syncingStats || (m_paneGeneration && m_paneGeneration->isAutoBatchRunning()))
+    {
+        return false;
+    }
+    if (!SocialStatistics::isStatisticsRetrievalDue(m_accounts, maxAgeSeconds, m_videos))
+    {
+        return false;
+    }
+    m_genLogConsole->appendPlainText(
+        QTime::currentTime().toString(QStringLiteral("HH:mm:ss  "))
+        + tr("↻ Automatic 12h statistics check due — retrieving latest account statistics && updating source quality…"));
+    m_statsSyncTask = std::make_unique<QCoro::Task<void>>(_syncStatsCoroutine(false));
+    return true;
+}
+
+void PaneWorkflow::_onGenerationDaemonTimerTick()
+{
+    if (!m_genDaemonActive || !m_paneGeneration)
+    {
+        return;
+    }
+    if (m_paneGeneration->isAutoBatchRunning() || m_syncingStats)
+    {
+        _armGenerationDaemonTimer();
+        return;
+    }
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    if (m_genDaemonNextCycleUtc.isValid() && nowUtc < m_genDaemonNextCycleUtc)
+    {
+        // While waiting for the next scheduled generation cycle, still perform the 12h
+        // statistics sync whenever it becomes due so failed sources are discarded promptly!
+        runPeriodicOrStartupStatsCheckIfDue(SocialStatistics::kAutoStatsSyncIntervalSeconds);
+        _updateHeaderAndStepBadges();
+        _armGenerationDaemonTimer();
+        return;
+    }
+
+    QString promptCliName;
+    QString imageCliName;
+    if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
+    {
+        promptCliName = pCli->getName();
+    }
+    if (auto *iCli = m_comboImageCli ? m_comboImageCli->currentData().value<AbstractCli *>() : nullptr)
+    {
+        imageCliName = iCli->getName();
+    }
+
+    if (m_paneGeneration->hasPausedAutoBatch())
+    {
+        m_genLogConsole->appendPlainText(
+            QTime::currentTime().toString(QStringLiteral("HH:mm:ss  "))
+            + tr("↻ Recurring workflow: resuming paused generation batch…"));
+        if (!m_paneGeneration->resumePausedAutoBatch(promptCliName, imageCliName))
+        {
+            m_genDaemonNextCycleUtc = nowUtc.addSecs(300);
+            _saveGenerationDaemonState();
+            _armGenerationDaemonTimer();
+        }
+        _updateHeaderAndStepBadges();
+        return;
+    }
+
+    m_genLogConsole->appendPlainText(
+        QTime::currentTime().toString(QStringLiteral("HH:mm:ss  "))
+        + tr("↻ Recurring workflow: starting scheduled generation cycle #%1…").arg(m_genDaemonCyclesCompleted + 1));
+
+    const bool statsDue12h = SocialStatistics::isStatisticsRetrievalDue(
+        m_accounts, SocialStatistics::kAutoStatsSyncIntervalSeconds, m_videos);
+    if (statsDue12h || (m_chkAutoSyncStats && m_chkAutoSyncStats->isChecked() && needsStatsSyncBeforeGeneration()))
+    {
+        m_statsSyncTask = std::make_unique<QCoro::Task<void>>(_syncStatsCoroutine(true));
+        return;
+    }
+    _launchStep1AutoBatchNow();
+}
+
+bool PaneWorkflow::restoreGenerationDaemon()
+{
+    bool recoveredAnything = false;
+    const QString path = generationDaemonStatePath();
+    if (!path.isEmpty() && QFileInfo::exists(path))
+    {
+        QFile f(path);
+        if (f.open(QIODevice::ReadOnly))
+        {
+            const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+            if (root.value(QStringLiteral("active")).toBool(false))
+            {
+                m_genDaemonActive = true;
+                m_genDaemonIntervalHours = qMax(1, root.value(QStringLiteral("intervalHours")).toInt(6));
+                m_genDaemonMaxPerWindow = qMax(1, root.value(QStringLiteral("maxPerWindow")).toInt(
+                    m_spinMaxPerWindow ? m_spinMaxPerWindow->value() : 6));
+                m_genDaemonCyclesCompleted = qMax(0, root.value(QStringLiteral("cyclesCompleted")).toInt(0));
+                m_genDaemonPassesCompleted = qMax(0, root.value(QStringLiteral("passesCompleted")).toInt(0));
+                m_genDaemonPassTotal = qMax(0, root.value(QStringLiteral("passTotal")).toInt(0));
+                m_genDaemonProductOffset = qMax(0, root.value(QStringLiteral("productOffset")).toInt(0));
+                m_genDaemonNextProdIdx = qMax(0, root.value(QStringLiteral("nextProductIndex")).toInt(0));
+                m_genDaemonNextSlotIdx = qMax(0, root.value(QStringLiteral("nextSlotIndex")).toInt(0));
+                const QString nextStr = root.value(QStringLiteral("nextCycleUtc")).toString();
+                m_genDaemonNextCycleUtc = nextStr.isEmpty()
+                    ? QDateTime{}
+                    : QDateTime::fromString(nextStr, Qt::ISODate).toUTC();
+                m_genDaemonBatchSpec = root.value(QStringLiteral("batchSpec")).toObject();
+
+                const QJsonArray savedIds = root.value(QStringLiteral("checkedProductIds")).toArray();
+                if (!savedIds.isEmpty())
+                {
+                    m_checkedProductIds.clear();
+                    for (const QJsonValue &v : savedIds)
+                    {
+                        if (!v.toString().trimmed().isEmpty())
+                        {
+                            m_checkedProductIds.insert(v.toString().trimmed());
+                        }
+                    }
+                    refreshStep1Products();
+                }
+                if (m_chkRepeatGeneration)
+                {
+                    const QSignalBlocker b(m_chkRepeatGeneration);
+                    m_chkRepeatGeneration->setChecked(true);
+                }
+                if (m_spinRepeatHours)
+                {
+                    const QSignalBlocker b(m_spinRepeatHours);
+                    m_spinRepeatHours->setValue(m_genDaemonIntervalHours);
+                    m_spinRepeatHours->setEnabled(true);
+                }
+                if (m_spinMaxPerWindow)
+                {
+                    const QSignalBlocker b(m_spinMaxPerWindow);
+                    m_spinMaxPerWindow->setValue(m_genDaemonMaxPerWindow);
+                    m_spinMaxPerWindow->setEnabled(true);
+                }
+                recoveredAnything = true;
+            }
+        }
+    }
+
+    // Crash recovery: if the previous process exited/crashed mid-batch (or recurring daemon is active with a paused batch)
+    if (m_paneGeneration && m_paneGeneration->hasPausedAutoBatch() && !m_paneGeneration->isAutoBatchRunning()
+        && (m_paneGeneration->wasPausedAutoBatchCrashInterrupted()
+            || (m_genDaemonActive && (!m_genDaemonNextCycleUtc.isValid()
+                                      || QDateTime::currentDateTimeUtc() >= m_genDaemonNextCycleUtc))))
+    {
+        QString promptCliName;
+        QString imageCliName;
+        if (auto *pCli = m_comboPromptCli ? m_comboPromptCli->currentData().value<AbstractCli *>() : nullptr)
+        {
+            promptCliName = pCli->getName();
+        }
+        if (auto *iCli = m_comboImageCli ? m_comboImageCli->currentData().value<AbstractCli *>() : nullptr)
+        {
+            imageCliName = iCli->getName();
+        }
+        m_genProgressBox->setVisible(true);
+        m_genLogConsole->appendPlainText(
+            QTime::currentTime().toString(QStringLiteral("HH:mm:ss  "))
+            + tr("↻ Crash recovery: automatically resuming interrupted generation batch…"));
+        if (m_paneGeneration->resumePausedAutoBatch(promptCliName, imageCliName))
+        {
+            recoveredAnything = true;
+        }
+    }
+    else if (m_genDaemonActive)
+    {
+        _armGenerationDaemonTimer();
+    }
+    _armContinuousStatsTimer();
+
+    _updateLimitBanner();
+    _updateStep1SummaryAndButtons();
+    _updateHeaderAndStepBadges();
+    return recoveredAnything;
+}
+
+void PaneWorkflow::stopGenerationWorkflow()
+{
+    m_genDaemonActive = false;
+    m_genDaemonNextProdIdx = 0;
+    m_genDaemonNextSlotIdx = 0;
+    m_genDaemonPassTotal = 0;
+    m_genDaemonPassesCompleted = 0;
+    m_genDaemonNextCycleUtc = QDateTime{};
+    if (m_genDaemonTimer)
+    {
+        m_genDaemonTimer->stop();
+    }
+    _armContinuousStatsTimer();
+    _saveGenerationDaemonState();
+
+    if (m_syncingStats)
+    {
+        m_statsSyncCancelled = true;
+        if (m_statsSyncCancelToken)
+        {
+            *m_statsSyncCancelToken = true;
+        }
+        m_syncingStats = false;
+        if (m_btnSyncStats)
+        {
+            m_btnSyncStats->setText(tr("↻ Sync Stats"));
+        }
+        m_btnCancelGen->setVisible(false);
+        m_genStatusLabel->setText(tr("Generation workflow stopped."));
+    }
+
+    if (m_paneGeneration)
+    {
+        if (m_paneGeneration->isAutoBatchRunning())
+        {
+            m_paneGeneration->cancelAutoBatch();
+        }
+        m_paneGeneration->discardPausedAutoBatch();
+    }
+    if (m_genStatusLabel && (!m_paneGeneration || !m_paneGeneration->isAutoBatchRunning()))
+    {
+        m_genStatusLabel->setText(tr("Generation workflow stopped."));
+    }
+    _updateLimitBanner();
+    _updateStep1SummaryAndButtons();
+    _updateHeaderAndStepBadges();
+}
+
+void PaneWorkflow::stopPublicationWorkflow()
+{
+    if (m_panePublishing)
+    {
+        m_panePublishing->stopJob();
+    }
+    _armContinuousStatsTimer();
+    if (m_step2Initialized && currentStep() == 1)
+    {
+        refreshStep2Candidates(true);
+    }
+    _refreshStep3QueueTable();
+    _updateStep3Buttons();
+    _updateHeaderAndStepBadges();
 }
 
 void PaneWorkflow::refreshStep2Candidates(bool preserveExistingSelection)
@@ -1865,23 +2640,73 @@ void PaneWorkflow::refreshStep2Candidates(bool preserveExistingSelection)
 
     int olderExcluded = 0;
     int singleExcluded = 0;
-    const QList<PanePublishing::EligibleCreative> candidates =
+    const QList<PanePublishing::EligibleCreative> rawCandidates =
         m_panePublishing->collectEligibleCreatives(
             cfg.maxDaysOld, skipSingleImages, &olderExcluded, &singleExcluded);
 
-    // If preserveExistingSelection is requested and the candidate count matches what's already loaded,
+    const QSet<QString> alreadyQueuedCodes = m_panePublishing->queuedOrActiveShortCodes();
+    QList<PanePublishing::EligibleCreative> candidates;
+    candidates.reserve(rawCandidates.size());
+    int queuedExcluded = 0;
+    for (const auto &c : rawCandidates)
+    {
+        if (alreadyQueuedCodes.contains(c.shortCode))
+        {
+            ++queuedExcluded;
+            continue;
+        }
+        candidates.append(c);
+    }
+
+    // If preserveExistingSelection is requested and the candidate set matches what's already loaded,
     // simply refresh the target/timing config without wiping the user's manual ordering or video text edits!
     if (preserveExistingSelection && m_step2Initialized
         && m_reviewWidget->totalCount() == candidates.size() && !candidates.isEmpty())
     {
-        m_reviewWidget->updateScheduleConfig(cfg);
-        return;
+        bool sameCodes = true;
+        const auto existingConfirmed = m_reviewWidget->buildConfirmedQueue();
+        Q_UNUSED(existingConfirmed);
+        if (sameCodes)
+        {
+            // Verify currentShortCode or count matches; only fast-exit if nothing was queued/added
+            // Wait: if 1 was removed and 1 was added simultaneously, rebuild while preserving checked items below!
+        }
     }
 
     QString expSummary;
-    const QList<PanePublishing::ScheduledItem> initialQueue =
-        PanePublishing::buildDeterministicDefaultQueue(
+    QList<PanePublishing::ScheduledItem> initialQueue;
+    if (preserveExistingSelection && m_step2Initialized)
+    {
+        // Preserve exact user-checked items (and their overlay edits / custom ordering) when new background
+        // generations arrive in Step 2!
+        const QList<PanePublishing::ScheduledItem> priorChecked = m_reviewWidget->buildConfirmedQueue();
+        if (!priorChecked.isEmpty())
+        {
+            QSet<QString> candidateCodeSet;
+            for (const auto &c : candidates)
+            {
+                candidateCodeSet.insert(c.shortCode);
+            }
+            for (const auto &item : priorChecked)
+            {
+                if (candidateCodeSet.contains(item.creative.shortCode))
+                {
+                    initialQueue.append(item);
+                }
+            }
+            const auto refExp = SocialStatistics::summarizeReferenceExperiment(m_videos);
+            expSummary = refExp.humanSummary();
+        }
+    }
+    if (initialQueue.isEmpty() && (!preserveExistingSelection || !m_step2Initialized))
+    {
+        initialQueue = PanePublishing::buildDeterministicDefaultQueue(
             cfg, candidates, m_videos, m_favoriteHooks, &expSummary);
+    }
+    else if (expSummary.isEmpty())
+    {
+        expSummary = SocialStatistics::summarizeReferenceExperiment(m_videos).humanSummary();
+    }
     const int baseMins = PanePublishing::baseIntervalMinutesForConfig(cfg);
 
     m_reviewWidget->setCandidates(
@@ -1894,9 +2719,14 @@ void PaneWorkflow::refreshStep2Candidates(bool preserveExistingSelection)
 
     if (candidates.isEmpty())
     {
-        QString emptyHtml = tr("<b>0 unpublished creatives</b> match the current age filter (≤ %1 day(s) old).")
+        QString emptyHtml = tr("<b>0 unqueued creatives</b> match the current age filter (≤ %1 day(s) old).")
             .arg(cfg.maxDaysOld);
-        if (olderExcluded > 0)
+        if (queuedExcluded > 0)
+        {
+            emptyHtml += tr(" <b>%1 creative(s)</b> are currently in the Publish Queue (Step 3) — new generations will appear here automatically as they finish!")
+                .arg(queuedExcluded);
+        }
+        else if (olderExcluded > 0)
         {
             emptyHtml += tr(" %1 older creative(s) were skipped — set <b>Max age</b> to 0 to include all ages.")
                 .arg(olderExcluded);
@@ -1933,7 +2763,16 @@ QCoro::Task<void> PaneWorkflow::_runAiSelectCoroutine()
     {
         if (t.platformId == QLatin1String("tiktok")) skipSingle = true;
     }
-    const auto candidates = m_panePublishing->collectEligibleCreatives(cfg.maxDaysOld, skipSingle);
+    const auto rawCandidates = m_panePublishing->collectEligibleCreatives(cfg.maxDaysOld, skipSingle);
+    const QSet<QString> alreadyQueuedCodes = m_panePublishing->queuedOrActiveShortCodes();
+    QList<PanePublishing::EligibleCreative> candidates;
+    for (const auto &c : rawCandidates)
+    {
+        if (!alreadyQueuedCodes.contains(c.shortCode))
+        {
+            candidates.append(c);
+        }
+    }
     if (candidates.isEmpty())
     {
         co_return;
@@ -2239,19 +3078,29 @@ void PaneWorkflow::_refreshStep3QueueTable()
 void PaneWorkflow::_updateStep3Buttons()
 {
     const bool running = m_panePublishing && m_panePublishing->isJobRunning();
+    const bool armed = m_panePublishing && m_panePublishing->isPublicationArmed();
     const auto cfg = _currentPublishConfig();
     const int selectedPosts = m_reviewWidget ? m_reviewWidget->checkedCount() : 0;
 
     if (m_btnStartPublish)
     {
-        m_btnStartPublish->setEnabled(!running && !cfg.targets.isEmpty() && selectedPosts > 0);
-        m_btnStartPublish->setText(selectedPosts > 0
-            ? tr("🚀 Start Auto-Publish Job (%1 post(s))").arg(selectedPosts)
-            : tr("Select creatives in Step 2 first"));
+        m_btnStartPublish->setEnabled(!cfg.targets.isEmpty() && selectedPosts > 0);
+        if (running || armed)
+        {
+            m_btnStartPublish->setText(selectedPosts > 0
+                ? tr("➕ Append %1 Post(s) to Active Publish Queue").arg(selectedPosts)
+                : tr("Publish Queue Active — Select more in Step 2 anytime"));
+        }
+        else
+        {
+            m_btnStartPublish->setText(selectedPosts > 0
+                ? tr("🚀 Start Auto-Publish Job (%1 post(s))").arg(selectedPosts)
+                : tr("Select creatives in Step 2 first"));
+        }
     }
     if (m_btnStopPublish)
     {
-        m_btnStopPublish->setEnabled(running);
+        m_btnStopPublish->setEnabled(running || armed);
     }
     if (m_btnPublishNextNow)
     {
@@ -2259,10 +3108,76 @@ void PaneWorkflow::_updateStep3Buttons()
     }
 }
 
+void PaneWorkflow::addSelectedStep2ToPublishQueue()
+{
+    if (!m_panePublishing || !m_reviewWidget)
+    {
+        return;
+    }
+    if (_currentPublishConfig().targets.isEmpty())
+    {
+        refreshStep3AccountsAndPreview();
+    }
+    const auto cfg = _currentPublishConfig();
+    if (cfg.targets.isEmpty())
+    {
+        QMessageBox::information(this, tr("Select target account"),
+            tr("Check at least one supported social media account (e.g. TikTok) in Step 3 first."));
+        setCurrentStep(2);
+        return;
+    }
+
+    QList<PanePublishing::ScheduledItem> confirmed = m_reviewWidget->buildConfirmedQueue();
+    if (confirmed.isEmpty())
+    {
+        return;
+    }
+    for (int i = 0; i < confirmed.size(); ++i)
+    {
+        bool validTarget = false;
+        for (const auto &t : cfg.targets)
+        {
+            if (t.accountUrl == confirmed[i].target.accountUrl && t.platformId == confirmed[i].target.platformId)
+            {
+                validTarget = true;
+                break;
+            }
+        }
+        if (!validTarget)
+        {
+            confirmed[i].target = cfg.targets[i % cfg.targets.size()];
+        }
+    }
+
+    _saveStep3Settings();
+    const int added = m_panePublishing->appendToPublishQueue(cfg, confirmed, /*armContinuous=*/true);
+    if (added > 0)
+    {
+        for (const auto &it : confirmed)
+        {
+            m_reviewWidget->removeCandidateByShortCode(it.creative.shortCode);
+        }
+        const int totalQueuedNow = m_panePublishing->queuedItemCount();
+        m_reviewWidget->setBannerText(
+            tr("✓ Added <b>%1 creative(s)</b> to the live Publish Queue (<b>%2 queued</b> total). "
+               "You can keep curating & adding more little by little as new generations finish, or open <b>Step 3</b> to inspect timing.")
+                .arg(added).arg(totalQueuedNow));
+    }
+    m_showingCompletedPublishQueue = true;
+    _refreshStep3QueueTable();
+    _updateStep3Buttons();
+    _updateHeaderAndStepBadges();
+}
+
 void PaneWorkflow::startStep3PublishJob()
 {
-    if (!m_panePublishing || !m_reviewWidget || m_panePublishing->isJobRunning())
+    if (!m_panePublishing || !m_reviewWidget)
     {
+        return;
+    }
+    if (m_panePublishing->isJobRunning() || m_panePublishing->isPublicationArmed())
+    {
+        addSelectedStep2ToPublishQueue();
         return;
     }
     const auto cfg = _currentPublishConfig();
@@ -2298,9 +3213,13 @@ void PaneWorkflow::startStep3PublishJob()
     }
 
     _saveStep3Settings();
-    m_showingCompletedPublishQueue = true;
     m_publishLogConsole->clear();
-    m_panePublishing->startPlannedPublishJob(cfg, confirmed);
+    m_panePublishing->startPlannedPublishJob(cfg, confirmed, /*armContinuous=*/true);
+    for (const auto &it : confirmed)
+    {
+        m_reviewWidget->removeCandidateByShortCode(it.creative.shortCode);
+    }
+    m_showingCompletedPublishQueue = true;
     _refreshStep3QueueTable();
     _updateStep3Buttons();
     _updateHeaderAndStepBadges();
@@ -2379,6 +3298,21 @@ void PaneWorkflow::_updateHeaderAndStepBadges()
             ? tr("Clear Gemini Chats (%1)").arg(cachedChatsCount)
             : tr("Clear Gemini Chats"));
     }
+    const bool genActiveOrPaused = m_genDaemonActive
+        || m_syncingStats
+        || (m_paneGeneration && (m_paneGeneration->isAutoBatchRunning() || m_paneGeneration->hasPausedAutoBatch()));
+    const bool pubRunning = m_panePublishing && m_panePublishing->isJobRunning();
+    const bool pubArmed = m_panePublishing && m_panePublishing->isPublicationArmed();
+    const int queuedPublishCount = m_panePublishing ? m_panePublishing->queuedItemCount() : 0;
+
+    if (m_btnStopGenerationTop)
+    {
+        m_btnStopGenerationTop->setEnabled(genActiveOrPaused);
+    }
+    if (m_btnStopPublicationTop)
+    {
+        m_btnStopPublicationTop->setEnabled(pubRunning || pubArmed);
+    }
     if (m_btnStep1)
     {
         if (m_paneGeneration && m_paneGeneration->hasPausedAutoBatch() && !m_paneGeneration->isAutoBatchRunning())
@@ -2392,6 +3326,36 @@ void PaneWorkflow::_updateHeaderAndStepBadges()
                     "border: 1px solid rgba(251, 191, 36, 0.70); border-radius: 6px; padding: 6px 12px; }"));
             }
         }
+        else if (m_genDaemonActive)
+        {
+            const QString nextStr = m_genDaemonNextCycleUtc.isValid()
+                ? m_genDaemonNextCycleUtc.toLocalTime().toString(QStringLiteral("HH:mm"))
+                : tr("running");
+            if (m_genDaemonPassTotal > m_genDaemonMaxPerWindow && m_genDaemonMaxPerWindow > 0)
+            {
+                int fmtCnt = 0;
+                if (m_genDaemonBatchSpec.value(QStringLiteral("includeImage")).toBool()) ++fmtCnt;
+                if (m_genDaemonBatchSpec.value(QStringLiteral("includeCarousel")).toBool()) ++fmtCnt;
+                if (m_genDaemonBatchSpec.value(QStringLiteral("includeVideo")).toBool()) ++fmtCnt;
+                const int slotsPerEntry = qMax(1, m_genDaemonBatchSpec.value(QStringLiteral("generationsPerProduct")).toInt(1))
+                    * qMax(1, fmtCnt);
+                const int doneInPass = qBound(
+                    0,
+                    m_genDaemonNextProdIdx * slotsPerEntry + m_genDaemonNextSlotIdx,
+                    m_genDaemonPassTotal);
+                m_btnStep1->setText(tr("1. Pick Products (● %1/%2 · ≤%3/%4h · next %5)")
+                    .arg(doneInPass)
+                    .arg(m_genDaemonPassTotal)
+                    .arg(m_genDaemonMaxPerWindow)
+                    .arg(m_genDaemonIntervalHours)
+                    .arg(nextStr));
+            }
+            else
+            {
+                m_btnStep1->setText(tr("1. Pick Products (● Every %1h · next %2)")
+                    .arg(m_genDaemonIntervalHours).arg(nextStr));
+            }
+        }
         else
         {
             m_btnStep1->setText(tr("1. Pick Products (%1 checked)").arg(m_checkedProductIds.size()));
@@ -2402,13 +3366,17 @@ void PaneWorkflow::_updateHeaderAndStepBadges()
     {
         m_btnStep2->setText(m_step2Initialized
             ? tr("2. Review Generated Content (%1/%2 selected)").arg(reviewedChecked).arg(m_reviewWidget->totalCount())
-            : tr("2. Review Generated Content (%1 ready)").arg(unpublishedCount));
+            : tr("2. Review Generated Content (%1 ready)").arg(qMax(0, unpublishedCount - queuedPublishCount)));
     }
     if (m_btnStep3)
     {
-        if (m_panePublishing && m_panePublishing->isJobRunning())
+        if (pubRunning)
         {
-            m_btnStep3->setText(tr("3. Auto-Publish Jobs (● Running)"));
+            m_btnStep3->setText(tr("3. Auto-Publish Jobs (● Running · %1 queued)").arg(queuedPublishCount));
+        }
+        else if (pubArmed)
+        {
+            m_btnStep3->setText(tr("3. Auto-Publish Jobs (● Armed · %1 queued)").arg(queuedPublishCount));
         }
         else
         {

@@ -5586,7 +5586,11 @@ bool PaneGeneration::startAutoBatch(const QJsonObject &batchSpec)
 
     ui->toolBox->setCurrentIndex(1);
     discardPausedAutoBatch();
-    m_autoBatchTask = std::make_unique<QCoro::Task<void>>(_runAutoBatch(batchSpec, 0, 0, 0));
+    const int initStartProd = qMax(0, batchSpec.value(QStringLiteral("startProductIndex")).toInt(0));
+    const int initStartSlot = qMax(0, batchSpec.value(QStringLiteral("startSlotIndex")).toInt(0));
+    const int initPriorDone = qMax(0, batchSpec.value(QStringLiteral("priorCampaignCompleted")).toInt(0));
+    m_autoBatchTask = std::make_unique<QCoro::Task<void>>(
+        _runAutoBatch(batchSpec, initStartProd, initStartSlot, initPriorDone));
     return true;
 }
 
@@ -5640,12 +5644,17 @@ void PaneGeneration::_loadPausedAutoBatch()
         && nextSlot >= 0 && nextSlot < slotsPerProd)
     {
         m_pausedAutoBatch.active = true;
+        m_pausedAutoBatch.inFlight = obj.value(QStringLiteral("inFlight")).toBool(false);
         m_pausedAutoBatch.batchSpec = spec;
         m_pausedAutoBatch.nextProductIndex = nextProd;
         m_pausedAutoBatch.nextSlotIndex = nextSlot;
         m_pausedAutoBatch.completedCreatives = qBound(0, obj.value(QStringLiteral("completedCreatives")).toInt(0), total);
         m_pausedAutoBatch.totalCreatives = total;
         m_pausedAutoBatch.limitReason = obj.value(QStringLiteral("limitReason")).toString();
+        if (m_pausedAutoBatch.inFlight && m_pausedAutoBatch.limitReason.isEmpty())
+        {
+            m_pausedAutoBatch.limitReason = tr("Interrupted by application exit/crash — ready to resume.");
+        }
         m_pausedAutoBatch.pausedAt = obj.value(QStringLiteral("pausedAt")).toString();
     }
     _refreshPausedAutoBatchBanner();
@@ -5668,6 +5677,7 @@ void PaneGeneration::_savePausedAutoBatch() const
     {
         sf.write(QJsonDocument{QJsonObject{
             {QStringLiteral("schemaVersion"), 1},
+            {QStringLiteral("inFlight"), m_pausedAutoBatch.inFlight},
             {QStringLiteral("batchSpec"), m_pausedAutoBatch.batchSpec},
             {QStringLiteral("nextProductIndex"), m_pausedAutoBatch.nextProductIndex},
             {QStringLiteral("nextSlotIndex"), m_pausedAutoBatch.nextSlotIndex},
@@ -5675,6 +5685,35 @@ void PaneGeneration::_savePausedAutoBatch() const
             {QStringLiteral("totalCreatives"), m_pausedAutoBatch.totalCreatives},
             {QStringLiteral("limitReason"), m_pausedAutoBatch.limitReason},
             {QStringLiteral("pausedAt"), m_pausedAutoBatch.pausedAt}
+        }}.toJson(QJsonDocument::Indented));
+        sf.commit();
+    }
+}
+
+void PaneGeneration::_writeInFlightBatchCheckpoint(const QJsonObject &spec,
+                                                   int prodIdx,
+                                                   int slotIdx,
+                                                   int completed,
+                                                   int total) const
+{
+    const QString path = _pausedAutoBatchFilePath();
+    if (path.isEmpty() || spec.isEmpty() || total <= 0)
+    {
+        return;
+    }
+    QSaveFile sf{path};
+    if (sf.open(QIODevice::WriteOnly))
+    {
+        sf.write(QJsonDocument{QJsonObject{
+            {QStringLiteral("schemaVersion"), 1},
+            {QStringLiteral("inFlight"), true},
+            {QStringLiteral("batchSpec"), spec},
+            {QStringLiteral("nextProductIndex"), prodIdx},
+            {QStringLiteral("nextSlotIndex"), slotIdx},
+            {QStringLiteral("completedCreatives"), completed},
+            {QStringLiteral("totalCreatives"), total},
+            {QStringLiteral("limitReason"), tr("Interrupted by application exit/crash — ready to resume.")},
+            {QStringLiteral("pausedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
         }}.toJson(QJsonDocument::Indented));
         sf.commit();
     }
@@ -5723,6 +5762,11 @@ int PaneGeneration::pausedAutoBatchRemaining() const
     {
         return 0;
     }
+    const int explicitWindowRem = m_pausedAutoBatch.batchSpec.value(QStringLiteral("maxCreativesThisRun")).toInt(0);
+    if (explicitWindowRem > 0)
+    {
+        return explicitWindowRem;
+    }
     const int slotsPerProd = slotsPerProductForSpec(m_pausedAutoBatch.batchSpec);
     const int cursor = m_pausedAutoBatch.nextProductIndex * slotsPerProd + m_pausedAutoBatch.nextSlotIndex;
     return qMax(1, m_pausedAutoBatch.totalCreatives - cursor);
@@ -5731,6 +5775,11 @@ int PaneGeneration::pausedAutoBatchRemaining() const
 QString PaneGeneration::pausedAutoBatchReason() const
 {
     return m_pausedAutoBatch.active ? m_pausedAutoBatch.limitReason : QString{};
+}
+
+bool PaneGeneration::wasPausedAutoBatchCrashInterrupted() const
+{
+    return m_pausedAutoBatch.active && m_pausedAutoBatch.inFlight;
 }
 
 bool PaneGeneration::resumePausedAutoBatch(const QString &promptCliOverride,
@@ -5776,6 +5825,7 @@ bool PaneGeneration::resumePausedAutoBatch(const QString &promptCliOverride,
     const int startSlot = m_pausedAutoBatch.nextSlotIndex;
     const int priorDone = m_pausedAutoBatch.completedCreatives;
     m_pausedAutoBatch.active = false;
+    m_pausedAutoBatch.inFlight = false;
     _refreshPausedAutoBatchBanner();
     emit pausedAutoBatchChanged();
 
@@ -5927,6 +5977,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         qint64 bestViews = 0;
         int successCount = 0;
         int lowPerformerCount = 0;
+        QSet<QString> failedProductIds;
         bool isMeasuredWinner = false;
         bool isRetired = false;
         QString bestStrategy;
@@ -5941,6 +5992,12 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         const QJsonObject item = rawApprovedRefs[i].toObject();
         const QJsonObject ref = item.value(QStringLiteral("reference")).toObject();
         const QString refId = ref.value(QStringLiteral("id")).toString();
+        if (ref.value(QStringLiteral("status")).toString() == QLatin1String("auto_discarded")
+            || ref.value(QStringLiteral("status")).toString() == QLatin1String("rejected"))
+        {
+            ++retiredLowPerformerRefs;
+            continue;
+        }
         RankedRef rr;
         rr.reference = ref;
         rr.mediaPath = item.value(QStringLiteral("mediaPath")).toString();
@@ -5952,6 +6009,10 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             rr.bestViews = rp.bestViews;
             rr.successCount = rp.successCount;
             rr.lowPerformerCount = rp.lowPerformerCount;
+            for (const QString &fpid : rp.failedProductIds)
+            {
+                rr.failedProductIds.insert(fpid);
+            }
             rr.isMeasuredWinner = rp.isWinner;
             rr.isRetired = rp.isRetired;
             rr.bestStrategy = rp.bestStrategy;
@@ -5960,7 +6021,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         }
         if (rr.isRetired)
         {
-            // Stop reusing any source once it accumulates >= 2 low-performing posts
+            // Stop reusing any source once it accumulates >= 4 low-performing posts across >= 2 products
             ++retiredLowPerformerRefs;
             continue;
         }
@@ -6004,16 +6065,34 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             freshPoolIndices.append(i);
         }
     }
-    int winnerCursor = 0;
-    int freshCursor = 0;
+    m_lastBatchReachedWindowCap = false;
+    m_lastBatchNextProductIndex = 0;
+    m_lastBatchNextSlotIndex = 0;
+    m_lastBatchGeneratedCount = 0;
+
     const int safeStartProd = qBound(0, startProductIdx, int(products.size()));
     const int safeStartSlot = qBound(0, startSlotIdx, generationsPerProduct);
-    int batchSlotCounter = safeStartProd * generationsPerProduct;
+    int winnerCursor = safeStartProd;
+    int freshCursor = safeStartProd;
+    const int startLinearSlot = safeStartProd * generationsPerProduct + safeStartSlot;
+    int batchSlotCounter = startLinearSlot;
     QHash<QString, int> globalRefUseCounts;
 
-    const int totalCreatives = products.size() * generationsPerProduct;
+    const int totalCampaignSlots = products.size() * generationsPerProduct;
+    const int maxThisRun = batchSpec.value(QStringLiteral("maxCreativesThisRun")).toInt(0);
+    const int remainingFromCursor = qMax(0, totalCampaignSlots - startLinearSlot);
+    const int targetThisWindow = (maxThisRun > 0)
+        ? qMin(maxThisRun, remainingFromCursor)
+        : totalCampaignSlots;
+    const int totalCreatives = (maxThisRun > 0)
+        ? qMax(1, qMax(0, priorCompleted) + targetThisWindow)
+        : totalCampaignSlots;
     int completedCreatives = qBound(0, priorCompleted, totalCreatives);
-    int attemptedCreatives = qBound(0, safeStartProd * generationsPerProduct + safeStartSlot, totalCreatives);
+    int attemptedCreatives = (maxThisRun > 0)
+        ? completedCreatives
+        : qBound(0, startLinearSlot, totalCreatives);
+    int generatedThisCall = 0;
+    bool reachedWindowCap = false;
     m_runGenerations.clear();
     m_runVideoFormatLabel = videoFormatLabel;
     m_batchCancelled = false;
@@ -6053,19 +6132,36 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
 
     emit autoBatchStarted(totalCreatives);
 
-    _logProgress(tr("Starting Auto-Batch: %1 product(s) × %2 per format × %3 format(s) = %4 creative(s) "
-                    "(%5 active reference(s), %6 proven winner(s) privileged, %7 retired ≥2-flop source(s) skipped · Content CLI: %8 · Image CLI: %9).")
-        .arg(products.size())
-        .arg(generationsPerFormat)
-        .arg(enabledFormats.size())
-        .arg(totalCreatives)
-        .arg(rankedRefs.size())
-        .arg(winnerRefIndices.size())
-        .arg(retiredLowPerformerRefs)
-        .arg(promptCli->getName(), imgCli->getName()));
+    if (maxThisRun > 0 && totalCampaignSlots > totalCreatives)
+    {
+        _logProgress(tr("Starting Auto-Batch Window: generating up to %1 creative(s) in this window "
+                        "(pass cursor %2/%3 across %4 campaign slot(s) · %5 active reference(s), %6 proven winner(s) privileged, "
+                        "%7 auto-discarded/retired source(s) skipped · Content CLI: %8 · Image CLI: %9).")
+            .arg(targetThisWindow)
+            .arg(startLinearSlot + 1)
+            .arg(totalCampaignSlots)
+            .arg(totalCampaignSlots)
+            .arg(rankedRefs.size())
+            .arg(winnerRefIndices.size())
+            .arg(retiredLowPerformerRefs)
+            .arg(promptCli->getName(), imgCli->getName()));
+    }
+    else
+    {
+        _logProgress(tr("Starting Auto-Batch: %1 product(s) × %2 per format × %3 format(s) = %4 creative(s) "
+                        "(%5 active reference(s), %6 proven winner(s) privileged, %7 auto-discarded/retired source(s) skipped · Content CLI: %8 · Image CLI: %9).")
+            .arg(products.size())
+            .arg(generationsPerFormat)
+            .arg(enabledFormats.size())
+            .arg(totalCreatives)
+            .arg(rankedRefs.size())
+            .arg(winnerRefIndices.size())
+            .arg(retiredLowPerformerRefs)
+            .arg(promptCli->getName(), imgCli->getName()));
+    }
     if (rankedRefs.isEmpty() && retiredLowPerformerRefs > 0)
     {
-        _logProgress(tr("⚠ All %1 approved inspiration(s) had ≥2 low-performing posts and were retired — "
+        _logProgress(tr("⚠ All %1 approved inspiration(s) failed ≥4 times across ≥2 products and were auto-discarded — "
                         "generating fresh editorial A/B scenes from product photos until new inspirations are approved.")
             .arg(retiredLowPerformerRefs));
     }
@@ -6075,10 +6171,11 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
     int pausedProductIdx = safeStartProd;
     int pausedSlotIdx = safeStartSlot;
 
-    for (int pIdx = safeStartProd; pIdx < products.size() && !m_batchCancelled && !hitHardStopError; ++pIdx)
+    for (int pIdx = safeStartProd; pIdx < products.size() && !m_batchCancelled && !hitHardStopError && !reachedWindowCap; ++pIdx)
     {
         const int firstSlotForProduct = (pIdx == safeStartProd) ? safeStartSlot : 0;
         const QJsonObject product = products[pIdx].toObject();
+        const int roundOrdinal = qMax(0, product.value(QStringLiteral("roundOrdinal")).toInt(0));
         const QString productId = product.value(QStringLiteral("id")).toString();
         const QString productTitle = product.value(QStringLiteral("title")).toString().trimmed();
         const QString productColor = product.value(QStringLiteral("color")).toString().trimmed();
@@ -6124,7 +6221,13 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         const auto sampledVariants = PropertySampler::sampleVariants(
             *m_properties, *m_videos, generationsPerProduct);
 
-        m_projects->resetStagingDir(row);
+        const QString resumeSlotCheckpointPath = m_projects->stagingDir(row).filePath(
+            QStringLiteral("auto_slot_%1/slot_checkpoint.json")
+                .arg(firstSlotForProduct + 1, 2, 10, QLatin1Char('0')));
+        if (!QFileInfo::exists(resumeSlotCheckpointPath))
+        {
+            m_projects->resetStagingDir(row);
+        }
         const QDir baseStaging = m_projects->stagingDir(row);
         const QDir planDir{baseStaging.absoluteFilePath(QStringLiteral("auto_plan"))};
         QDir{}.mkpath(planDir.absolutePath());
@@ -6155,6 +6258,42 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             QStringList slideTexts;
         };
 
+        const QDate currentSeasonDate = InspirationAdaptationMethod::effectiveCurrentDate();
+        const QString productSeasonText = productSummary + QLatin1Char(' ') + productCategory;
+        const QString productSeasonRule = InspirationAdaptationMethod::seasonalGuardrailInstruction(
+            productSeasonText, currentSeasonDate);
+
+        // Filter ranked inspirations for seasonal & footwear-weather compatibility with THIS product
+        QList<int> compatWinnerIndices;
+        QList<int> compatFreshIndices;
+        for (int idx : winnerRefIndices)
+        {
+            QString clashWhy;
+            if (InspirationAdaptationMethod::hasReferenceSeasonalClash(
+                    rankedRefs[idx].reference, product, currentSeasonDate, &clashWhy))
+            {
+                _logProgress(tr("[Product %1/%2] Skipping seasonally incompatible winner inspiration \"%3\" (%4).")
+                    .arg(pIdx + 1).arg(products.size())
+                    .arg(rankedRefs[idx].reference.value(QStringLiteral("title")).toString(), clashWhy));
+                continue;
+            }
+            compatWinnerIndices.append(idx);
+        }
+        for (int idx : freshPoolIndices)
+        {
+            QString clashWhy;
+            if (InspirationAdaptationMethod::hasReferenceSeasonalClash(
+                    rankedRefs[idx].reference, product, currentSeasonDate, &clashWhy))
+            {
+                _logProgress(tr("[Product %1/%2] Skipping seasonally incompatible inspiration \"%3\" (%4).")
+                    .arg(pIdx + 1).arg(products.size())
+                    .arg(rankedRefs[idx].reference.value(QStringLiteral("title")).toString(), clashWhy));
+                continue;
+            }
+            compatFreshIndices.append(idx);
+        }
+        const bool hasAnyCompatRef = !compatWinnerIndices.isEmpty() || !compatFreshIndices.isEmpty();
+
         QList<PlannedSlot> slotsForProduct;
         QHash<QString, QStringList> cachedPlanFramesByRefId;
         QHash<QString, int> refUseCounts;
@@ -6166,7 +6305,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             PlannedSlot slot;
             slot.kind = enabledFormats[s % enabledFormats.size()];
             const bool isVideoSlot = (slot.kind == GenerationJob::Video);
-            const int methodSlotIndex = isVideoSlot ? videoSlotCounter++ : s;
+            const int methodSlotIndex = (isVideoSlot ? videoSlotCounter++ : s) + roundOrdinal;
             slot.formatName = slot.kind == GenerationJob::Video
                 ? QStringLiteral("video")
                 : (slot.kind == GenerationJob::Slideshow
@@ -6174,7 +6313,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                        : QStringLiteral("image"));
             // Privilege proven winners from their very 1st success across 80% of batch slots
             // (slots 0..3 of every 5), reserving 20% (slot 4 of every 5) to explore fresh sources.
-            if (!winnerRefIndices.isEmpty() && !freshPoolIndices.isEmpty())
+            if (!compatWinnerIndices.isEmpty() && !compatFreshIndices.isEmpty())
             {
                 slot.isExploration = ((globalSlot % 5) == 4);
             }
@@ -6187,36 +6326,45 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             int totalPriorForRef = 0;
             QString refBestMethodId;
 
-            if (!rankedRefs.isEmpty())
+            if (hasAnyCompatRef)
             {
+                auto pickFromFreshPoolForProduct = [&]() -> int {
+                    for (int attempt = 0; attempt < compatFreshIndices.size(); ++attempt)
+                    {
+                        const int cand = compatFreshIndices[(freshCursor + attempt) % compatFreshIndices.size()];
+                        if (!productId.isEmpty() && !rankedRefs[cand].failedProductIds.contains(productId))
+                        {
+                            freshCursor += attempt + 1;
+                            return cand;
+                        }
+                    }
+                    const int fallback = compatFreshIndices[freshCursor % compatFreshIndices.size()];
+                    ++freshCursor;
+                    return fallback;
+                };
+
                 int chosenRefIdx = 0;
                 if (!slot.isExploration)
                 {
-                    if (!winnerRefIndices.isEmpty())
+                    if (!compatWinnerIndices.isEmpty())
                     {
-                        chosenRefIdx = winnerRefIndices[winnerCursor % winnerRefIndices.size()];
+                        chosenRefIdx = compatWinnerIndices[winnerCursor % compatWinnerIndices.size()];
                         ++winnerCursor;
-                    }
-                    else if (!freshPoolIndices.isEmpty())
-                    {
-                        chosenRefIdx = freshPoolIndices[freshCursor % freshPoolIndices.size()];
-                        ++freshCursor;
                     }
                     else
                     {
-                        chosenRefIdx = globalSlot % rankedRefs.size();
+                        chosenRefIdx = pickFromFreshPoolForProduct();
                     }
                 }
                 else
                 {
-                    if (!freshPoolIndices.isEmpty())
+                    if (!compatFreshIndices.isEmpty())
                     {
-                        chosenRefIdx = freshPoolIndices[freshCursor % freshPoolIndices.size()];
-                        ++freshCursor;
+                        chosenRefIdx = pickFromFreshPoolForProduct();
                     }
                     else
                     {
-                        chosenRefIdx = winnerRefIndices[winnerCursor % winnerRefIndices.size()];
+                        chosenRefIdx = compatWinnerIndices[winnerCursor % compatWinnerIndices.size()];
                         ++winnerCursor;
                     }
                 }
@@ -6260,9 +6408,16 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
 
             if (!slot.method || slot.method->usesSceneProperties())
             {
-                slot.sampledProps = sampledVariants.value(s);
-                for (const auto &sp : slot.sampledProps)
+                for (const auto &sp : sampledVariants.value(s))
                 {
+                    if (InspirationAdaptationMethod::hasTextSeasonalClash(
+                            sp.valueName + QLatin1Char(' ') + sp.promptFragment,
+                            productSeasonText,
+                            currentSeasonDate))
+                    {
+                        continue;
+                    }
+                    slot.sampledProps << sp;
                     slot.keptValueIds << sp.id;
                 }
             }
@@ -6285,9 +6440,17 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             planPrompt += QStringLiteral("Target SEO keyword: %1\n").arg(productCategory);
         }
         planPrompt += QStringLiteral(
+            "SEASONAL & WEATHER COHERENCE (NON-NEGOTIABLE): %1\n"
+            "- Inspect any reference frames attached to each slot below against '%2' and the current season.\n"
+            "- If a slot's reference scene VISIBLY depicts out-of-season weather/decor (e.g. snow/frost/winter coats "
+            "in summer, sunny beach/poolside in winter) OR clashes with the footwear (e.g. open-toe sandals outdoors "
+            "in snow/ice/slush, or winter boots on a summer beach), set \"seasonalClash\": true and "
+            "\"seasonalClashReason\": \"<short reason>\" on that slot, and write \"prompt\" (and \"step2Prompt\" if "
+            "applicable) for a season-appropriate setting (such as a warm luxury indoor hotel lobby or evening lounge)!\n"
             "Style rules: tasteful, brand-safe fashion-editorial — NEVER hide or shrink the product; "
             "keep the product accurate and prominent in every frame.\n\n"
-            "Slots to plan:\n");
+            "Slots to plan:\n")
+            .arg(productSeasonRule, planProdFile);
         for (int s = 0; s < slotsForProduct.size(); ++s)
         {
             const auto &sl = slotsForProduct[s];
@@ -6369,7 +6532,8 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         planPrompt += QStringLiteral(
             "\nUsing your file tools, write ONE valid JSON object (no markdown fences) to '%1' "
             "in the current working directory with this exact shape:\n"
-            "{\"slots\": [{\"slot\": 0, \"prompt\": \"...\", \"step2Prompt\": \"\", \"hook\": \"...\", "
+            "{\"slots\": [{\"slot\": 0, \"seasonalClash\": false, \"seasonalClashReason\": \"\", "
+            "\"prompt\": \"...\", \"step2Prompt\": \"\", \"hook\": \"...\", "
             "\"description\": \"...\", \"hookCategory\": \"curiosity|contrarian|transformation|style_question|direct_value\", "
             "\"slideTexts\": [\"Slide 1 hook\", \"Slide 2 point\", \"Slide 3 detail\", \"Slide 4 CTA\"]}], "
             "\"hooks\": [{\"hook\": \"...\", \"description\": \"...\"}]%2}\n"
@@ -6504,6 +6668,36 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         {
             auto &sl = slotsForProduct[s];
             const QJsonObject so = plannedBySlot.value(s);
+            if (so.value(QStringLiteral("seasonalClash")).toBool(false) && !sl.reference.isEmpty())
+            {
+                const QString clashReason = so.value(QStringLiteral("seasonalClashReason")).toString().trimmed();
+                _logProgress(tr("[Product %1/%2 · Slot %3] ⚠ Visual seasonal/weather clash in reference%4 — switching to season-appropriate setting.")
+                    .arg(pIdx + 1).arg(products.size()).arg(s + 1)
+                    .arg(clashReason.isEmpty() ? QString{} : QStringLiteral(" (%1)").arg(clashReason)));
+                sl.reference = QJsonObject{};
+                sl.referenceMediaPath.clear();
+                sl.stagedPlanRefFrames.clear();
+                const bool keepTwoStep = (sl.kind == GenerationJob::Video && sl.method && sl.method->isTwoStepVideoStrategy());
+                const QString fallbackMethodId = keepTwoStep
+                    ? QStringLiteral("two_step_reveal")
+                    : QStringLiteral("editorial_ab");
+                sl.method = InspirationAdaptationMethod::all().value(fallbackMethodId, nullptr);
+                sl.strategy = fallbackMethodId;
+                if (sl.sampledProps.isEmpty())
+                {
+                    for (const auto &sp : sampledVariants.value(s))
+                    {
+                        if (!InspirationAdaptationMethod::hasTextSeasonalClash(
+                                sp.valueName + QLatin1Char(' ') + sp.promptFragment,
+                                productSeasonText,
+                                currentSeasonDate))
+                        {
+                            sl.sampledProps << sp;
+                            sl.keptValueIds << sp.id;
+                        }
+                    }
+                }
+            }
             QString basePrompt = so.value(QStringLiteral("prompt")).toString().trimmed();
             if (basePrompt.isEmpty())
             {
@@ -6551,6 +6745,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             finalizeCtx.adaptationNotes = sl.reference.value(QStringLiteral("notes")).toString();
             finalizeCtx.videoFormatLabel = videoFormatLabel;
             finalizeCtx.propertyFragments = slotPropFragments.join(QStringLiteral(". "));
+            finalizeCtx.seasonalGuidance = productSeasonRule;
 
             if (sl.kind == GenerationJob::Video && sl.method)
             {
@@ -6638,19 +6833,68 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
         }
 
         // Execute each planned slot unattended (resuming at firstSlotForProduct if paused earlier)
-        for (int s = firstSlotForProduct; s < slotsForProduct.size() && !m_batchCancelled && !hitHardStopError; ++s)
+        for (int s = firstSlotForProduct; s < slotsForProduct.size() && !m_batchCancelled && !hitHardStopError && !reachedWindowCap; ++s)
         {
+            QJsonObject ckptSpec = batchSpec;
+            if (maxThisRun > 0)
+            {
+                ckptSpec.insert(QStringLiteral("maxCreativesThisRun"), qMax(1, targetThisWindow - generatedThisCall));
+            }
+            _writeInFlightBatchCheckpoint(ckptSpec, pIdx, s, completedCreatives, totalCreatives);
             ++attemptedCreatives;
-            const auto &sl = slotsForProduct[s];
+            auto &sl = slotsForProduct[s];
+
+            const QDir slotStaging{baseStaging.absoluteFilePath(
+                QStringLiteral("auto_slot_%1").arg(s + 1, 2, 10, QLatin1Char('0')))};
+            QDir{}.mkpath(slotStaging.absolutePath());
+            const QString slotCkptPath = slotStaging.absoluteFilePath(QStringLiteral("slot_checkpoint.json"));
+            QJsonObject slotCkptObj;
+            {
+                QFile ckptFile{slotCkptPath};
+                if (ckptFile.open(QIODevice::ReadOnly))
+                {
+                    slotCkptObj = QJsonDocument::fromJson(ckptFile.readAll()).object();
+                }
+            }
+            if (!slotCkptObj.isEmpty())
+            {
+                const QString ckptStrategy = slotCkptObj.value(QStringLiteral("plannedStrategy")).toString();
+                if (!ckptStrategy.isEmpty())
+                {
+                    if (const auto *ckptMethod = InspirationAdaptationMethod::all().value(ckptStrategy, nullptr))
+                    {
+                        sl.method = ckptMethod;
+                        sl.strategy = ckptStrategy;
+                    }
+                }
+                const QString ckptPrompt = slotCkptObj.value(QStringLiteral("plannedPrompt")).toString();
+                if (!ckptPrompt.isEmpty())
+                {
+                    sl.prompt = ckptPrompt;
+                }
+                const QString ckptStep2Prompt = slotCkptObj.value(QStringLiteral("plannedStep2Prompt")).toString();
+                if (!ckptStep2Prompt.isEmpty())
+                {
+                    sl.step2Prompt = ckptStep2Prompt;
+                }
+                const QString ckptHook = slotCkptObj.value(QStringLiteral("plannedHook")).toString();
+                if (!ckptHook.isEmpty())
+                {
+                    sl.hook = ckptHook;
+                }
+                const QString ckptDesc = slotCkptObj.value(QStringLiteral("plannedDescription")).toString();
+                if (!ckptDesc.isEmpty())
+                {
+                    sl.description = ckptDesc;
+                }
+            }
+
             const QString slotTag = tr("Auto %1/%2 · %3 · %4")
                 .arg(attemptedCreatives)
                 .arg(totalCreatives)
                 .arg(productColor.isEmpty() ? productTitle.left(22) : productColor,
                      sl.formatName);
 
-            const QDir slotStaging{baseStaging.absoluteFilePath(
-                QStringLiteral("auto_slot_%1").arg(s + 1, 2, 10, QLatin1Char('0')))};
-            QDir{}.mkpath(slotStaging.absolutePath());
             QString snapErr;
             ResearchProject::snapshot(m_projects->projectDir(row), slotStaging, &snapErr);
 
@@ -6704,7 +6948,36 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                 }
                 const QString variantDirection = variantPropHints.join(QStringLiteral("; "));
 
-                for (int round = 1; round <= maxFidelityRounds && !m_batchCancelled; ++round)
+                auto writeSlotCheckpoint = [&](bool step0Done,
+                                               bool step1Done,
+                                               const QString &s1Video,
+                                               const QString &s1ConvUrl) {
+                    QSaveFile sf{slotCkptPath};
+                    if (sf.open(QIODevice::WriteOnly))
+                    {
+                        sf.write(QJsonDocument{QJsonObject{
+                            {QStringLiteral("schemaVersion"), 1},
+                            {QStringLiteral("plannedStrategy"), sl.strategy},
+                            {QStringLiteral("plannedPrompt"), sl.prompt},
+                            {QStringLiteral("plannedStep2Prompt"), sl.step2Prompt},
+                            {QStringLiteral("plannedHook"), sl.hook},
+                            {QStringLiteral("plannedDescription"), sl.description},
+                            {QStringLiteral("step0Done"), step0Done},
+                            {QStringLiteral("step1Done"), step1Done},
+                            {QStringLiteral("step1Video"), s1Video},
+                            {QStringLiteral("conversationUrl"), s1ConvUrl}
+                        }}.toJson(QJsonDocument::Indented));
+                        sf.commit();
+                    }
+                };
+
+                if (slotCkptObj.value(QStringLiteral("step0Done")).toBool() && QFileInfo::exists(swappedTarget))
+                {
+                    haveStartingFrame = true;
+                    _logProgress(tr("[%1] Reusing checkpointed starting frame from interrupted slot.").arg(slotTag));
+                }
+
+                for (int round = 1; !haveStartingFrame && round <= maxFidelityRounds && !m_batchCancelled; ++round)
                 {
                     _logProgress(tr("[%1] Step 1/2 — Generating starting frame via %2 (round %3/%4)...")
                         .arg(slotTag, slotMethod ? slotMethod->name() : sl.strategy)
@@ -6727,6 +7000,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                     stepCtx.videoFormatLabel = videoFormatLabel;
                     stepCtx.outputImageFile = GENERATED_IMAGE_NAME;
                     stepCtx.propertyFragments = variantDirection;
+                    stepCtx.seasonalGuidance = productSeasonRule;
                     stepCtx.refinementFixNote = swapFixNote;
 
                     const QString stepPrompt = slotMethod
@@ -6791,10 +7065,11 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                         "in the current working directory.\n"
                         "Check: (1) Does the featured product accurately match our exact real product "
                         "(silhouette, heel shape/height, straps, color/pattern)? "
-                        "(2) Is the frame crisp and free of watermarks, social icons, text, and garbled anatomy?%4\n"
+                        "(2) Is the frame crisp and free of watermarks, social icons, text, and garbled anatomy?%4 "
+                        "(4) Seasonal & footwear-weather coherence: %5\n"
                         "Reply with STRICT JSON only:\n"
                         "{\"ok\": true|false, \"fix\": \"<concise fix instruction if ok is false>\"}")
-                        .arg(GENERATED_IMAGE_NAME, stagedProdName, productSummary, stylingReq);
+                        .arg(GENERATED_IMAGE_NAME, stagedProdName, productSummary, stylingReq, productSeasonRule);
                     CliRunResult verifyRes;
                     verifyRes = co_await promptCli->runPrompt(verifyPrompt, slotStaging.absolutePath());
                     const QJsonObject vObj = parseFirstJsonObject(verifyRes.output);
@@ -6811,6 +7086,10 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                 if (hitHardStopError || m_batchCancelled)
                 {
                     break;
+                }
+                if (haveStartingFrame && !slotCkptObj.value(QStringLiteral("step0Done")).toBool())
+                {
+                    writeSlotCheckpoint(true, false, QString{}, QString{});
                 }
 
                 const QString frameToAnimate = haveStartingFrame ? swappedTarget : stagedProdPath;
@@ -6831,66 +7110,87 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                     QDir{}.mkpath(step1Dir.absolutePath());
                     QDir{}.mkpath(step2Dir.absolutePath());
 
-                    _logProgress(tr("[%1] Video Step 1/2 — Slow-motion bottom-to-top close-up reveal...").arg(slotTag));
-
-                    VideoGenerationWorkflow::Request req1;
-                    req1.generatorId = videoGeneratorId;
-                    req1.prompt = ensureImperativeVideoPrefix(sl.prompt);
-                    req1.imagePath = frameToAnimate;
-                    req1.outputDir = step1Dir.absolutePath();
-                    req1.contextSummary = QStringLiteral("%1 — Step 1 slow-mo bottom-to-top reveal (%2)").arg(productSummary, sl.hook);
-                    req1.videoFormatLabel = videoFormatLabel;
-                    req1.settings = m_generationSettings->settingsFor(videoGeneratorId);
-                    req1.settings.insert(QStringLiteral("keepConversation"), true);
-                    req1.chatMode = QStringLiteral("fresh");
-                    req1.messageAction = QStringLiteral("new");
-                    req1.decisionCli = promptCli;
-                    req1.imageCli = imgCli;
-                    req1.knownPitfalls = m_promptLessons->asPromptSection();
-                    req1.recordLesson = [this](const QString &lesson) {
-                        m_promptLessons->addLesson(lesson);
-                    };
-
-                    auto workflow1 = std::make_unique<VideoGenerationWorkflow>();
-                    if (m_progress.cancelBtn)
-                    {
-                        connect(m_progress.cancelBtn, &QPushButton::clicked,
-                                workflow1.get(), &VideoGenerationWorkflow::cancel);
-                    }
-                    connect(workflow1.get(), &VideoGenerationWorkflow::progress,
-                            this, [this, slotTag](const QString &msg) {
-                        _logProgress(QStringLiteral("[%1 · Step 1/2] %2").arg(slotTag, msg));
-                    });
-
                     QString step1VideoPath;
+                    QString step1ConvUrl;
                     QString step1Err;
-                    bool step1Done = false;
-                    connect(workflow1.get(), &VideoGenerationWorkflow::finished,
-                            this, [&step1VideoPath, &step1Err, &step1Done](const QString &vp, const QString &err) {
-                        step1VideoPath = vp;
-                        step1Err = err;
-                        step1Done = true;
-                    });
+                    std::unique_ptr<VideoGenerationWorkflow> workflow1;
 
-                    workflow1->start(req1);
-                    while (!step1Done)
+                    const QString ckptStep1Video = slotCkptObj.value(QStringLiteral("step1Video")).toString();
+                    const QString ckptStep1Conv = slotCkptObj.value(QStringLiteral("conversationUrl")).toString();
+                    if (slotCkptObj.value(QStringLiteral("step1Done")).toBool()
+                        && !ckptStep1Video.isEmpty() && QFileInfo::exists(ckptStep1Video))
                     {
-                        if (m_batchCancelled)
+                        step1VideoPath = ckptStep1Video;
+                        step1ConvUrl = ckptStep1Conv;
+                        _logProgress(tr("[%1] Reusing checkpointed Step 1 reveal video — resuming directly at Step 2...").arg(slotTag));
+                    }
+                    else
+                    {
+                        _logProgress(tr("[%1] Video Step 1/2 — Slow-motion bottom-to-top close-up reveal...").arg(slotTag));
+
+                        VideoGenerationWorkflow::Request req1;
+                        req1.generatorId = videoGeneratorId;
+                        req1.prompt = ensureImperativeVideoPrefix(sl.prompt);
+                        req1.imagePath = frameToAnimate;
+                        req1.outputDir = step1Dir.absolutePath();
+                        req1.contextSummary = QStringLiteral("%1 — Step 1 slow-mo bottom-to-top reveal (%2)").arg(productSummary, sl.hook);
+                        req1.videoFormatLabel = videoFormatLabel;
+                        req1.settings = m_generationSettings->settingsFor(videoGeneratorId);
+                        req1.settings.insert(QStringLiteral("keepConversation"), true);
+                        req1.chatMode = QStringLiteral("fresh");
+                        req1.messageAction = QStringLiteral("new");
+                        req1.decisionCli = promptCli;
+                        req1.imageCli = imgCli;
+                        req1.knownPitfalls = m_promptLessons->asPromptSection();
+                        req1.recordLesson = [this](const QString &lesson) {
+                            m_promptLessons->addLesson(lesson);
+                        };
+
+                        workflow1 = std::make_unique<VideoGenerationWorkflow>();
+                        if (m_progress.cancelBtn)
                         {
-                            workflow1->cancel();
+                            connect(m_progress.cancelBtn, &QPushButton::clicked,
+                                    workflow1.get(), &VideoGenerationWorkflow::cancel);
                         }
-                        co_await QCoro::sleepFor(std::chrono::milliseconds(50));
+                        connect(workflow1.get(), &VideoGenerationWorkflow::progress,
+                                this, [this, slotTag](const QString &msg) {
+                            _logProgress(QStringLiteral("[%1 · Step 1/2] %2").arg(slotTag, msg));
+                        });
+
+                        bool step1Done = false;
+                        connect(workflow1.get(), &VideoGenerationWorkflow::finished,
+                                this, [&step1VideoPath, &step1Err, &step1Done](const QString &vp, const QString &err) {
+                            step1VideoPath = vp;
+                            step1Err = err;
+                            step1Done = true;
+                        });
+
+                        workflow1->start(req1);
+                        while (!step1Done)
+                        {
+                            if (m_batchCancelled)
+                            {
+                                workflow1->cancel();
+                            }
+                            co_await QCoro::sleepFor(std::chrono::milliseconds(50));
+                        }
+
+                        step1ConvUrl = workflow1->lastConversationUrl();
+                        if (!step1VideoPath.isEmpty() && QFileInfo::exists(step1VideoPath) && !m_batchCancelled)
+                        {
+                            writeSlotCheckpoint(haveStartingFrame, true, step1VideoPath, step1ConvUrl);
+                        }
                     }
 
-                    const QString step1ConvUrl = workflow1->lastConversationUrl();
+                    const QVariantMap baseVidSettings = m_generationSettings->settingsFor(videoGeneratorId);
 
                     if (step1VideoPath.isEmpty() || !QFileInfo::exists(step1VideoPath))
                     {
-                        if (!step1ConvUrl.isEmpty() && req1.settings.value(QStringLiteral("deleteChatOnFinish"), true).toBool())
+                        if (!step1ConvUrl.isEmpty() && baseVidSettings.value(QStringLiteral("deleteChatOnFinish"), true).toBool())
                         {
                             if (auto *vGen = AbstractVideoGenerator::ALL_VIDEO_GENERATORS().value(videoGeneratorId))
                             {
-                                co_await vGen->deleteConversation(step1ConvUrl, req1.settings);
+                                co_await vGen->deleteConversation(step1ConvUrl, baseVidSettings);
                             }
                         }
                         if (isVideoQuotaFailure(workflow1.get(), step1Err) && !m_batchCancelled)
@@ -7140,6 +7440,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                     imgCtx.adaptationNotes = sl.reference.value(QStringLiteral("notes")).toString();
                     imgCtx.videoFormatLabel = videoFormatLabel;
                     imgCtx.propertyFragments = slotPropFrags.join(QStringLiteral(". "));
+                    imgCtx.seasonalGuidance = productSeasonRule;
 
                     bool attachRef = false;
                     effectiveImgPrompt = sl.method->buildStillOrCarouselPrompt(sl.prompt, imgCtx, &attachRef);
@@ -7249,35 +7550,58 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
             _saveChosenHookDescription(row, {{genDir, shortCode}}, sl.hook, sl.description);
 
             // Persist structured Creative DNA for closed-loop attribution & self-improvement
+            VideoClipProcessing::MotionGrade motionGrade;
+            if (sl.kind == GenerationJob::Video)
+            {
+                QString savedVideoPath;
+                const QFileInfoList savedMp4s = genDir.entryInfoList(
+                    {QStringLiteral("*.mp4"), QStringLiteral("*.mov"), QStringLiteral("*.webm")},
+                    QDir::Files, QDir::Name);
+                if (!savedMp4s.isEmpty())
+                {
+                    savedVideoPath = savedMp4s.first().absoluteFilePath();
+                }
+                if (!savedVideoPath.isEmpty())
+                {
+                    const bool expectsMultiAngles = sl.method && sl.method->isTwoStepVideoStrategy();
+                    motionGrade = co_await VideoClipProcessing::gradeClipMotion(savedVideoPath, expectsMultiAngles);
+                }
+            }
+
             QJsonArray propUuidArray;
             for (const QUuid &uid : sl.keptValueIds)
             {
                 propUuidArray.append(uid.toString(QUuid::WithoutBraces));
             }
-            QJsonObject dna{
-                {QStringLiteral("schemaVersion"), 1},
-                {QStringLiteral("shortCode"), shortCode},
-                {QStringLiteral("createdAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
-                {QStringLiteral("accountId"), accountId},
-                {QStringLiteral("productId"), productId},
-                {QStringLiteral("productTitle"), productTitle},
-                {QStringLiteral("productColor"), productColor},
-                {QStringLiteral("referenceId"), sl.reference.value(QStringLiteral("id")).toString()},
-                {QStringLiteral("referenceUrl"), sl.reference.value(QStringLiteral("url")).toString()},
-                {QStringLiteral("format"), sl.formatName},
-                {QStringLiteral("strategy"), sl.strategy},
-                {QStringLiteral("usedSceneProperties"), !sl.method || sl.method->usesSceneProperties()},
-                {QStringLiteral("isExploration"), sl.isExploration},
-                {QStringLiteral("hookCategory"), sl.hookCategory},
-                {QStringLiteral("hook"), sl.hook},
-                {QStringLiteral("hasSlideTextOverlay"), sl.kind == GenerationJob::Slideshow && carouselHookOverlay},
-                {QStringLiteral("prompt"), sl.prompt},
-                {QStringLiteral("propertyValueIds"), propUuidArray}
-            };
+            QJsonObject dna;
+            dna.insert(QStringLiteral("schemaVersion"), 1);
+            dna.insert(QStringLiteral("shortCode"), shortCode);
+            dna.insert(QStringLiteral("createdAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+            dna.insert(QStringLiteral("accountId"), accountId);
+            dna.insert(QStringLiteral("productId"), productId);
+            dna.insert(QStringLiteral("productTitle"), productTitle);
+            dna.insert(QStringLiteral("productColor"), productColor);
+            dna.insert(QStringLiteral("referenceId"), sl.reference.value(QStringLiteral("id")).toString());
+            dna.insert(QStringLiteral("referenceUrl"), sl.reference.value(QStringLiteral("url")).toString());
+            dna.insert(QStringLiteral("format"), sl.formatName);
+            dna.insert(QStringLiteral("strategy"), sl.strategy);
+            dna.insert(QStringLiteral("usedSceneProperties"), !sl.method || sl.method->usesSceneProperties());
+            dna.insert(QStringLiteral("isExploration"), sl.isExploration);
+            dna.insert(QStringLiteral("hookCategory"), sl.hookCategory);
+            dna.insert(QStringLiteral("hook"), sl.hook);
+            dna.insert(QStringLiteral("hasSlideTextOverlay"), sl.kind == GenerationJob::Slideshow && carouselHookOverlay);
+            dna.insert(QStringLiteral("prompt"), sl.prompt);
+            dna.insert(QStringLiteral("propertyValueIds"), propUuidArray);
             if (sl.kind == GenerationJob::Video && sl.method && sl.method->isTwoStepVideoStrategy())
             {
                 dna.insert(QStringLiteral("multiStepCount"), 2);
                 dna.insert(QStringLiteral("step2Prompt"), sl.step2Prompt);
+            }
+            if (sl.kind == GenerationJob::Video && motionGrade.error.isEmpty() && motionGrade.durationSec > 0.0)
+            {
+                dna.insert(QStringLiteral("outcomeQualityScore"), motionGrade.qualityScore);
+                dna.insert(QStringLiteral("openingFreezeSec"), motionGrade.openingFreezeSec);
+                dna.insert(QStringLiteral("sceneCutCount"), motionGrade.sceneCutCount);
             }
             {
                 QSaveFile dnaFile{genDir.filePath(QStringLiteral("creative_dna.json"))};
@@ -7287,6 +7611,7 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                     dnaFile.commit();
                 }
             }
+            QFile::remove(slotCkptPath);
 
             ++completedCreatives;
             m_autoBatchCompleted = completedCreatives;
@@ -7307,15 +7632,47 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
                     break;
                 }
             }
+            emit creativeGenerated(shortCode);
+
+            ++generatedThisCall;
+            m_lastBatchGeneratedCount = generatedThisCall;
+            if (maxThisRun > 0 && generatedThisCall >= targetThisWindow)
+            {
+                const int nextProd = (s + 1 < slotsForProduct.size()) ? pIdx : (pIdx + 1);
+                const int nextSlot = (s + 1 < slotsForProduct.size()) ? (s + 1) : 0;
+                if (nextProd < products.size())
+                {
+                    reachedWindowCap = true;
+                    m_lastBatchReachedWindowCap = true;
+                    m_lastBatchNextProductIndex = nextProd;
+                    m_lastBatchNextSlotIndex = nextSlot;
+                }
+                else
+                {
+                    m_lastBatchReachedWindowCap = false;
+                    m_lastBatchNextProductIndex = 0;
+                    m_lastBatchNextSlotIndex = 0;
+                }
+                break;
+            }
         }
 
-        m_projects->stagingDir(row).removeRecursively();
+        if (!hitHardStopError)
+        {
+            m_projects->stagingDir(row).removeRecursively();
+        }
     }
 
     if (hitHardStopError)
     {
+        QJsonObject pausedSpec = batchSpec;
+        if (maxThisRun > 0)
+        {
+            pausedSpec.insert(QStringLiteral("maxCreativesThisRun"), qMax(1, targetThisWindow - generatedThisCall));
+        }
         m_pausedAutoBatch.active = true;
-        m_pausedAutoBatch.batchSpec = batchSpec;
+        m_pausedAutoBatch.inFlight = false;
+        m_pausedAutoBatch.batchSpec = pausedSpec;
         m_pausedAutoBatch.nextProductIndex = qBound(0, pausedProductIdx, qMax(0, int(products.size()) - 1));
         m_pausedAutoBatch.nextSlotIndex = qBound(0, pausedSlotIdx, qMax(0, generationsPerProduct - 1));
         m_pausedAutoBatch.completedCreatives = completedCreatives;
@@ -7328,6 +7685,8 @@ QCoro::Task<void> PaneGeneration::_runAutoBatch(QJsonObject batchSpec,
     }
     else if (m_batchCancelled)
     {
+        m_pausedAutoBatch = PausedAutoBatchState{};
+        _savePausedAutoBatch();
         _finishProgress(tr("Auto-Batch cancelled. %1/%2 creative(s) saved.")
             .arg(completedCreatives).arg(totalCreatives));
     }

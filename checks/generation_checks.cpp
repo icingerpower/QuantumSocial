@@ -939,6 +939,48 @@ static void checkVideoClips(const QDir &root)
             && videoPixel(prepMerged3.path, 0.2).blue() > 200,
             "cumulative 3-turn merge extracts trailing segment and clears nativeMergedPath");
 
+    // 5) Deterministic motion/freeze & multi-angle cut outcome grader (VideoClipProcessing::gradeClipMotion):
+    const QString frozenOpeningClip = root.filePath("frozen_opening.mp4");
+    const QString multiAngleMovingClip = root.filePath("multi_angle_moving.mp4");
+    mediaCommand("ffmpeg", {"-v", "error", "-y",
+        "-f", "lavfi", "-i", "color=red:s=160x120:d=1.8:r=30",
+        "-f", "lavfi", "-i", "testsrc=s=160x120:d=1.6:r=30",
+        "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]", "-c:v", "libx264", frozenOpeningClip});
+    mediaCommand("ffmpeg", {"-v", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc=s=160x120:d=1.1:r=30",
+        "-f", "lavfi", "-i", "smptebars=s=160x120:d=0.15:r=30",
+        "-f", "lavfi", "-i", "rgbtestsrc=s=160x120:d=1.1:r=30",
+        "-f", "lavfi", "-i", "testsrc2=s=160x120:d=1.1:r=30",
+        "-filter_complex", "[0:v][1:v][2:v][3:v]concat=n=4:v=1:a=0[v]", "-map", "[v]", "-c:v", "libx264", multiAngleMovingClip});
+
+    VideoClipProcessing::MotionGrade gradeFrozen;
+    {
+        QEventLoop loop;
+        auto task = VideoClipProcessing::gradeClipMotion(frozenOpeningClip, true);
+        QCoro::connect(std::move(task), &loop, [&](VideoClipProcessing::MotionGrade g) {
+            gradeFrozen = std::move(g);
+            loop.quit();
+        });
+        loop.exec();
+    }
+    VideoClipProcessing::MotionGrade gradeMulti;
+    {
+        QEventLoop loop;
+        auto task = VideoClipProcessing::gradeClipMotion(multiAngleMovingClip, true);
+        QCoro::connect(std::move(task), &loop, [&](VideoClipProcessing::MotionGrade g) {
+            gradeMulti = std::move(g);
+            loop.quit();
+        });
+        loop.exec();
+    }
+    require(gradeFrozen.error.isEmpty() && gradeFrozen.durationSec >= 3.0 && gradeFrozen.openingFreezeSec >= 1.2,
+            "gradeClipMotion detects >=1.2s static opening freeze");
+    require(gradeMulti.error.isEmpty() && gradeMulti.durationSec >= 3.0
+                && gradeMulti.openingFreezeSec < 0.5 && gradeMulti.sceneCutCount >= 2,
+            "gradeClipMotion detects multi-angle scene cuts with zero opening freeze");
+    require(gradeMulti.qualityScore >= gradeFrozen.qualityScore + 20,
+            "gradeClipMotion ranks multi-angle moving video significantly higher than frozen-opening clip");
+
     ProductShowcaseMultiVideoWorkflow workflow;
     workflow.configure(2, "Intro", 1, "Continuation", 2);
     auto json = workflow.toJson();

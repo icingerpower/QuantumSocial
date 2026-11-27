@@ -74,6 +74,12 @@ public:
     }
     bool deleteCreativeByShortCode(const QString &shortCode, bool askConfirmation = true);
     bool needsStatsSyncBeforeGeneration() const;
+    bool isGenerationDaemonActive() const { return m_genDaemonActive; }
+    QDateTime nextGenerationCycleUtc() const { return m_genDaemonNextCycleUtc; }
+    QString generationDaemonStatePath() const;
+    bool restoreGenerationDaemon();
+    void scheduleStartupStatisticsCheck(int delayMs = 1200);
+    bool runPeriodicOrStartupStatsCheckIfDue(qint64 maxAgeSeconds = 12 * 3600);
 
 signals:
     void openResearchTabRequested();
@@ -88,7 +94,10 @@ public slots:
     void syncAccountStatisticsNow();
     void openClearGeminiChatsDialog();
     void startStep1Generation();
+    void addSelectedStep2ToPublishQueue();
     void startStep3PublishJob();
+    void stopGenerationWorkflow();
+    void stopPublicationWorkflow();
 
 private:
     QWidget *_buildStep1Page();
@@ -103,6 +112,11 @@ private:
     void _updateLimitBanner();
     void _saveStep1Settings() const;
     void _launchStep1AutoBatchNow();
+    void _saveGenerationDaemonState() const;
+    void _armGenerationDaemonTimer();
+    void _onGenerationDaemonTimerTick();
+    void _armContinuousStatsTimer();
+    void _onContinuousStatsTimerTick();
     QCoro::Task<void> _syncStatsCoroutine(bool startGenerationAfter);
 
     PanePublishing::PublishJobConfig _currentPublishConfig() const;
@@ -125,6 +139,8 @@ private:
     // Top persistent header & stepper
     QComboBox *m_accountCombo = nullptr;
     QLabel *m_headerSummaryLabel = nullptr;
+    QPushButton *m_btnStopGenerationTop = nullptr;
+    QPushButton *m_btnStopPublicationTop = nullptr;
     QPushButton *m_btnSyncStats = nullptr;
     QPushButton *m_btnClearGeminiChats = nullptr;
     QPushButton *m_btnStep1 = nullptr;
@@ -143,6 +159,9 @@ private:
     QLabel *m_prodPreviewCaption = nullptr;
     QLabel *m_inspirationsInfoLabel = nullptr;
     QSpinBox *m_spinGenPerProduct = nullptr;
+    QCheckBox *m_chkRepeatGeneration = nullptr;
+    QSpinBox *m_spinRepeatHours = nullptr;
+    QSpinBox *m_spinMaxPerWindow = nullptr;
     QComboBox *m_comboPromptCli = nullptr;
     QComboBox *m_comboImageCli = nullptr;
     QCheckBox *m_chkFormatVideo = nullptr;
@@ -166,6 +185,20 @@ private:
     QPushButton *m_btnGenerateAndNext = nullptr;
     QSet<QString> m_checkedProductIds;
     bool m_triggeredBatchFromWorkflow = false;
+    bool m_genDaemonActive = false;
+    int m_genDaemonIntervalHours = 6;
+    int m_genDaemonMaxPerWindow = 6;
+    int m_genDaemonCyclesCompleted = 0;
+    int m_genDaemonProductOffset = 0;
+    int m_genDaemonNextProdIdx = 0;
+    int m_genDaemonNextSlotIdx = 0;
+    int m_genDaemonPassTotal = 0;
+    int m_genDaemonPassesCompleted = 0;
+    QDateTime m_genDaemonNextCycleUtc;
+    QJsonObject m_genDaemonBatchSpec;
+    QJsonObject _buildUnrolledDaemonSpec(const QStringList &chosenIds) const;
+    QTimer *m_genDaemonTimer = nullptr;
+    QTimer *m_continuousStatsTimer = nullptr;
     bool m_syncingStats = false;
     bool m_statsSyncCancelled = false;
     std::shared_ptr<bool> m_statsSyncCancelToken;
@@ -179,6 +212,7 @@ private:
     QPushButton *m_btnRefreshCandidates = nullptr;
     WidgetCreativeReview *m_reviewWidget = nullptr;
     QPushButton *m_btnBackToStep1 = nullptr;
+    QPushButton *m_btnAddSelectedToQueue = nullptr;
     QPushButton *m_btnContinueToStep3 = nullptr;
     bool m_step2Initialized = false;
     bool m_aiPlanningInProgress = false;

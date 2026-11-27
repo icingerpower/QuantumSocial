@@ -12,6 +12,7 @@
 #include "model/TableAccounts.h"
 #include "model/TableProjects.h"
 #include "model/accounts/AbstractSocialAccount.h"
+#include "model/research/InspirationAdaptationMethod.h"
 #include "model/videos/SocialStatistics.h"
 #include "model/videos/TableVideos.h"
 
@@ -854,6 +855,8 @@ PanePublishing::PanePublishing(TableAccounts *accounts,
     connect(m_btnReconnect, &QPushButton::clicked, this, [this]() { reconnectBrowserSession(); });
     connect(m_btnOpenDebugDir, &QPushButton::clicked, this, &PanePublishing::openDebugLogsFolder);
     connect(m_btnClearLogs, &QPushButton::clicked, m_logConsole, &QPlainTextEdit::clear);
+
+    restorePersistedQueue();
 }
 
 PanePublishing::~PanePublishing()
@@ -1016,6 +1019,35 @@ void PanePublishing::_appendLog(const QString &line)
     emit logLineAppended(formatted);
 }
 
+int PanePublishing::queuedItemCount() const
+{
+    int count = 0;
+    for (const auto &it : m_queue)
+    {
+        if (it.status == QLatin1String("Queued") || it.status == QLatin1String("Uploading"))
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+QSet<QString> PanePublishing::queuedOrActiveShortCodes() const
+{
+    QSet<QString> codes;
+    for (const auto &it : m_queue)
+    {
+        if (it.status == QLatin1String("Queued")
+            || it.status == QLatin1String("Uploading")
+            || ((m_jobActive || m_continuousArmed)
+                && (it.status == QLatin1String("Published") || it.status == QLatin1String("Dry-run OK"))))
+        {
+            codes.insert(it.creative.shortCode.trimmed().toUpper());
+        }
+    }
+    return codes;
+}
+
 bool PanePublishing::canPublishNextNow() const
 {
     if (!m_jobActive || m_uploadingNow)
@@ -1168,6 +1200,7 @@ QList<PanePublishing::EligibleCreative> PanePublishing::_collectEligibleCreative
             item.strategy = dna.value(QStringLiteral("strategy")).toString();
             item.referenceUrl = dna.value(QStringLiteral("referenceUrl")).toString();
             item.dnaAccountId = dna.value(QStringLiteral("accountId")).toString();
+            item.outcomeQualityScore = dna.value(QStringLiteral("outcomeQualityScore")).toInt(-1);
         }
         else
         {
@@ -1176,12 +1209,17 @@ QList<PanePublishing::EligibleCreative> PanePublishing::_collectEligibleCreative
         list.append(item);
     }
 
-    // Oldest unpublished creatives first by default so mature generations get published in FIFO order
+    // Oldest unpublished creatives first by default so mature generations get published in FIFO order;
+    // within the same age cohort, surface highest Outcome Grader quality scores first!
     std::stable_sort(list.begin(), list.end(),
                      [](const EligibleCreative &a, const EligibleCreative &b) {
                          if (a.ageDays != b.ageDays)
                          {
                              return a.ageDays > b.ageDays;
+                         }
+                         if (a.outcomeQualityScore != b.outcomeQualityScore)
+                         {
+                             return a.outcomeQualityScore > b.outcomeQualityScore;
                          }
                          return a.shortCode < b.shortCode;
                      });
@@ -1896,17 +1934,21 @@ QCoro::Task<QList<PanePublishing::ScheduledItem>> PanePublishing::buildAiPlanned
     QJsonArray plannedJsonItems;
     if (config.plannerCli)
     {
+        const QString currentSeason = InspirationAdaptationMethod::currentSeasonLabel();
         QString prompt = QStringLiteral(
             "You are scheduling an automated social-media publishing queue.\n"
+            "Current calendar season: %4.\n"
             "Constraints:\n"
             "- Select exactly %1 creative(s) from the eligible unpublished candidates below.\n"
             "- Max posts per day per account: %2 (%3).\n"
             "- Item 0 MUST have \"delayMinutes\": 0 so the first post publishes immediately.\n"
+            "- Seasonal relevance: favor creatives whose product and hook/scene fit %4 (avoid out-of-season pairings "
+            "such as winter snow boots in summer or outdoor beach vibes in winter; indoor evening heels/sandals are great year-round).\n"
             "- Maximize variety: alternate different products/colors, formats (video vs carousel vs image), "
             "and hook categories so consecutive posts never look repetitive.\n")
             .arg(targetTotal)
             .arg(config.postsPerDay)
-            .arg(spacingDesc);
+            .arg(spacingDesc, currentSeason);
 
         prompt += videoTextExp.plannerPromptAddendum();
         prompt += refExp.plannerPromptAddendum();
@@ -2061,7 +2103,8 @@ QCoro::Task<QList<PanePublishing::ScheduledItem>> PanePublishing::buildAiPlanned
 }
 
 bool PanePublishing::startPlannedPublishJob(const PublishJobConfig &config,
-                                            const QList<ScheduledItem> &confirmedQueue)
+                                            const QList<ScheduledItem> &confirmedQueue,
+                                            bool armContinuous)
 {
     if (m_jobActive || config.targets.isEmpty() || confirmedQueue.isEmpty())
     {
@@ -2073,8 +2116,11 @@ bool PanePublishing::startPlannedPublishJob(const PublishJobConfig &config,
     applySpacingSchedule(m_queue, config);
     m_currentIndex = -1;
     m_jobActive = true;
+    m_continuousArmed = armContinuous;
+    m_needsPreUploadLiveSync = false;
     m_uploadingNow = false;
     m_cancelFlag = std::make_shared<bool>(false);
+    _savePersistedQueue();
     _refreshQueueTable();
     _updateActionButtons();
 
@@ -2112,6 +2158,7 @@ QCoro::Task<void> PanePublishing::_runPlannedJobCoroutine(
         {
             m_queue.clear();
             m_jobActive = false;
+            _savePersistedQueue();
             const QString syncDone = tr("Synced %1 live post(s) from TikTok — all selected creatives are already published!")
                 .arg(syncedPublishedCount);
             m_statusLabel->setText(syncDone);
@@ -2125,6 +2172,7 @@ QCoro::Task<void> PanePublishing::_runPlannedJobCoroutine(
 
     m_queue = confirmedQueue;
     applySpacingSchedule(m_queue, config);
+    _savePersistedQueue();
 
     const int baseIntervalMins = baseIntervalMinutesForConfig(config);
     const int perDayCap = qMax(1, config.postsPerDay);
@@ -2201,8 +2249,11 @@ bool PanePublishing::startPublishJob(const PublishJobConfig &config)
     m_queue.clear();
     m_currentIndex = -1;
     m_jobActive = true;
+    m_continuousArmed = false;
+    m_needsPreUploadLiveSync = false;
     m_uploadingNow = false;
     m_cancelFlag = std::make_shared<bool>(false);
+    _savePersistedQueue();
     _refreshQueueTable();
     _updateActionButtons();
 
@@ -2264,9 +2315,11 @@ QCoro::Task<void> PanePublishing::_runJobCoroutine(PublishJobConfig config,
     if (cancelToken && *cancelToken)
     {
         m_jobActive = false;
+        _savePersistedQueue();
         _updateActionButtons();
         co_return;
     }
+    _savePersistedQueue();
 
     _appendLog(tr("[AI-PLANNER] Planned %1 publish slot(s):").arg(m_queue.size()));
     for (int i = 0; i < m_queue.size(); ++i)
@@ -2487,7 +2540,7 @@ void PanePublishing::_updateActionButtons()
         }
     }
     if (m_btnNewJob) m_btnNewJob->setEnabled(!m_jobActive);
-    if (m_btnStopJob) m_btnStopJob->setEnabled(m_jobActive);
+    if (m_btnStopJob) m_btnStopJob->setEnabled(m_jobActive || m_continuousArmed);
     if (m_btnPublishNextNow) m_btnPublishNextNow->setEnabled(m_jobActive && !m_uploadingNow && hasQueued);
     if (m_statusLabel) emit statusTextChanged(m_statusLabel->text());
     emit jobStateChanged(m_jobActive);
@@ -2520,10 +2573,14 @@ void PanePublishing::_scheduleNextTimer()
                 ++pubCount;
             }
         }
-        const QString doneMsg = tr("Auto-Publish job completed: %1/%2 post(s) succeeded.")
-            .arg(pubCount).arg(m_queue.size());
+        const QString doneMsg = m_continuousArmed
+            ? tr("Auto-Publish queue drained (%1/%2 succeeded) — Continuous Publication remains armed for new creatives (click \"Stop Publication\" to stop).")
+                  .arg(pubCount).arg(m_queue.size())
+            : tr("Auto-Publish job completed: %1/%2 post(s) succeeded.")
+                  .arg(pubCount).arg(m_queue.size());
         m_statusLabel->setText(doneMsg);
         _appendLog(QStringLiteral("[JOB-DONE] ") + doneMsg);
+        _savePersistedQueue();
         _updateActionButtons();
         return;
     }
@@ -2570,13 +2627,14 @@ void PanePublishing::publishNextNow()
             break;
         }
     }
+    _savePersistedQueue();
     _refreshQueueTable();
     m_waitTimer->start(0);
 }
 
 void PanePublishing::stopJob()
 {
-    if (!m_jobActive)
+    if (!m_jobActive && !m_continuousArmed)
     {
         return;
     }
@@ -2594,9 +2652,12 @@ void PanePublishing::stopJob()
         }
     }
     m_jobActive = false;
+    m_continuousArmed = false;
+    m_needsPreUploadLiveSync = false;
     m_uploadingNow = false;
     m_statusLabel->setText(tr("Publish job stopped by user."));
     _appendLog(tr("[STOPPED] Publish job stopped by user."));
+    _savePersistedQueue();
     _refreshQueueTable();
     _updateActionButtons();
 }
@@ -2641,8 +2702,40 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
     m_currentIndex = itemIndex;
     m_uploadingNow = true;
     m_queue[itemIndex].status = QStringLiteral("Uploading");
+    _savePersistedQueue();
     _refreshQueueTable();
     _updateActionButtons();
+
+    const auto cancelToken = m_cancelFlag;
+    if (m_needsPreUploadLiveSync)
+    {
+        m_needsPreUploadLiveSync = false;
+        const PublishJobConfig syncCfg = m_activeConfig;
+        int syncedCount = 0;
+        syncedCount = co_await _syncLivePublicationsForTargets(syncCfg, cancelToken);
+        Q_UNUSED(syncedCount);
+        if (cancelToken && *cancelToken)
+        {
+            m_uploadingNow = false;
+            co_return;
+        }
+        if (m_videos)
+        {
+            const auto *recNow = m_videos->recordFromShortCode(m_queue[itemIndex].creative.shortCode);
+            if (recNow && recNow->published)
+            {
+                m_uploadingNow = false;
+                m_queue[itemIndex].status = QStringLiteral("Published");
+                m_queue[itemIndex].aiReason = tr("Verified already live on account after restart");
+                _appendLog(tr("[CRASH-RECOVERY] %1 is already published on %2 — skipping duplicate upload.")
+                    .arg(m_queue[itemIndex].creative.shortCode, m_queue[itemIndex].target.accountUrl));
+                _savePersistedQueue();
+                _refreshQueueTable();
+                _scheduleNextTimer();
+                co_return;
+            }
+        }
+    }
 
     const ScheduledItem item = m_queue[itemIndex];
     m_statusLabel->setText(tr("Publishing #%1/%2: %3 (%4) → %5...")
@@ -2665,12 +2758,11 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
         m_queue[itemIndex].status = QStringLiteral("Failed");
         m_queue[itemIndex].aiReason = tr("Platform auto-publisher unavailable");
         _appendLog(tr("[ERROR] Platform '%1' does not support auto-publishing.").arg(item.target.platformName));
+        _savePersistedQueue();
         _refreshQueueTable();
         _scheduleNextTimer();
         co_return;
     }
-
-    const auto cancelToken = m_cancelFlag;
 
     // Pre-publish caption & hashtag completeness check:
     // Never let an older generation (like QS-0001) go out with only "qs0001" and zero description/#hashtags!
@@ -2882,6 +2974,7 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
     {
         m_queue[itemIndex].status = QStringLiteral("Dry-run OK");
         m_queue[itemIndex].aiReason = tr("Verified upload + caption in Chrome (not posted)");
+        _savePersistedQueue();
         _refreshQueueTable();
         _scheduleNextTimer();
         co_return;
@@ -2942,6 +3035,7 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
 
         m_queue[itemIndex].status = QStringLiteral("Published");
         m_queue[itemIndex].aiReason = tr("Published via Chrome (%1)").arg(item.target.platformName);
+        _savePersistedQueue();
         _refreshQueueTable();
         _scheduleNextTimer();
         co_return;
@@ -2971,16 +3065,567 @@ QCoro::Task<void> PanePublishing::_executeItemCoroutine(int itemIndex)
             }
         }
         m_jobActive = false;
+        m_continuousArmed = false;
         m_waitTimer->stop();
         m_countdownUiTimer->stop();
         const QString stopMsg = tr("Job stopped automatically so you can inspect the issue: %1").arg(res.errorMessage);
         m_statusLabel->setText(stopMsg);
         _appendLog(QStringLiteral("[AUTO-STOP] ") + stopMsg);
+        _savePersistedQueue();
         _refreshQueueTable();
         _updateActionButtons();
         co_return;
     }
 
+    _savePersistedQueue();
     _refreshQueueTable();
     _scheduleNextTimer();
+}
+
+QString PanePublishing::persistedQueueFilePath() const
+{
+    return WorkingDirectoryManager::instance()->workingDir().filePath(QStringLiteral("publish_queue.json"));
+}
+
+QJsonObject PanePublishing::_configToJson(const PublishJobConfig &config) const
+{
+    QJsonArray targetArr;
+    for (const auto &t : config.targets)
+    {
+        targetArr.append(QJsonObject{
+            {QStringLiteral("platformId"), t.platformId},
+            {QStringLiteral("platformName"), t.platformName},
+            {QStringLiteral("accountUrl"), t.accountUrl},
+            {QStringLiteral("followers"), t.followers}
+        });
+    }
+    const QString spacingStr = (config.spacingMode == SpacingMode::EvenSpread24h)
+        ? QStringLiteral("even24h")
+        : ((config.spacingMode == SpacingMode::FixedInterval)
+               ? QStringLiteral("fixed")
+               : QStringLiteral("daytime12h"));
+    return QJsonObject{
+        {QStringLiteral("targets"), targetArr},
+        {QStringLiteral("maxDaysOld"), config.maxDaysOld},
+        {QStringLiteral("postsPerDay"), config.postsPerDay},
+        {QStringLiteral("totalPosts"), config.totalPosts},
+        {QStringLiteral("spacingMode"), spacingStr},
+        {QStringLiteral("fixedIntervalMinutes"), config.fixedIntervalMinutes},
+        {QStringLiteral("useSystemChromeProfile"), config.useSystemChromeProfile},
+        {QStringLiteral("muteOriginalAudio"), config.muteOriginalAudio},
+        {QStringLiteral("useSuggestedSound"), config.useSuggestedSound},
+        {QStringLiteral("dryRun"), config.dryRun},
+        {QStringLiteral("plannerCliName"), config.plannerCli ? config.plannerCli->getName() : QString{}},
+        {QStringLiteral("uploadUrlOverride"), config.uploadUrlOverride}
+    };
+}
+
+PanePublishing::PublishJobConfig PanePublishing::_configFromJson(const QJsonObject &obj) const
+{
+    PublishJobConfig cfg;
+    for (const QJsonValue &tv : obj.value(QStringLiteral("targets")).toArray())
+    {
+        const QJsonObject to = tv.toObject();
+        AccountTarget t;
+        t.platformId = to.value(QStringLiteral("platformId")).toString();
+        t.platformName = to.value(QStringLiteral("platformName")).toString();
+        t.accountUrl = to.value(QStringLiteral("accountUrl")).toString();
+        t.followers = to.value(QStringLiteral("followers")).toInteger(-1);
+        if (!t.platformId.isEmpty() && !t.accountUrl.isEmpty())
+        {
+            cfg.targets.append(t);
+        }
+    }
+    cfg.maxDaysOld = obj.value(QStringLiteral("maxDaysOld")).toInt(10);
+    cfg.postsPerDay = qMax(1, obj.value(QStringLiteral("postsPerDay")).toInt(3));
+    cfg.totalPosts = qMax(1, obj.value(QStringLiteral("totalPosts")).toInt(6));
+    const QString sp = obj.value(QStringLiteral("spacingMode")).toString();
+    if (sp == QLatin1String("even24h"))
+    {
+        cfg.spacingMode = SpacingMode::EvenSpread24h;
+    }
+    else if (sp == QLatin1String("fixed"))
+    {
+        cfg.spacingMode = SpacingMode::FixedInterval;
+    }
+    else
+    {
+        cfg.spacingMode = SpacingMode::DaytimeSpread12h;
+    }
+    cfg.fixedIntervalMinutes = qMax(5, obj.value(QStringLiteral("fixedIntervalMinutes")).toInt(60));
+    cfg.useSystemChromeProfile = obj.value(QStringLiteral("useSystemChromeProfile")).toBool(true);
+    cfg.muteOriginalAudio = obj.value(QStringLiteral("muteOriginalAudio")).toBool(true);
+    cfg.useSuggestedSound = obj.value(QStringLiteral("useSuggestedSound")).toBool(true);
+    cfg.dryRun = obj.value(QStringLiteral("dryRun")).toBool(false);
+    cfg.uploadUrlOverride = obj.value(QStringLiteral("uploadUrlOverride")).toString();
+    const QString cliName = obj.value(QStringLiteral("plannerCliName")).toString().trimmed();
+    if (!cliName.isEmpty())
+    {
+        for (AbstractCli *cli : m_clis)
+        {
+            if (cli && cli->getName() == cliName)
+            {
+                cfg.plannerCli = cli;
+                break;
+            }
+        }
+    }
+    return cfg;
+}
+
+void PanePublishing::_savePersistedQueue() const
+{
+    const QString path = persistedQueueFilePath();
+    if (path.isEmpty())
+    {
+        return;
+    }
+    QJsonArray itemsArr;
+    for (const auto &it : m_queue)
+    {
+        itemsArr.append(QJsonObject{
+            {QStringLiteral("shortCode"), it.creative.shortCode},
+            {QStringLiteral("platformId"), it.target.platformId},
+            {QStringLiteral("platformName"), it.target.platformName},
+            {QStringLiteral("accountUrl"), it.target.accountUrl},
+            {QStringLiteral("followers"), it.target.followers},
+            {QStringLiteral("delayMinutesFromPrevious"), it.delayMinutesFromPrevious},
+            {QStringLiteral("scheduledAt"), it.scheduledAt.toUTC().toString(Qt::ISODate)},
+            {QStringLiteral("addVideoText"), it.addVideoText},
+            {QStringLiteral("aiSuggestedVideoText"), it.aiSuggestedVideoText},
+            {QStringLiteral("videoOverlayText"), it.videoOverlayText},
+            {QStringLiteral("videoTextStyle"), it.videoTextStyle},
+            {QStringLiteral("aiReason"), it.aiReason},
+            {QStringLiteral("status"), it.status}
+        });
+    }
+    const QJsonObject root{
+        {QStringLiteral("schemaVersion"), 1},
+        {QStringLiteral("updatedAt"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+        {QStringLiteral("jobActive"), m_jobActive},
+        {QStringLiteral("armed"), m_continuousArmed},
+        {QStringLiteral("config"), _configToJson(m_activeConfig)},
+        {QStringLiteral("items"), itemsArr}
+    };
+    QSaveFile sf{path};
+    if (sf.open(QIODevice::WriteOnly))
+    {
+        sf.write(QJsonDocument{root}.toJson(QJsonDocument::Indented));
+        sf.commit();
+    }
+}
+
+void PanePublishing::_scheduleAppendedItems(QList<ScheduledItem> &existingQueue,
+                                            QList<ScheduledItem> &newItems,
+                                            const PublishJobConfig &config)
+{
+    if (newItems.isEmpty())
+    {
+        return;
+    }
+    const int perDayCap = qMax(1, config.postsPerDay);
+    const int baseIntervalMins = baseIntervalMinutesForConfig(config);
+    const QDateTime now = QDateTime::currentDateTime();
+
+    QHash<QString, int> accPostCount;
+    QHash<QString, QDateTime> accLastTime;
+    QHash<QString, QDateTime> accDayWindowStart;
+    QDateTime latestImmediateSlot = now;
+    bool anyImmediateAssigned = false;
+
+    // Seed per-account counters & last scheduled timestamps from active/recent items in existingQueue
+    for (const auto &ex : existingQueue)
+    {
+        if (ex.status != QLatin1String("Queued")
+            && ex.status != QLatin1String("Uploading")
+            && ex.status != QLatin1String("Published")
+            && ex.status != QLatin1String("Dry-run OK"))
+        {
+            continue;
+        }
+        if (!ex.scheduledAt.isValid() || ex.scheduledAt.secsTo(now) > 86400)
+        {
+            continue;
+        }
+        const QString accKey = QStringLiteral("%1|%2")
+            .arg(ex.target.platformId, ex.target.accountUrl.trimmed().toLower());
+        const int prior = accPostCount.value(accKey, 0);
+        if (prior == 0)
+        {
+            accDayWindowStart.insert(accKey, ex.scheduledAt);
+        }
+        accPostCount.insert(accKey, prior + 1);
+        if (!accLastTime.contains(accKey) || ex.scheduledAt > accLastTime.value(accKey))
+        {
+            accLastTime.insert(accKey, ex.scheduledAt);
+        }
+    }
+
+    for (int i = 0; i < newItems.size(); ++i)
+    {
+        ScheduledItem &it = newItems[i];
+        const QString accKey = QStringLiteral("%1|%2")
+            .arg(it.target.platformId, it.target.accountUrl.trimmed().toLower());
+        const int priorOnAcc = accPostCount.value(accKey, 0);
+
+        QDateTime slotTime;
+        if (priorOnAcc == 0)
+        {
+            if (!anyImmediateAssigned)
+            {
+                slotTime = now;
+                latestImmediateSlot = slotTime;
+                anyImmediateAssigned = true;
+            }
+            else
+            {
+                slotTime = latestImmediateSlot.addSecs(120);
+                latestImmediateSlot = slotTime;
+            }
+            accDayWindowStart.insert(accKey, slotTime);
+        }
+        else
+        {
+            const QDateTime prevAccTime = accLastTime.value(accKey, now);
+            const bool newDayForAcc = (priorOnAcc % perDayCap) == 0;
+            int waitMins = baseIntervalMins;
+
+            if (config.spacingMode == SpacingMode::EvenSpread24h)
+            {
+                waitMins = baseIntervalMins;
+                if (newDayForAcc)
+                {
+                    accDayWindowStart.insert(accKey, prevAccTime.addSecs(qint64(waitMins) * 60));
+                }
+            }
+            else if (config.spacingMode == SpacingMode::FixedInterval)
+            {
+                if (newDayForAcc)
+                {
+                    const QDateTime dayStart = accDayWindowStart.value(accKey, now);
+                    const qint64 elapsedMins = qMax<qint64>(0, dayStart.secsTo(prevAccTime) / 60);
+                    waitMins = qMax(baseIntervalMins, int(1440 - elapsedMins));
+                    accDayWindowStart.insert(accKey, prevAccTime.addSecs(qint64(waitMins) * 60));
+                }
+                else
+                {
+                    waitMins = baseIntervalMins;
+                }
+            }
+            else
+            {
+                const int maxJitter = qMin(15, qMax(2, baseIntervalMins / 5));
+                const int rawJitter = ((((existingQueue.size() + i) * 37) % (2 * maxJitter + 1)) - maxJitter);
+                waitMins = newDayForAcc
+                    ? (720 + qMax(0, rawJitter))
+                    : qMax(15, baseIntervalMins + rawJitter);
+                if (newDayForAcc)
+                {
+                    accDayWindowStart.insert(accKey, prevAccTime.addSecs(qint64(waitMins) * 60));
+                }
+            }
+            const QDateTime candidateTime = prevAccTime.addSecs(qint64(waitMins) * 60);
+            slotTime = (candidateTime > now) ? candidateTime : now;
+            if (!anyImmediateAssigned && slotTime == now)
+            {
+                anyImmediateAssigned = true;
+                latestImmediateSlot = now;
+            }
+        }
+
+        it.scheduledAt = slotTime;
+        it.status = QStringLiteral("Queued");
+        accPostCount.insert(accKey, priorOnAcc + 1);
+        accLastTime.insert(accKey, slotTime);
+    }
+
+    QList<ScheduledItem> combined = existingQueue;
+    combined.append(newItems);
+    for (int i = 0; i < combined.size(); ++i)
+    {
+        if (i == 0)
+        {
+            combined[i].delayMinutesFromPrevious = 0;
+        }
+        else
+        {
+            const qint64 secs = combined[i - 1].scheduledAt.secsTo(combined[i].scheduledAt);
+            combined[i].delayMinutesFromPrevious = qMax(0, int((secs + 30) / 60));
+        }
+    }
+    existingQueue = combined;
+}
+
+int PanePublishing::appendToPublishQueue(const PublishJobConfig &config,
+                                         const QList<ScheduledItem> &newItems,
+                                         bool armContinuous)
+{
+    if (config.targets.isEmpty() || newItems.isEmpty())
+    {
+        return 0;
+    }
+
+    const QSet<QString> alreadyActive = queuedOrActiveShortCodes();
+    QSet<QString> batchSeen;
+    QList<ScheduledItem> filtered;
+    for (int i = 0; i < newItems.size(); ++i)
+    {
+        ScheduledItem item = newItems[i];
+        const QString codeUpper = item.creative.shortCode.trimmed().toUpper();
+        if (codeUpper.isEmpty() || alreadyActive.contains(codeUpper) || batchSeen.contains(codeUpper))
+        {
+            continue;
+        }
+        if (m_videos)
+        {
+            const auto *rec = m_videos->recordFromShortCode(codeUpper);
+            if (rec && rec->published)
+            {
+                continue;
+            }
+        }
+        bool validTarget = false;
+        for (const auto &t : config.targets)
+        {
+            if (t.accountUrl == item.target.accountUrl && t.platformId == item.target.platformId)
+            {
+                validTarget = true;
+                break;
+            }
+        }
+        if (!validTarget)
+        {
+            item.target = config.targets[filtered.size() % config.targets.size()];
+        }
+        if (item.aiReason.trimmed().isEmpty())
+        {
+            item.aiReason = tr("Queued incrementally");
+        }
+        batchSeen.insert(codeUpper);
+        filtered.append(item);
+    }
+
+    if (filtered.isEmpty())
+    {
+        return 0;
+    }
+
+    // Update active config while keeping existing targets available if items in flight use them
+    PublishJobConfig mergedCfg = config;
+    for (const auto &oldT : m_activeConfig.targets)
+    {
+        bool found = false;
+        for (const auto &newT : mergedCfg.targets)
+        {
+            if (newT.platformId == oldT.platformId && newT.accountUrl == oldT.accountUrl)
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            mergedCfg.targets.append(oldT);
+        }
+    }
+    m_activeConfig = mergedCfg;
+    if (armContinuous)
+    {
+        m_continuousArmed = true;
+    }
+
+    const int prevSize = m_queue.size();
+    _scheduleAppendedItems(m_queue, filtered, m_activeConfig);
+    const int addedCount = m_queue.size() - prevSize;
+
+    const bool wasActive = m_jobActive;
+    if (!m_jobActive)
+    {
+        m_jobActive = true;
+        m_uploadingNow = false;
+        m_needsPreUploadLiveSync = m_activeConfig.uploadUrlOverride.isEmpty();
+        m_cancelFlag = std::make_shared<bool>(false);
+        _appendLog(tr("[JOB-START] Continuous Publish Queue active — added %1 creative(s) (%2 queued, max %3/day).")
+            .arg(addedCount).arg(queuedItemCount()).arg(m_activeConfig.postsPerDay));
+    }
+    else
+    {
+        _appendLog(tr("[QUEUE-APPEND] Added %1 creative(s) to live publish queue (%2 queued total, max %3/day).")
+            .arg(addedCount).arg(queuedItemCount()).arg(m_activeConfig.postsPerDay));
+    }
+
+    for (int idx = prevSize; idx < m_queue.size(); ++idx)
+    {
+        const auto &it = m_queue[idx];
+        _appendLog(tr("  + #%1 %2 (%3) → %4 at %5 (+%6m)")
+            .arg(idx + 1)
+            .arg(it.creative.shortCode, it.creative.format, it.target.accountUrl,
+                 it.scheduledAt.toString(QStringLiteral("yyyy-MM-dd HH:mm")))
+            .arg(it.delayMinutesFromPrevious));
+    }
+
+    _savePersistedQueue();
+    _refreshQueueTable();
+    _updateActionButtons();
+    if (!wasActive || !m_uploadingNow)
+    {
+        _scheduleNextTimer();
+    }
+    return addedCount;
+}
+
+bool PanePublishing::restorePersistedQueue()
+{
+    const QString path = persistedQueueFilePath();
+    if (path.isEmpty() || !QFileInfo::exists(path))
+    {
+        return false;
+    }
+    QFile f{path};
+    if (!f.open(QIODevice::ReadOnly))
+    {
+        return false;
+    }
+    const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+    const bool savedActive = root.value(QStringLiteral("jobActive")).toBool(false);
+    const bool savedArmed = root.value(QStringLiteral("armed")).toBool(false);
+    if (!savedActive && !savedArmed)
+    {
+        return false;
+    }
+
+    const PublishJobConfig restoredCfg = _configFromJson(root.value(QStringLiteral("config")).toObject());
+    if (restoredCfg.targets.isEmpty() || !m_videos || !m_projects)
+    {
+        return false;
+    }
+
+    // Index all unpublished creatives + allow reconstructing published history rows
+    QHash<QString, EligibleCreative> eligibleByCode;
+    for (const auto &ec : _collectEligibleCreatives(0, false))
+    {
+        eligibleByCode.insert(ec.shortCode.toUpper(), ec);
+    }
+
+    QList<ScheduledItem> historyItems;
+    QList<ScheduledItem> pendingItems;
+    bool hadInterruptedUpload = false;
+
+    for (const QJsonValue &iv : root.value(QStringLiteral("items")).toArray())
+    {
+        const QJsonObject io = iv.toObject();
+        const QString code = io.value(QStringLiteral("shortCode")).toString().trimmed();
+        const QString codeUpper = code.toUpper();
+        if (codeUpper.isEmpty())
+        {
+            continue;
+        }
+        const auto *rec = m_videos->recordFromShortCode(codeUpper);
+        if (!rec)
+        {
+            continue;
+        }
+
+        ScheduledItem item;
+        if (eligibleByCode.contains(codeUpper))
+        {
+            item.creative = eligibleByCode.value(codeUpper);
+        }
+        else
+        {
+            item.creative.videoId = rec->id;
+            item.creative.projectId = rec->projectId;
+            item.creative.projectRow = m_projects->rowOfId(rec->projectId);
+            item.creative.shortCode = rec->shortCode;
+            item.creative.format = QStringLiteral("video");
+            item.creative.productSummary = rec->shortCode;
+        }
+        item.target.platformId = io.value(QStringLiteral("platformId")).toString();
+        item.target.platformName = io.value(QStringLiteral("platformName")).toString();
+        item.target.accountUrl = io.value(QStringLiteral("accountUrl")).toString();
+        item.target.followers = io.value(QStringLiteral("followers")).toInteger(-1);
+        item.delayMinutesFromPrevious = io.value(QStringLiteral("delayMinutesFromPrevious")).toInt(0);
+        const QDateTime utcTime = QDateTime::fromString(io.value(QStringLiteral("scheduledAt")).toString(), Qt::ISODate);
+        item.scheduledAt = utcTime.isValid() ? utcTime.toLocalTime() : QDateTime::currentDateTime();
+        item.addVideoText = io.value(QStringLiteral("addVideoText")).toBool(false);
+        item.aiSuggestedVideoText = io.value(QStringLiteral("aiSuggestedVideoText")).toBool(false);
+        item.videoOverlayText = io.value(QStringLiteral("videoOverlayText")).toString();
+        item.videoTextStyle = io.value(QStringLiteral("videoTextStyle")).toString();
+        item.aiReason = io.value(QStringLiteral("aiReason")).toString();
+        item.status = io.value(QStringLiteral("status")).toString();
+
+        if (rec->published && item.status != QLatin1String("Published"))
+        {
+            item.status = QStringLiteral("Published");
+        }
+        else if (item.status == QLatin1String("Uploading"))
+        {
+            hadInterruptedUpload = true;
+            item.status = QStringLiteral("Queued");
+        }
+
+        if (item.status == QLatin1String("Queued"))
+        {
+            if (!item.creative.mediaPaths.isEmpty())
+            {
+                pendingItems.append(item);
+            }
+        }
+        else
+        {
+            historyItems.append(item);
+        }
+    }
+
+    m_activeConfig = restoredCfg;
+    m_continuousArmed = savedArmed;
+    m_uploadingNow = false;
+    m_currentIndex = -1;
+    m_cancelFlag = std::make_shared<bool>(false);
+
+    const QDateTime now = QDateTime::currentDateTime();
+    bool hasOverduePending = false;
+    for (const auto &p : pendingItems)
+    {
+        if (!p.scheduledAt.isValid() || p.scheduledAt < now)
+        {
+            hasOverduePending = true;
+            break;
+        }
+    }
+
+    if (!pendingItems.isEmpty() && hasOverduePending)
+    {
+        // Burst protection on crash/reboot recovery: re-space overdue items cleanly from now
+        m_queue = historyItems;
+        _scheduleAppendedItems(m_queue, pendingItems, m_activeConfig);
+    }
+    else
+    {
+        m_queue = historyItems;
+        m_queue.append(pendingItems);
+    }
+
+    m_needsPreUploadLiveSync = (hadInterruptedUpload || !pendingItems.isEmpty())
+        && m_activeConfig.uploadUrlOverride.isEmpty();
+    m_jobActive = !pendingItems.isEmpty();
+
+    _appendLog(tr("[CRASH-RECOVERY] Restored publish queue from disk (%1 pending, %2 completed, armed=%3).")
+        .arg(pendingItems.size())
+        .arg(historyItems.size())
+        .arg(m_continuousArmed ? QStringLiteral("true") : QStringLiteral("false")));
+    if (m_continuousArmed && pendingItems.isEmpty() && m_statusLabel)
+    {
+        m_statusLabel->setText(
+            tr("Continuous Publication armed (0 queued — add creatives from Step 2 anytime, or click \"Stop Publication\" to disarm)."));
+    }
+
+    _savePersistedQueue();
+    _refreshQueueTable();
+    _updateActionButtons();
+    if (m_jobActive)
+    {
+        m_waitTimer->start(50);
+    }
+    return true;
 }

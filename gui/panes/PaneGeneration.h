@@ -96,10 +96,15 @@ public:
     bool isAutoBatchRunning() const { return m_autoBatchRunning; }
     void cancelAutoBatch();
     bool hasPausedAutoBatch() const;
+    bool wasPausedAutoBatchCrashInterrupted() const;
     int pausedAutoBatchCompleted() const;
     int pausedAutoBatchTotal() const;
     int pausedAutoBatchRemaining() const;
     QString pausedAutoBatchReason() const;
+    bool lastAutoBatchReachedWindowCap() const { return m_lastBatchReachedWindowCap; }
+    int lastAutoBatchNextProductIndex() const { return m_lastBatchNextProductIndex; }
+    int lastAutoBatchNextSlotIndex() const { return m_lastBatchNextSlotIndex; }
+    int lastAutoBatchGeneratedCount() const { return m_lastBatchGeneratedCount; }
     bool resumePausedAutoBatch(const QString &promptCliOverride = QString{},
                                const QString &imageCliOverride = QString{});
     void discardPausedAutoBatch();
@@ -128,6 +133,7 @@ signals:
     void autoPublishRequested();
     void autoBatchStarted(int totalCreatives);
     void autoBatchProgress(int completedCreatives, int totalCreatives, const QString &message);
+    void creativeGenerated(const QString &shortCode);
     void autoBatchPausedOnLimit(int completedCreatives, int totalCreatives, const QString &limitReason);
     void autoBatchFinished(int completedCreatives, int totalCreatives, bool cancelled, const QString &errorMessage);
     void pausedAutoBatchChanged();
@@ -323,6 +329,10 @@ private:
     bool m_autoBatchRunning = false;
     int m_autoBatchCompleted = 0;
     int m_autoBatchTotal = 0;
+    bool m_lastBatchReachedWindowCap = false;
+    int m_lastBatchNextProductIndex = 0;
+    int m_lastBatchNextSlotIndex = 0;
+    int m_lastBatchGeneratedCount = 0;
     QList<QMetaObject::Connection> m_autoBatchWorkflowCancelConns;
     void _queueJobs(int row, const QUuid &projectId, const QList<GenerationJob> &jobs);
     // One in-flight coroutine per group currently running an image/slideshow
@@ -463,6 +473,7 @@ private:
     struct PausedAutoBatchState
     {
         bool active = false;
+        bool inFlight = false;
         QJsonObject batchSpec;
         int nextProductIndex = 0;
         int nextSlotIndex = 0;
@@ -480,6 +491,11 @@ private:
     QString _pausedAutoBatchFilePath() const;
     void _loadPausedAutoBatch();
     void _savePausedAutoBatch() const;
+    void _writeInFlightBatchCheckpoint(const QJsonObject &spec,
+                                       int prodIdx,
+                                       int slotIdx,
+                                       int completed,
+                                       int total) const;
     void _refreshPausedAutoBatchBanner();
     QCoro::Task<void> _runAutoBatch(QJsonObject batchSpec,
                                     int startProductIdx = 0,
